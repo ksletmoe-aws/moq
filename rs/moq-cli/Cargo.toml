@@ -36,3 +36,7 @@ url = "2"
 
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.5"
+
+[[bin]]
+name = "test-catalog-publisher"
+path = "src/test_catalog_publisher.rs"
