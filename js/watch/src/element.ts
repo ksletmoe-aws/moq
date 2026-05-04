@@ -6,7 +6,7 @@ import { MultiBackend } from "./backend";
 import { Broadcast, CATALOG_FORMATS, type CatalogFormat } from "./broadcast";
 import type { Latency } from "./sync";
 
-const DEFAULT_CATALOG_FORMAT: CatalogFormat = "hang";
+const DEFAULT_CATALOG_FORMAT: CatalogFormat = "auto";
 
 function parseCatalogFormat(value: string | null): CatalogFormat {
 	return CATALOG_FORMATS.find((f) => f === value) ?? DEFAULT_CATALOG_FORMAT;

@@ -6,7 +6,7 @@ import { Effect, type Getter, Signal } from "@moq/signals";
 
 import { toHang } from "./msf";
 
-export const CATALOG_FORMATS = ["hang", "msf", "manual"] as const;
+export const CATALOG_FORMATS = ["auto", "hang", "msf", "manual"] as const;
 export type CatalogFormat = (typeof CATALOG_FORMATS)[number];
 
 export interface BroadcastProps {
@@ -65,7 +65,7 @@ export class Broadcast {
 		this.name = Signal.from(props?.name ?? Path.empty());
 		this.enabled = Signal.from(props?.enabled ?? false);
 		this.reload = Signal.from(props?.reload ?? false);
-		this.catalogFormat = Signal.from(props?.catalogFormat ?? "hang");
+		this.catalogFormat = Signal.from(props?.catalogFormat ?? "auto");
 		this.catalog = Signal.from(props?.catalog);
 
 		this.#announced = props?.announced ?? new Signal(new Set());
@@ -127,6 +127,76 @@ export class Broadcast {
 
 		this.status.set("loading");
 
+		if (format === "auto") {
+			this.#runAutoCatalog(effect, broadcast);
+		} else {
+			this.#runFormatCatalog(effect, broadcast, format);
+		}
+	}
+
+	#runAutoCatalog(effect: Effect, broadcast: Moq.Broadcast): void {
+		// Subscribe to both catalog tracks in parallel; use whichever produces data first.
+		const hangTrack = broadcast.subscribe("catalog.json", Catalog.PRIORITY.catalog);
+		const msfTrack = broadcast.subscribe("catalog", Catalog.PRIORITY.catalog);
+		effect.cleanup(() => {
+			hangTrack.close();
+			msfTrack.close();
+		});
+
+		effect.spawn(async () => {
+			try {
+				// Race the first fetch from each format.
+				const result = await Promise.race([
+					Catalog.fetch(hangTrack).then((r) =>
+						r ? { format: "hang" as const, catalog: r, track: hangTrack } : null,
+					),
+					Msf.fetch(msfTrack).then((r) =>
+						r ? { format: "msf" as const, catalog: toHang(r), track: msfTrack } : null,
+					),
+					effect.cancel,
+				]);
+
+				if (!result) return;
+
+				// Close the track we're not using.
+				if (result.format === "hang") {
+					msfTrack.close();
+				} else {
+					hangTrack.close();
+				}
+
+				console.debug("auto-detected catalog format:", result.format, this.name.peek());
+				this.catalog.set(result.catalog);
+				this.status.set("live");
+
+				// Continue fetching from the winning format.
+				const track = result.track;
+				const fetchNext =
+					result.format === "hang"
+						? async () => Catalog.fetch(track)
+						: async () => {
+								const update = await Msf.fetch(track);
+								return update ? toHang(update) : undefined;
+							};
+
+				for (;;) {
+					const update = await Promise.race([effect.cancel, fetchNext()]);
+					if (!update) break;
+
+					console.debug("received catalog", result.format, this.name.peek(), update);
+					this.catalog.set(update);
+					this.status.set("live");
+				}
+			} catch (err) {
+				console.warn("error fetching catalog", this.name.peek(), err);
+			} finally {
+				this.catalog.set(undefined);
+				this.status.set("offline");
+			}
+		});
+	}
+
+	#runFormatCatalog(effect: Effect, broadcast: Moq.Broadcast, format: "hang" | "msf"): void {
 		const trackName = format === "hang" ? "catalog.json" : "catalog";
 		const track = broadcast.subscribe(trackName, Catalog.PRIORITY.catalog);
 		effect.cleanup(() => track.close());
