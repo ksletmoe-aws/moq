@@ -127,3 +127,146 @@ fn test_vp9_catalog() {
 	assert_eq!(mvex.trex.len(), 1);
 	assert_eq!(mvex.trex[0].track_id, moov.trak[0].tkhd.track_id);
 }
+
+// --- Adaptation tests (Step 7) ---
+
+#[test]
+fn test_container_cmaf_serde_roundtrip() {
+	let original = Container::Cmaf {
+		init: bytes::Bytes::from_static(b"hello world init segment"),
+	};
+
+	let json = serde_json::to_string(&original).unwrap();
+	assert!(json.contains("\"kind\":\"cmaf\""));
+	assert!(json.contains("\"init\""));
+
+	let deserialized: Container = serde_json::from_str(&json).unwrap();
+	assert_eq!(deserialized, original);
+}
+
+#[tokio::test]
+async fn test_cmsf_producer_consumer_roundtrip() {
+	use crate::export::cmsf::CmsfBroadcastDemuxer;
+	use crate::import::cmsf_fmp4::CmsfFmp4Importer;
+	use crate::import::cmsf_types::CmsfConfig;
+
+	let data = include_bytes!("bbb.mp4");
+
+	// Producer side: feed bbb.mp4 through CMSF importer.
+	let broadcast = moq_lite::Broadcast::new().produce();
+	let consumer = broadcast.consume();
+
+	let mut importer = CmsfFmp4Importer::new(broadcast, CmsfConfig::default()).unwrap();
+	let mut buf = bytes::BytesMut::from(&data[..]);
+	let _ = importer.decode(&mut buf);
+	importer.finish().unwrap();
+
+	// Consumer side: create demuxer from the broadcast consumer.
+	let mut demuxer = CmsfBroadcastDemuxer::new(consumer).unwrap();
+
+	// Wait for catalog to be received and tracks subscribed.
+	demuxer.ready().await.unwrap();
+
+	let tracks = demuxer.active_tracks();
+	assert!(tracks.len() >= 2, "expected at least video + audio, got {:?}", tracks);
+
+	// Read segments and verify metadata fidelity.
+	let seg = demuxer.next().await.unwrap().expect("should get a segment");
+	assert!(!seg.media_data.is_empty());
+	assert!(seg.track_name.ends_with(".m4s"));
+	assert!(seg.timescale > 0, "timescale should be non-zero");
+	assert!(seg.duration > 0, "duration should be non-zero");
+
+	// Verify the first segment of a group is a keyframe.
+	if seg.group_id == 0 {
+		assert!(seg.is_keyframe, "first segment in first group should be a keyframe");
+	}
+
+	// Verify PTS is parseable and consistent with parse_cmsf_metadata.
+	let reparsed = crate::cmsf::parse_cmsf_metadata(&seg.media_data).unwrap();
+	assert_eq!(seg.pts, reparsed.pts, "PTS should match re-parse");
+	assert_eq!(seg.duration, reparsed.duration, "duration should match re-parse");
+	assert_eq!(
+		seg.is_keyframe, reparsed.is_keyframe,
+		"keyframe flag should match re-parse"
+	);
+
+	// Read more segments to verify continuity.
+	let mut count = 1;
+	while let Some(seg) = demuxer.next().await.unwrap() {
+		assert!(seg.timescale > 0);
+		assert!(!seg.media_data.is_empty());
+		count += 1;
+		if count >= 10 {
+			break;
+		}
+	}
+	assert!(count >= 3, "expected at least 3 segments from bbb.mp4, got {count}");
+}
+
+#[tokio::test]
+async fn test_cmsf_demuxer_skips_malformed_frames() {
+	use crate::export::cmsf::CmsfTrackDemuxer;
+
+	// Create a track with valid init data but feed it a malformed frame.
+	let mut broadcast = moq_lite::Broadcast::new().produce();
+	let mut track_producer = broadcast.create_track(moq_lite::Track::new("video0.m4s")).unwrap();
+	let track_consumer = broadcast
+		.consume()
+		.subscribe_track(&moq_lite::Track::new("video0.m4s"))
+		.unwrap();
+
+	// Build a valid init segment for timescale.
+	let init_data = crate::cmsf::test_helpers::build_init_segment(90000);
+
+	let mut demuxer = CmsfTrackDemuxer::new(track_consumer, bytes::Bytes::from(init_data), 90000);
+
+	// Write a valid keyframe followed by garbage.
+	let valid = crate::cmsf::test_helpers::build_moof_mdat(0, 3003, 0x0200_0000);
+	let mut group = track_producer.append_group().unwrap();
+	group.write_frame(bytes::Bytes::from(valid)).unwrap();
+	group.write_frame(bytes::Bytes::from_static(b"garbage")).unwrap();
+	group.finish().unwrap();
+	track_producer.finish().unwrap();
+
+	// Should get the valid frame.
+	let seg = demuxer.next().await.unwrap().expect("should get valid segment");
+	assert_eq!(seg.pts, 0);
+	assert!(seg.is_keyframe);
+
+	// Malformed frame should be skipped, track ends.
+	let end = demuxer.next().await.unwrap();
+	assert!(end.is_none(), "should end after skipping malformed frame");
+}
+
+#[tokio::test]
+async fn test_cmsf_demuxer_end_reason_track_finished() {
+	use crate::export::cmsf::{CmsfTrackDemuxer, EndReason};
+
+	let mut broadcast = moq_lite::Broadcast::new().produce();
+	let mut track_producer = broadcast.create_track(moq_lite::Track::new("audio0.m4s")).unwrap();
+	let track_consumer = broadcast
+		.consume()
+		.subscribe_track(&moq_lite::Track::new("audio0.m4s"))
+		.unwrap();
+
+	let init_data = crate::cmsf::test_helpers::build_init_segment(48000);
+	let mut demuxer = CmsfTrackDemuxer::new(track_consumer, bytes::Bytes::from(init_data), 48000);
+
+	// Write one frame then finish the track.
+	let frame = crate::cmsf::test_helpers::build_moof_mdat(0, 1024, 0x0200_0000);
+	let mut group = track_producer.append_group().unwrap();
+	group.write_frame(bytes::Bytes::from(frame)).unwrap();
+	group.finish().unwrap();
+	track_producer.finish().unwrap();
+
+	// Read the frame.
+	let seg = demuxer.next().await.unwrap().expect("should get segment");
+	assert_eq!(seg.pts, 0);
+	assert_eq!(seg.timescale, 48000);
+
+	// Track should end.
+	let end = demuxer.next().await.unwrap();
+	assert!(end.is_none());
+	assert!(matches!(demuxer.end_reason(), Some(EndReason::TrackFinished)));
+}

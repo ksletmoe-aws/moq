@@ -19,6 +19,7 @@
 //!   moof+mdat fragments) in timestamp order across tracks.
 
 pub mod catalog;
+pub mod cmsf;
 pub mod container;
 mod error;
 pub mod export;

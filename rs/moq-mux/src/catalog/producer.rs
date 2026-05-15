@@ -153,6 +153,8 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 			init_data,
 			render_group: Some(1),
 			alt_group: if has_multiple_video { Some(1) } else { None },
+			max_grp_sap_starting_type: None,
+			max_obj_sap_starting_type: None,
 		});
 	}
 
@@ -186,10 +188,16 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 			init_data,
 			render_group: Some(1),
 			alt_group: if has_multiple_audio { Some(1) } else { None },
+			max_grp_sap_starting_type: None,
+			max_obj_sap_starting_type: None,
 		});
 	}
 
-	moq_msf::Catalog { version: 1, tracks }
+	moq_msf::Catalog {
+		version: 1,
+		generated_at: None,
+		tracks,
+	}
 }
 
 #[cfg(test)]

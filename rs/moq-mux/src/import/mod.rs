@@ -20,7 +20,11 @@ mod annexb;
 mod av01;
 mod avc1;
 mod avc3;
+pub(crate) mod cmsf_broadcast;
+pub(crate) mod cmsf_fmp4;
+pub(crate) mod cmsf_types;
 mod fmp4;
+pub(crate) mod fmp4_parser;
 mod framed;
 mod hev1;
 mod hls;
@@ -38,6 +42,10 @@ pub use hev1::*;
 pub use hls::*;
 pub use opus::*;
 pub use stream::*;
+
+pub use cmsf_broadcast::CmsfBroadcastProducer;
+pub use cmsf_fmp4::CmsfFmp4Importer;
+pub use cmsf_types::{CmsfAudioTrack, CmsfConfig, CmsfObject, CmsfVideoTrack, TrackId};
 
 #[cfg(test)]
 mod test;

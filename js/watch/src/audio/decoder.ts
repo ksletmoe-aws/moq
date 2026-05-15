@@ -271,8 +271,14 @@ export class Decoder {
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
 		// Opus in CMAF uses raw packets (not OGG-wrapped), so description must be omitted.
 		// The dOps box from the init segment is not a valid OGG Identification Header.
+		// For other codecs, fall back to the init segment's description (esds, etc.)
+		// when the catalog doesn't provide one (MSF/CMSF path).
 		const description =
-			config.codec === "opus" ? undefined : config.description ? Util.Hex.toBytes(config.description) : undefined;
+			config.codec === "opus"
+				? undefined
+				: config.description
+					? Util.Hex.toBytes(config.description)
+					: init.description;
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),

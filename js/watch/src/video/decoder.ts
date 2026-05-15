@@ -362,7 +362,9 @@ class DecoderTrack {
 
 		const initSegment = base64ToBytes(this.config.container.init);
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
-		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : undefined;
+		// MSF/CMSF catalogs don't carry a separate description field — the codec
+		// description (avcC, hvcC, etc.) lives inside the init segment's moov box.
+		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : init.description;
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),

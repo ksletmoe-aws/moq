@@ -359,6 +359,141 @@ pub unsafe extern "C" fn moq_publish_media_frame(
 	})
 }
 
+// --- CMSF Broadcast Producer ---
+
+/// Create a CMSF broadcast producer and announce it to an origin.
+///
+/// - `origin`: origin handle from [moq_origin_create]
+/// - `path` / `path_len`: broadcast path (e.g. "live")
+/// - `publish_hang`: if true, also publish a hang catalog (catalog.json)
+///
+/// Returns a non-zero CMSF handle on success, or a negative code on failure.
+///
+/// # Safety
+/// - The caller must ensure that path is a valid pointer to path_len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_cmsf_create(origin: u32, path: *const c_char, path_len: usize, publish_hang: bool) -> i32 {
+	ffi::enter(move || {
+		let path = unsafe { ffi::parse_str(path, path_len)? };
+		let origin_id = ffi::parse_id(origin)?;
+		let mut state = State::lock();
+		let (id, consumer) = state.publish.cmsf_create(publish_hang)?;
+		if let Err(err) = state.origin.publish(origin_id, path, consumer) {
+			let _ = state.publish.cmsf_close(id);
+			return Err(err);
+		}
+		Ok(id)
+	})
+}
+
+/// Add a video track to a CMSF broadcast.
+///
+/// Returns a non-zero track handle on success, or a negative code on failure.
+///
+/// # Safety
+/// - All pointer+length pairs must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_cmsf_add_video(
+	cmsf: u32,
+	codec: *const c_char,
+	codec_len: usize,
+	description: *const u8,
+	description_len: usize,
+	width: u32,
+	height: u32,
+	bitrate: u64,
+	framerate: f64,
+	timescale: u64,
+	init_segment: *const u8,
+	init_segment_len: usize,
+	alt_group: u32,
+) -> i32 {
+	ffi::enter(move || {
+		let codec = unsafe { ffi::parse_str(codec, codec_len)? };
+		let desc = unsafe { ffi::parse_slice(description, description_len)? };
+		let desc = if desc.is_empty() { None } else { Some(desc) };
+		let init = unsafe { ffi::parse_slice(init_segment, init_segment_len)? };
+		let id = ffi::parse_id(cmsf)?;
+		State::lock().publish.cmsf_add_video(
+			id, codec, desc, width, height, bitrate, framerate, timescale, init, alt_group,
+		)
+	})
+}
+
+/// Add an audio track to a CMSF broadcast.
+///
+/// Returns a non-zero track handle on success, or a negative code on failure.
+///
+/// # Safety
+/// - All pointer+length pairs must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_cmsf_add_audio(
+	cmsf: u32,
+	codec: *const c_char,
+	codec_len: usize,
+	description: *const u8,
+	description_len: usize,
+	sample_rate: u32,
+	channel_count: u32,
+	bitrate: u64,
+	timescale: u64,
+	init_segment: *const u8,
+	init_segment_len: usize,
+	alt_group: u32,
+) -> i32 {
+	ffi::enter(move || {
+		let codec = unsafe { ffi::parse_str(codec, codec_len)? };
+		let desc = unsafe { ffi::parse_slice(description, description_len)? };
+		let desc = if desc.is_empty() { None } else { Some(desc) };
+		let init = unsafe { ffi::parse_slice(init_segment, init_segment_len)? };
+		let id = ffi::parse_id(cmsf)?;
+		State::lock().publish.cmsf_add_audio(
+			id,
+			codec,
+			desc,
+			sample_rate,
+			channel_count,
+			bitrate,
+			timescale,
+			init,
+			alt_group,
+		)
+	})
+}
+
+/// Write a CMAF object (moof+mdat) to a track.
+///
+/// - `cmsf`: CMSF handle from [moq_cmsf_create]
+/// - `track`: track handle from [moq_cmsf_add_video] / [moq_cmsf_add_audio]
+/// - `data` / `data_len`: complete moof+mdat fragment bytes
+/// - `group_id`: explicit group ID (0 = auto-detect from keyframes)
+///
+/// SAP type is auto-detected from the moof sample flags.
+///
+/// Returns zero on success, or a negative code on failure.
+///
+/// # Safety
+/// - The caller must ensure that data is a valid pointer to data_len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_cmsf_write(cmsf: u32, track: u32, data: *const u8, data_len: usize, group_id: u64) -> i32 {
+	ffi::enter(move || {
+		let id = ffi::parse_id(cmsf)?;
+		let data = unsafe { ffi::parse_slice(data, data_len)? };
+		State::lock().publish.cmsf_write(id, track, data, group_id)
+	})
+}
+
+/// Close a CMSF broadcast producer and finish all tracks.
+///
+/// Returns zero on success, or a negative code on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn moq_cmsf_close(cmsf: u32) -> i32 {
+	ffi::enter(move || {
+		let id = ffi::parse_id(cmsf)?;
+		State::lock().publish.cmsf_close(id)
+	})
+}
+
 /// Create a catalog consumer for a broadcast.
 ///
 /// The callback is called with a catalog ID when a new catalog is available.

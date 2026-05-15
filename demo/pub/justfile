@@ -44,6 +44,11 @@ bbb url='http://localhost:4443/anon' *args:
 	just download bbb
 	just cmaf bbb "{{url}}" {{args}}
 
+# Publish Big Buck Bunny via CMSF format.
+bbb-cmsf url='http://localhost:4443/anon' *args:
+	just download bbb
+	just cmsf bbb "{{url}}" {{args}}
+
 # Publish Tears of Steel to a relay server.
 tos url='http://localhost:4443/anon' *args:
 	just download tos
@@ -55,6 +60,13 @@ cmaf name url='http://localhost:4443/anon' *args:
 	just ffmpeg-cmaf "media/{{name}}.mp4" |\
 	cargo run --bin moq-cli -- \
 		{{args}} publish --url "{{url}}" --name "{{name}}" fmp4
+
+# Publish a video using CMSF format to a relay server.
+cmsf name url='http://localhost:4443/anon' *args:
+	cargo build --bin moq-cli
+	just ffmpeg-cmaf "media/{{name}}.mp4" |\
+	cargo run --bin moq-cli -- \
+		{{args}} publish --url "{{url}}" --name "{{name}}" cmsf
 
 # Publish a video via iroh.
 iroh name url prefix="":

@@ -24,6 +24,9 @@ pub struct Catalog {
 	/// MSF version — always 1 for this draft.
 	pub version: u32,
 
+	/// Milliseconds since Unix epoch when this catalog was generated.
+	pub generated_at: Option<u64>,
+
 	/// Array of track descriptions.
 	pub tracks: Vec<Track>,
 }
@@ -74,6 +77,12 @@ pub struct Track {
 
 	/// Alternate group for quality switching.
 	pub alt_group: Option<u32>,
+
+	/// Maximum SAP type at the start of any group (CMSF §3.4).
+	pub max_grp_sap_starting_type: Option<u32>,
+
+	/// Maximum SAP type at the start of any object (CMSF §3.4).
+	pub max_obj_sap_starting_type: Option<u32>,
 }
 
 impl Catalog {
@@ -219,6 +228,7 @@ mod test {
 	fn serialize_video_track() {
 		let catalog = Catalog {
 			version: 1,
+			generated_at: None,
 			tracks: vec![Track {
 				name: "video0".to_string(),
 				packaging: Packaging::Legacy,
@@ -234,6 +244,8 @@ mod test {
 				init_data: None,
 				render_group: Some(1),
 				alt_group: None,
+				max_grp_sap_starting_type: None,
+				max_obj_sap_starting_type: None,
 			}],
 		};
 
@@ -252,6 +264,7 @@ mod test {
 	fn serialize_audio_track() {
 		let catalog = Catalog {
 			version: 1,
+			generated_at: None,
 			tracks: vec![Track {
 				name: "audio0".to_string(),
 				packaging: Packaging::Legacy,
@@ -267,6 +280,8 @@ mod test {
 				init_data: None,
 				render_group: Some(1),
 				alt_group: None,
+				max_grp_sap_starting_type: None,
+				max_obj_sap_starting_type: None,
 			}],
 		};
 
@@ -319,6 +334,7 @@ mod test {
 	fn roundtrip_empty() {
 		let catalog = Catalog {
 			version: 1,
+			generated_at: None,
 			tracks: vec![],
 		};
 		let json = catalog.to_string().unwrap();
@@ -330,6 +346,7 @@ mod test {
 	fn cmaf_packaging() {
 		let catalog = Catalog {
 			version: 1,
+			generated_at: None,
 			tracks: vec![Track {
 				name: "hd".to_string(),
 				packaging: Packaging::Cmaf,
@@ -345,6 +362,8 @@ mod test {
 				init_data: Some("AQID".to_string()),
 				render_group: Some(1),
 				alt_group: Some(1),
+				max_grp_sap_starting_type: None,
+				max_obj_sap_starting_type: None,
 			}],
 		};
 
@@ -352,5 +371,104 @@ mod test {
 		assert!(json.contains("\"packaging\":\"cmaf\""));
 		let parsed = Catalog::from_str(&json).unwrap();
 		assert_eq!(catalog, parsed);
+	}
+
+	#[test]
+	fn cmsf_generated_at() {
+		let catalog = Catalog {
+			version: 1,
+			generated_at: Some(1714500000000),
+			tracks: vec![],
+		};
+
+		let json = catalog.to_string().unwrap();
+		assert!(json.contains("\"generatedAt\":1714500000000"));
+		let parsed = Catalog::from_str(&json).unwrap();
+		assert_eq!(parsed.generated_at, Some(1714500000000));
+	}
+
+	#[test]
+	fn cmsf_generated_at_omitted_when_none() {
+		let catalog = Catalog {
+			version: 1,
+			generated_at: None,
+			tracks: vec![],
+		};
+
+		let json = catalog.to_string().unwrap();
+		assert!(!json.contains("generatedAt"));
+	}
+
+	#[test]
+	fn cmsf_sap_fields() {
+		let catalog = Catalog {
+			version: 1,
+			generated_at: None,
+			tracks: vec![Track {
+				name: "video0.m4s".to_string(),
+				packaging: Packaging::Cmaf,
+				is_live: true,
+				role: Some(Role::Video),
+				codec: Some("avc1.640028".to_string()),
+				width: Some(1920),
+				height: Some(1080),
+				framerate: Some(30.0),
+				samplerate: None,
+				channel_config: None,
+				bitrate: Some(5_000_000),
+				init_data: Some("AQID".to_string()),
+				render_group: Some(1),
+				alt_group: Some(1),
+				max_grp_sap_starting_type: Some(1),
+				max_obj_sap_starting_type: Some(2),
+			}],
+		};
+
+		let json = catalog.to_string().unwrap();
+		assert!(json.contains("\"maxGrpSapStartingType\":1"));
+		assert!(json.contains("\"maxObjSapStartingType\":2"));
+		let parsed = Catalog::from_str(&json).unwrap();
+		assert_eq!(parsed.tracks[0].max_grp_sap_starting_type, Some(1));
+		assert_eq!(parsed.tracks[0].max_obj_sap_starting_type, Some(2));
+	}
+
+	#[test]
+	fn cmsf_sap_fields_omitted_when_none() {
+		let catalog = Catalog {
+			version: 1,
+			generated_at: None,
+			tracks: vec![Track {
+				name: "video0.m4s".to_string(),
+				packaging: Packaging::Cmaf,
+				is_live: true,
+				role: None,
+				codec: None,
+				width: None,
+				height: None,
+				framerate: None,
+				samplerate: None,
+				channel_config: None,
+				bitrate: None,
+				init_data: None,
+				render_group: None,
+				alt_group: None,
+				max_grp_sap_starting_type: None,
+				max_obj_sap_starting_type: None,
+			}],
+		};
+
+		let json = catalog.to_string().unwrap();
+		assert!(!json.contains("maxGrpSapStartingType"));
+		assert!(!json.contains("maxObjSapStartingType"));
+	}
+
+	#[test]
+	fn cmsf_backward_compat_missing_fields() {
+		// JSON without the new CMSF fields should still deserialize.
+		let json = r#"{"version":1,"tracks":[{"name":"v","packaging":"cmaf","isLive":true}]}"#;
+		let catalog = Catalog::from_str(json).unwrap();
+		assert_eq!(catalog.generated_at, None);
+		assert_eq!(catalog.tracks[0].max_grp_sap_starting_type, None);
+		assert_eq!(catalog.tracks[0].max_obj_sap_starting_type, None);
 	}
 }
