@@ -486,3 +486,28 @@ test("Consumer with CmafFormat delivers correct timestamps", async () => {
 	expect(frames[1].timestamp).toBe(33_333 as Time.Micro); // 3000/90000 * 1_000_000
 	consumer.close();
 });
+
+test("Consumer handles epoch-based group sequences without skipping", async () => {
+	// EML/CMSF uses epoch-based sequences with large gaps (not sequential).
+	// The consumer must advance #active to the next group's actual sequence,
+	// not just increment by 1.
+	const EPOCH_BASE = 85386781784064;
+	const GAP = 48128; // typical EML group gap
+
+	const track = new Track("test");
+	const consumer = new Consumer(track, { format: new LegacyFormat(), latency: 2000 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, EPOCH_BASE, [0 as Time.Micro, 20_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, EPOCH_BASE + GAP, [40_000 as Time.Micro, 60_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, EPOCH_BASE + GAP * 2, [80_000 as Time.Micro, 100_000 as Time.Micro]);
+	track.close();
+
+	const frames = await drainFrames(consumer, 500);
+
+	// All 6 frames should be delivered without any being skipped.
+	expect(frames).toHaveLength(6);
+	expect(frames[0].timestamp).toBe(0 as Time.Micro);
+	expect(frames[2].timestamp).toBe(40_000 as Time.Micro);
+	expect(frames[4].timestamp).toBe(80_000 as Time.Micro);
+	consumer.close();
+});

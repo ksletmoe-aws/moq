@@ -112,6 +112,16 @@ export class Consumer {
 
 					this.#updateBuffered();
 
+					// Promote #active eagerly if it drifted below this group
+					// (e.g. +1 fallback with no next group buffered at the time).
+					if (
+						this.#active !== undefined &&
+						this.#groups[0]?.consumer === group.consumer &&
+						group.consumer.sequence > this.#active
+					) {
+						this.#active = group.consumer.sequence;
+					}
+
 					if (group.consumer.sequence === this.#active) {
 						this.#notify?.();
 						this.#notify = undefined;
@@ -129,8 +139,10 @@ export class Consumer {
 			group.done = true;
 
 			if (group.consumer.sequence === this.#active) {
-				// Advance to the next group.
-				this.#active += 1;
+				// Advance to the next group in the buffer, or past this one.
+				const idx = this.#groups.indexOf(group);
+				const next = this.#groups[idx + 1];
+				this.#active = next?.consumer.sequence ?? group.consumer.sequence + 1;
 			}
 
 			// Recompute buffered ranges now that this group is done,
@@ -197,6 +209,16 @@ export class Consumer {
 	// If frame is undefined, the group is done.
 	async next(): Promise<{ frame: Frame | undefined; group: number } | undefined> {
 		for (;;) {
+			// If #active points below all buffered groups (e.g. a +1 guess made when
+			// no next group was buffered), promote it to the first real group.
+			if (
+				this.#active !== undefined &&
+				this.#groups.length > 0 &&
+				this.#groups[0].consumer.sequence > this.#active
+			) {
+				this.#active = this.#groups[0].consumer.sequence;
+			}
+
 			if (
 				this.#groups.length > 0 &&
 				this.#active !== undefined &&
@@ -214,12 +236,13 @@ export class Consumer {
 				// The latter handles the case where #runGroup finished before
 				// #active reached this group (e.g. after a latency skip).
 				if (this.#active > this.#groups[0].consumer.sequence || this.#groups[0].done) {
-					if (this.#groups[0].consumer.sequence === this.#active) {
-						this.#active += 1;
-					}
-
 					const group = this.#groups.shift();
 					if (group) {
+						if (group.consumer.sequence === this.#active) {
+							const next = this.#groups[0];
+							this.#active = next?.consumer.sequence ?? group.consumer.sequence + 1;
+						}
+
 						this.#updateBuffered();
 						return { frame: undefined, group: group.consumer.sequence };
 					}
@@ -250,9 +273,8 @@ export class Consumer {
 	#updateBuffered(): void {
 		const ranges: BufferedRanges = [];
 
-		let prev: Group | undefined;
-
-		for (const group of this.#groups) {
+		for (let i = 0; i < this.#groups.length; i++) {
+			const group = this.#groups[i];
 			const first = group.frames.at(0);
 			if (!first || group.latest === undefined) continue;
 
@@ -260,14 +282,13 @@ export class Consumer {
 			const end = Moq.Time.Milli.fromMicro(group.latest);
 
 			const last = ranges.at(-1);
-			const contiguous = prev?.done && prev.consumer.sequence + 1 === group.consumer.sequence;
+			const prev = this.#groups[i - 1];
+			const contiguous = prev?.done === true && prev.latest !== undefined;
 			if (last && (last.end >= start || contiguous)) {
 				last.end = Moq.Time.Milli.max(last.end, end);
 			} else {
 				ranges.push({ start, end });
 			}
-
-			prev = group;
 		}
 
 		this.#buffered.set(ranges);
