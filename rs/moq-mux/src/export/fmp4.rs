@@ -22,7 +22,7 @@ use crate::container::{Consumer, Frame, Hang};
 /// fragments. Returns `None` when the broadcast ends.
 pub struct Fmp4 {
 	broadcast: moq_net::BroadcastConsumer,
-	catalog: Option<crate::catalog::Consumer>,
+	catalog: Option<CatalogSource>,
 	latency: Duration,
 
 	tracks: HashMap<String, Fmp4Track>,
@@ -34,6 +34,26 @@ pub struct Fmp4 {
 	/// Set after the init segment has been emitted; subsequent catalog updates only
 	/// (un)subscribe tracks without re-emitting init.
 	init_emitted: bool,
+}
+
+/// Source for the catalog stream backing an [`Fmp4`].
+///
+/// Both variants expose the same [`hang::Catalog`] shape; the MSF variant converts on
+/// the fly so the rest of the pipeline only deals with hang types.
+enum CatalogSource {
+	/// The hang catalog track (track name `catalog.json`, JSON payload).
+	Hang(crate::catalog::Consumer),
+	/// The MSF catalog track (track name `catalog`, MSF JSON payload converted to hang).
+	Msf(crate::catalog::MsfConsumer),
+}
+
+impl CatalogSource {
+	fn poll_next(&mut self, waiter: &conducer::Waiter) -> Poll<anyhow::Result<Option<hang::Catalog>>> {
+		match self {
+			Self::Hang(c) => c.poll_next(waiter).map_err(Into::into),
+			Self::Msf(c) => c.poll_next(waiter),
+		}
+	}
 }
 
 struct Fmp4Track {
@@ -61,7 +81,27 @@ impl Fmp4 {
 
 		Ok(Self {
 			broadcast,
-			catalog: Some(catalog),
+			catalog: Some(CatalogSource::Hang(catalog)),
+			latency: Duration::ZERO,
+			tracks: HashMap::new(),
+			init_pending: None,
+			init_emitted: false,
+		})
+	}
+
+	/// Subscribe to `broadcast` and produce fMP4 byte chunks, using the MSF catalog.
+	///
+	/// Behaves like [`Self::new`] but subscribes to the MSF catalog track
+	/// ([`moq_msf::DEFAULT_NAME`]) instead of the hang catalog. Incoming MSF catalog
+	/// snapshots are converted to [`hang::Catalog`] before driving track (un)subscription
+	/// and init segment construction, so the rest of the pipeline is identical.
+	pub fn new_msf(broadcast: moq_net::BroadcastConsumer) -> Result<Self, crate::Error> {
+		let catalog_track = broadcast.subscribe_track(&moq_net::Track::new(moq_msf::DEFAULT_NAME))?;
+		let catalog = crate::catalog::MsfConsumer::new(catalog_track);
+
+		Ok(Self {
+			broadcast,
+			catalog: Some(CatalogSource::Msf(catalog)),
 			latency: Duration::ZERO,
 			tracks: HashMap::new(),
 			init_pending: None,
@@ -92,7 +132,7 @@ impl Fmp4 {
 	pub fn poll_next(&mut self, waiter: &conducer::Waiter) -> Poll<anyhow::Result<Option<Bytes>>> {
 		// 1. Drain catalog updates and (un)subscribe tracks accordingly.
 		while let Some(catalog) = self.catalog.as_mut() {
-			match catalog.poll_next(waiter).map_err(crate::Error::from)? {
+			match catalog.poll_next(waiter)? {
 				Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot)?,
 				Poll::Ready(None) => {
 					self.catalog = None;

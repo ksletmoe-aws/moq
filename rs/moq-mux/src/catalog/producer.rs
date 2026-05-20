@@ -119,6 +119,22 @@ impl Drop for Guard<'_> {
 	}
 }
 
+/// Determine the SAP starting type for a given video codec.
+///
+/// SAP type 1: closed GOP (IDR at every SAP). Used for H.264, VP8, AV1, VP9.
+/// SAP type 3: open GOP (CRA/non-IDR RAP possible). Used for H.265 as a
+/// conservative worst-case since the codec supports both IDR and CRA.
+///
+/// Returns None for unknown codecs so the field is omitted from the catalog.
+fn video_sap_type(codec: &hang::catalog::VideoCodec) -> Option<u8> {
+	use hang::catalog::VideoCodec;
+	match codec {
+		VideoCodec::H264(_) | VideoCodec::VP8 | VideoCodec::AV1(_) | VideoCodec::VP9(_) => Some(1),
+		VideoCodec::H265(_) => Some(3),
+		_ => None,
+	}
+}
+
 /// Convert a hang catalog to an MSF catalog.
 fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 	let mut tracks = Vec::new();
@@ -138,6 +154,7 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 				.map(|d| base64::engine::general_purpose::STANDARD.encode(d.as_ref())),
 		};
 
+		let sap_type = video_sap_type(&config.codec);
 		tracks.push(moq_msf::Track {
 			name: name.clone(),
 			packaging,
@@ -153,6 +170,9 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 			init_data,
 			render_group: Some(1),
 			alt_group: if has_multiple_video { Some(1) } else { None },
+			max_grp_sap_starting_type: sap_type,
+			max_obj_sap_starting_type: sap_type,
+			jitter: config.jitter.map(|t| t.as_millis() as f64),
 		});
 	}
 
@@ -186,6 +206,9 @@ fn to_msf(catalog: &hang::Catalog) -> moq_msf::Catalog {
 			init_data,
 			render_group: Some(1),
 			alt_group: if has_multiple_audio { Some(1) } else { None },
+			max_grp_sap_starting_type: Some(1),
+			max_obj_sap_starting_type: Some(1),
+			jitter: config.jitter.map(|t| t.as_millis() as f64),
 		});
 	}
 
@@ -269,6 +292,9 @@ mod test {
 		assert_eq!(video.framerate, Some(30.0));
 		assert_eq!(video.bitrate, Some(6_000_000));
 		assert!(video.init_data.is_none());
+		assert_eq!(video.max_grp_sap_starting_type, Some(1));
+		assert_eq!(video.max_obj_sap_starting_type, Some(1));
+		assert_eq!(video.jitter, None);
 
 		let audio = &msf.tracks[1];
 		assert_eq!(audio.name, "audio0");
@@ -278,6 +304,9 @@ mod test {
 		assert_eq!(audio.samplerate, Some(48_000));
 		assert_eq!(audio.channel_config, Some("2".to_string()));
 		assert_eq!(audio.bitrate, Some(128_000));
+		assert_eq!(audio.max_grp_sap_starting_type, Some(1));
+		assert_eq!(audio.max_obj_sap_starting_type, Some(1));
+		assert_eq!(audio.jitter, None);
 	}
 
 	#[test]
@@ -374,5 +403,159 @@ mod test {
 		let video = &msf.tracks[0];
 		assert_eq!(video.packaging, moq_msf::Packaging::Cmaf);
 		assert_eq!(video.init_data, Some("AAAYZ2Z0eXA=".to_string()));
+	}
+
+	#[test]
+	fn convert_sap_h264_with_jitter() {
+		let mut video_renditions = BTreeMap::new();
+		video_renditions.insert(
+			"video0".to_string(),
+			VideoConfig {
+				codec: H264 {
+					profile: 0x64,
+					constraints: 0x00,
+					level: 0x1f,
+					inline: true,
+				}
+				.into(),
+				description: None,
+				coded_width: Some(1280),
+				coded_height: Some(720),
+				display_ratio_width: None,
+				display_ratio_height: None,
+				bitrate: None,
+				framerate: Some(30.0),
+				optimize_for_latency: None,
+				container: Container::Legacy,
+				jitter: Some(moq_net::Time::from_millis_unchecked(100)),
+			},
+		);
+
+		let mut audio_renditions = BTreeMap::new();
+		audio_renditions.insert(
+			"audio0".to_string(),
+			AudioConfig {
+				codec: AudioCodec::Opus,
+				sample_rate: 48_000,
+				channel_count: 2,
+				bitrate: None,
+				description: None,
+				container: Container::Legacy,
+				jitter: Some(moq_net::Time::from_millis_unchecked(40)),
+			},
+		);
+
+		let catalog = hang::Catalog {
+			video: Video {
+				renditions: video_renditions,
+				display: None,
+				rotation: None,
+				flip: None,
+			},
+			audio: Audio {
+				renditions: audio_renditions,
+			},
+			..Default::default()
+		};
+
+		let msf = to_msf(&catalog);
+
+		let video = &msf.tracks[0];
+		assert_eq!(video.role, Some(moq_msf::Role::Video));
+		assert_eq!(video.max_grp_sap_starting_type, Some(1));
+		assert_eq!(video.max_obj_sap_starting_type, Some(1));
+		assert_eq!(video.jitter, Some(100.0));
+
+		let audio = &msf.tracks[1];
+		assert_eq!(audio.role, Some(moq_msf::Role::Audio));
+		assert_eq!(audio.max_grp_sap_starting_type, Some(1));
+		assert_eq!(audio.max_obj_sap_starting_type, Some(1));
+		assert_eq!(audio.jitter, Some(40.0));
+	}
+
+	#[test]
+	fn convert_sap_h265() {
+		use hang::catalog::H265;
+
+		let mut video_renditions = BTreeMap::new();
+		video_renditions.insert(
+			"video0".to_string(),
+			VideoConfig {
+				codec: H265 {
+					in_band: false,
+					profile_space: 0,
+					profile_idc: 1,
+					profile_compatibility_flags: [0, 0, 0, 0],
+					tier_flag: false,
+					level_idc: 93,
+					constraint_flags: [0, 0, 0, 0, 0, 0],
+				}
+				.into(),
+				description: None,
+				coded_width: Some(1920),
+				coded_height: Some(1080),
+				display_ratio_width: None,
+				display_ratio_height: None,
+				bitrate: None,
+				framerate: Some(60.0),
+				optimize_for_latency: None,
+				container: Container::Legacy,
+				jitter: None,
+			},
+		);
+
+		let catalog = hang::Catalog {
+			video: Video {
+				renditions: video_renditions,
+				display: None,
+				rotation: None,
+				flip: None,
+			},
+			..Default::default()
+		};
+
+		let msf = to_msf(&catalog);
+		let video = &msf.tracks[0];
+		assert_eq!(video.max_grp_sap_starting_type, Some(3));
+		assert_eq!(video.max_obj_sap_starting_type, Some(3));
+		assert_eq!(video.jitter, None);
+	}
+
+	#[test]
+	fn convert_sap_unknown_codec() {
+		use hang::catalog::VideoCodec;
+
+		let mut video_renditions = BTreeMap::new();
+		video_renditions.insert(
+			"video0".to_string(),
+			VideoConfig {
+				codec: VideoCodec::Unknown("future-codec.01".to_string()),
+				description: None,
+				coded_width: None,
+				coded_height: None,
+				display_ratio_width: None,
+				display_ratio_height: None,
+				bitrate: None,
+				framerate: None,
+				optimize_for_latency: None,
+				container: Container::Legacy,
+				jitter: None,
+			},
+		);
+
+		let catalog = hang::Catalog {
+			video: Video {
+				renditions: video_renditions,
+				display: None,
+				rotation: None,
+				flip: None,
+			},
+			..Default::default()
+		};
+
+		let msf = to_msf(&catalog);
+		let video = &msf.tracks[0];
+		assert_eq!(video.max_grp_sap_starting_type, None);
+		assert_eq!(video.max_obj_sap_starting_type, None);
 	}
 }
