@@ -51,8 +51,10 @@ impl EgressSource {
 	/// caller hands `EgressSource` to [`Session::egress`](crate::session::Session::egress)
 	/// which takes the receiver via [`Self::take_writes`].
 	pub async fn new(broadcast: moq_net::BroadcastConsumer) -> Result<Self> {
-		let catalog_track =
-			broadcast.subscribe_track(&moq_net::Track::new(hang::Catalog::default_track().name.clone()))?;
+		let catalog_track = broadcast
+			.subscribe_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_subscription())
+			.ok()
+			.await?;
 		let mut consumer = moq_mux::catalog::hang::Consumer::new(catalog_track);
 		let catalog = consumer
 			.next()
@@ -81,15 +83,25 @@ impl EgressSource {
 	/// the codec's negotiated RTP clock. The pump subscribes to a matching
 	/// catalog rendition and forwards every frame as a [`WriteRequest`].
 	pub fn on_track(&mut self, mid: Mid, codec: Codec, pt: Pt, clock_rate: Frequency) -> Result<()> {
-		let track = match self.pick_track(codec)? {
-			Some(t) => t,
-			None => {
-				tracing::warn!(?codec, "no matching catalog rendition; egress track ignored");
-				return Ok(());
-			}
-		};
+		// `subscribe_track` now blocks on SUBSCRIBE_OK, so pick + subscribe inside
+		// the pump task to keep this str0m callback non-blocking.
 		let tx = self.writes_tx.clone();
-		tokio::spawn(pump(mid, pt, clock_rate, track, tx));
+		let broadcast = self.broadcast.clone();
+		let catalog = self.catalog.clone();
+		tokio::spawn(async move {
+			let track = match pick_track(&broadcast, &catalog, codec).await {
+				Ok(Some(t)) => t,
+				Ok(None) => {
+					tracing::warn!(?codec, "no matching catalog rendition; egress track ignored");
+					return;
+				}
+				Err(err) => {
+					tracing::warn!(?codec, %err, "egress track subscribe failed");
+					return;
+				}
+			};
+			pump(mid, pt, clock_rate, track, tx).await;
+		});
 		Ok(())
 	}
 
@@ -122,44 +134,40 @@ impl EgressSource {
 		}
 		out
 	}
+}
 
-	/// Find the first catalog rendition for the given codec and build a
-	/// [`codec::Track`] subscribed to it. Returns `None` if no rendition
-	/// matches.
-	fn pick_track(&self, codec: Codec) -> Result<Option<codec::Track>> {
-		match codec {
-			Codec::Opus => {
-				let Some((name, _config)) = self
-					.catalog
-					.audio
-					.renditions
-					.iter()
-					.find(|(_, c)| matches!(c.codec, AudioCodec::Opus))
-				else {
-					return Ok(None);
-				};
-				Ok(Some(codec::Track::opus(&self.broadcast, name)?))
-			}
-			Codec::H264 | Codec::Vp8 | Codec::Vp9 => {
-				let target = match codec {
-					Codec::H264 => VideoCodecKind::H264,
-					Codec::Vp8 => VideoCodecKind::VP8,
-					Codec::Vp9 => VideoCodecKind::VP9,
-					_ => unreachable!(),
-				};
-				let Some((name, config)) = self
-					.catalog
-					.video
-					.renditions
-					.iter()
-					.find(|(_, c)| c.codec.kind() == target)
-				else {
-					return Ok(None);
-				};
-				Ok(Some(codec::Track::video(&self.broadcast, name, config)?))
-			}
-			other => Err(Error::UnsupportedCodec(format!("{other:?}"))),
+/// Find the first catalog rendition for the given codec and build a
+/// [`codec::Track`] subscribed to it. Returns `None` if no rendition matches.
+async fn pick_track(
+	broadcast: &moq_net::BroadcastConsumer,
+	catalog: &Catalog,
+	codec: Codec,
+) -> Result<Option<codec::Track>> {
+	match codec {
+		Codec::Opus => {
+			let Some((name, _config)) = catalog
+				.audio
+				.renditions
+				.iter()
+				.find(|(_, c)| matches!(c.codec, AudioCodec::Opus))
+			else {
+				return Ok(None);
+			};
+			Ok(Some(codec::Track::opus(broadcast, name).await?))
 		}
+		Codec::H264 | Codec::Vp8 | Codec::Vp9 => {
+			let target = match codec {
+				Codec::H264 => VideoCodecKind::H264,
+				Codec::Vp8 => VideoCodecKind::VP8,
+				Codec::Vp9 => VideoCodecKind::VP9,
+				_ => unreachable!(),
+			};
+			let Some((name, config)) = catalog.video.renditions.iter().find(|(_, c)| c.codec.kind() == target) else {
+				return Ok(None);
+			};
+			Ok(Some(codec::Track::video(broadcast, name, config).await?))
+		}
+		other => Err(Error::UnsupportedCodec(format!("{other:?}"))),
 	}
 }
 

@@ -77,9 +77,12 @@ enum TrackConvert {
 
 impl Track {
 	/// Audio track for an Opus rendition.
-	pub fn opus(broadcast: &moq_net::BroadcastConsumer, name: &str) -> Result<Self> {
+	pub async fn opus(broadcast: &moq_net::BroadcastConsumer, name: &str) -> Result<Self> {
 		let container = moq_mux::catalog::hang::Container::Legacy;
-		let track = broadcast.subscribe_track(&moq_net::Track::new(name.to_string()))?;
+		let track = broadcast
+			.subscribe_track(name, moq_net::Subscription::default())
+			.ok()
+			.await?;
 		let consumer = moq_mux::container::Consumer::new(track, container);
 		Ok(Self {
 			consumer,
@@ -90,9 +93,12 @@ impl Track {
 
 	/// Video track. Codec inferred from `config.codec`; bitstream shape
 	/// inferred from `config.description` (avc1 vs avc3).
-	pub fn video(broadcast: &moq_net::BroadcastConsumer, name: &str, config: &VideoConfig) -> Result<Self> {
+	pub async fn video(broadcast: &moq_net::BroadcastConsumer, name: &str, config: &VideoConfig) -> Result<Self> {
 		let container: moq_mux::catalog::hang::Container = (&config.container).try_into()?;
-		let track = broadcast.subscribe_track(&moq_net::Track::new(name.to_string()))?;
+		let track = broadcast
+			.subscribe_track(name, moq_net::Subscription::default())
+			.ok()
+			.await?;
 		let consumer = moq_mux::container::Consumer::new(track, container);
 
 		let (codec, convert) = match &config.codec {

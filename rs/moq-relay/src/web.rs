@@ -508,11 +508,6 @@ async fn serve_fetch(
 
 	tracing::info!(%broadcast, %track, "fetching track");
 
-	let track = moq_net::Track {
-		name: track,
-		..Default::default()
-	};
-
 	let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
 	let result = tokio::time::timeout_at(deadline, async {
@@ -524,10 +519,14 @@ async fn serve_fetch(
 			.announced_broadcast("")
 			.await
 			.ok_or(StatusCode::NOT_FOUND)?;
-		let mut track = broadcast.subscribe_track(&track).map_err(|err| match err {
-			moq_net::Error::NotFound => StatusCode::NOT_FOUND,
-			_ => StatusCode::INTERNAL_SERVER_ERROR,
-		})?;
+		let mut track = broadcast
+			.subscribe_track(&track, moq_net::Subscription::default())
+			.ok()
+			.await
+			.map_err(|err| match err {
+				moq_net::Error::NotFound => StatusCode::NOT_FOUND,
+				_ => StatusCode::INTERNAL_SERVER_ERROR,
+			})?;
 		let group = match params.group {
 			FetchGroup::Latest => match track.latest() {
 				Some(sequence) => track.get_group(sequence).await,

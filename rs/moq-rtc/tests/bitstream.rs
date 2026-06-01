@@ -156,7 +156,7 @@ async fn egress_opus_passthrough() {
 	let snapshot = catalog.snapshot();
 	let (name, _) = snapshot.audio.renditions.iter().next().expect("rendition");
 	let consumer = producer.consume();
-	let mut track = moq_rtc::codec::Track::opus(&consumer, name).expect("opus track");
+	let mut track = moq_rtc::codec::Track::opus(&consumer, name).await.expect("opus track");
 
 	let frame = track.next().await.expect("ok").expect("frame");
 	assert_eq!(frame.timestamp_us, 20_000);
@@ -189,7 +189,9 @@ async fn egress_h264_avc3_passthrough() {
 	let snapshot = catalog.snapshot();
 	let (name, config) = snapshot.video.renditions.iter().next().expect("rendition");
 	let consumer = producer.consume();
-	let mut track = moq_rtc::codec::Track::video(&consumer, name, config).expect("h264 track");
+	let mut track = moq_rtc::codec::Track::video(&consumer, name, config)
+		.await
+		.expect("h264 track");
 
 	let frame = track.next().await.expect("ok").expect("frame");
 	// avc3 storage means catalog `description` is empty; the egress track
