@@ -19,6 +19,7 @@ export class CacheFull extends Error {
 	}
 }
 
+/** Reactive backing state for a {@link Group}: buffered frames, a closed flag, and the running frame count. */
 export class GroupState {
 	frames = new Signal<Uint8Array[]>([]);
 	closed = new Signal<boolean | Error>(false);
@@ -29,10 +30,15 @@ export class GroupState {
 	offset = 0;
 }
 
+/** An ordered stream of frames within a track, delivered over a single QUIC stream. */
 export class Group {
+	/** Sequence number of this group within its track. */
 	readonly sequence: number;
 
+	/** Reactive backing state. */
 	state = new GroupState();
+
+	/** Resolves with the abort error (or undefined) once closed. */
 	readonly closed: Promise<Error | undefined>;
 
 	// Downstream copies that receive every frame written here, synchronously. Used by
@@ -112,14 +118,17 @@ export class Group {
 		return dst;
 	}
 
+	/** Write a string as a single UTF-8 encoded frame. */
 	writeString(str: string) {
 		this.writeFrame(new TextEncoder().encode(str));
 	}
 
+	/** Write a value as a single JSON-encoded frame. */
 	writeJson(json: unknown) {
 		this.writeString(JSON.stringify(json));
 	}
 
+	/** Write a boolean as a single one-byte frame. */
 	writeBool(bool: boolean) {
 		this.writeFrame(new Uint8Array([bool ? 1 : 0]));
 	}
@@ -144,6 +153,7 @@ export class Group {
 		}
 	}
 
+	/** Reads the next frame along with its sequence number within the group. */
 	async readFrameSequence(): Promise<{ sequence: number; data: Uint8Array } | undefined> {
 		for (;;) {
 			if (this.state.offset > 0) throw new CacheFull();
@@ -160,21 +170,25 @@ export class Group {
 		}
 	}
 
+	/** Reads the next frame and decodes it as a UTF-8 string. */
 	async readString(): Promise<string | undefined> {
 		const frame = await this.readFrame();
 		return frame ? new TextDecoder().decode(frame) : undefined;
 	}
 
+	/** Reads the next frame and parses it as JSON. */
 	async readJson(): Promise<unknown | undefined> {
 		const frame = await this.readString();
 		return frame ? JSON.parse(frame) : undefined;
 	}
 
+	/** Reads the next frame and decodes it as a one-byte boolean. */
 	async readBool(): Promise<boolean | undefined> {
 		const frame = await this.readFrame();
 		return frame ? frame[0] === 1 : undefined;
 	}
 
+	/** Closes the group, optionally with an error to abort readers. */
 	close(abort?: Error) {
 		this.state.closed.set(abort ?? true);
 

@@ -73,6 +73,7 @@ export class TrackConsumer {
 	}
 }
 
+/** Reactive backing state for a {@link Broadcast}: requested tracks plus a closed flag. */
 export class BroadcastState {
 	requested = new Signal<TrackRequest[]>([]);
 	closed = new Signal<boolean | Error>(false);
@@ -87,8 +88,10 @@ export class BroadcastState {
  * @public
  */
 export class Broadcast {
+	/** Reactive backing state. */
 	state = new BroadcastState();
 
+	/** Resolves with the abort error (or undefined) once closed. */
 	readonly closed: Promise<Error | undefined>;
 
 	// Consume-side hook installed by the wire layer (Subscriber.consume) to resolve

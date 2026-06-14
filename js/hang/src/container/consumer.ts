@@ -5,10 +5,12 @@ import { Effect, type Getter, type GetterInit, getter, Signal } from "@moq/signa
 import type { Format } from "./format";
 import type { BufferedRanges, Frame } from "./types";
 
+/** Options for constructing a {@link Consumer}. */
 export interface ConsumerProps {
+	/** The container format used to decode each MoQ frame. */
 	format: Format;
-	// Target latency in milliseconds (default: 0). Read-only: a Getter (e.g. another
-	// component's output) is accepted directly.
+	/** Target latency in milliseconds, controlling how aggressively slow groups are skipped (default: 0). */
+	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	latency?: GetterInit<Time.Milli>;
 }
 
@@ -20,6 +22,7 @@ interface Group {
 	done?: boolean; // Set when #runGroup finishes reading all frames
 }
 
+/** Reads frames from a MoQ track in order, buffering groups and skipping slow ones to meet the latency target. */
 export class Consumer {
 	#track: Moq.TrackSubscriber;
 	#format: Format;
@@ -31,10 +34,12 @@ export class Consumer {
 	#notify?: () => void;
 
 	#buffered = new Signal<BufferedRanges>([]);
+	/** The time ranges currently buffered and ready to play. */
 	readonly buffered: Getter<BufferedRanges> = this.#buffered;
 
 	#signals = new Effect();
 
+	/** Start consuming the given track, decoding frames with `props.format`. */
 	constructor(track: Moq.TrackSubscriber, props: ConsumerProps) {
 		this.#track = track;
 		this.#format = props.format;
@@ -232,8 +237,10 @@ export class Consumer {
 		return true;
 	}
 
-	// Returns the next frame in order, along with the group number.
-	// If frame is undefined, the group is done.
+	/**
+	 * Returns the next frame in order along with its group number, awaiting one if needed.
+	 * A `frame` of undefined signals the end of that group; the overall result is undefined once closed.
+	 */
 	async next(): Promise<{ frame: Frame | undefined; group: number } | undefined> {
 		for (;;) {
 			if (
@@ -317,6 +324,7 @@ export class Consumer {
 		this.#buffered.set(ranges);
 	}
 
+	/** Stop consuming and release the track and all buffered groups. */
 	close(): void {
 		this.#signals.close();
 	}

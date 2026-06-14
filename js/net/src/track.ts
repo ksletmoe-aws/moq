@@ -49,6 +49,8 @@ type CachedGroup = { group: Group; time: number; mirrors: Map<TrackState, Group>
 abstract class TrackHandle {
 	readonly name: string;
 	readonly state: TrackState;
+
+	/** Resolves with the abort error (or undefined) once closed. */
 	readonly closed: Promise<Error | undefined>;
 
 	constructor(name: string, state: TrackState) {
@@ -266,18 +268,21 @@ export class TrackProducer extends TrackHandle {
 		group.close();
 	}
 
+	/** Appends a string to the track as its own single-frame group. */
 	writeString(str: string) {
 		const group = this.appendGroup();
 		group.writeString(str);
 		group.close();
 	}
 
+	/** Appends a JSON value to the track as its own single-frame group. */
 	writeJson(json: unknown) {
 		const group = this.appendGroup();
 		group.writeJson(json);
 		group.close();
 	}
 
+	/** Appends a boolean to the track as its own single-frame group. */
 	writeBool(bool: boolean) {
 		const group = this.appendGroup();
 		group.writeBool(bool);
@@ -335,11 +340,12 @@ export class TrackSubscriber extends TrackHandle {
 		}
 	}
 
+	/** Reads the next frame across all groups, discarding older groups. */
 	async readFrame(): Promise<Uint8Array | undefined> {
 		return (await this.readFrameSequence())?.data;
 	}
 
-	// Returns the sequence number of the group and frame, not just the data.
+	/** Reads the next frame along with its group and frame sequence numbers. */
 	async readFrameSequence(): Promise<{ group: number; frame: number; data: Uint8Array } | undefined> {
 		for (;;) {
 			const groups = this.state.groups.peek();
@@ -400,18 +406,21 @@ export class TrackSubscriber extends TrackHandle {
 		}
 	}
 
+	/** Reads the next frame and decodes it as a UTF-8 string. */
 	async readString(): Promise<string | undefined> {
 		const next = await this.readFrame();
 		if (!next) return undefined;
 		return new TextDecoder().decode(next);
 	}
 
+	/** Reads the next frame and parses it as JSON. */
 	async readJson(): Promise<unknown | undefined> {
 		const next = await this.readString();
 		if (!next) return undefined;
 		return JSON.parse(next);
 	}
 
+	/** Reads the next frame and decodes it as a one-byte boolean, throwing on a malformed frame. */
 	async readBool(): Promise<boolean | undefined> {
 		const next = await this.readFrame();
 		if (!next) return undefined;

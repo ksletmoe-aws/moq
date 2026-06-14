@@ -702,14 +702,23 @@ impl TrackProducer {
 
 	pub fn poll_subscription_changed(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Subscription>>> {
 		let prev = &self.prev_subscription;
-		let combined = match self
-			.state
-			.poll(waiter, |state| poll_combined_subscriptions(state, waiter, prev))
-		{
-			Poll::Ready(Ok(combined)) => combined,
+		let mut combined = None;
+		let mut state = match self.state.poll(waiter, |state| {
+			let next = combined_subscription(state, waiter);
+			if &next == prev {
+				Poll::Pending
+			} else {
+				combined = next;
+				Poll::Ready(())
+			}
+		}) {
+			Poll::Ready(Ok(state)) => state,
 			Poll::Ready(Err(state)) => return Poll::Ready(Err(state.abort.clone().unwrap_or(Error::Dropped))),
 			Poll::Pending => return Poll::Pending,
 		};
+		// The aggregate changed: prune any closed subscribers now that we hold the lock.
+		state.subscriptions.retain(|sub| !sub.is_closed());
+		drop(state);
 		self.prev_subscription = combined.clone();
 		Poll::Ready(Ok(combined))
 	}
@@ -735,17 +744,23 @@ impl TrackProducer {
 /// [`GroupRequest`] bound to a fresh producer handle. Shared by every
 /// [`TrackDynamic`] handle on the track.
 fn poll_requested_group(state: &kio::Producer<TrackState>, waiter: &kio::Waiter) -> Poll<Result<GroupRequest>> {
-	let req = ready!(state.poll(waiter, |state| {
-		// Read-only `is_empty` first: only take the `&mut` (which flags the state
-		// modified) once there's a request to pop, so idle polls don't wake waiters.
-		if state.fetches.is_empty() {
-			return state.abort.clone().map_or(Poll::Pending, |err| Poll::Ready(Err(err)));
+	// Read-only predicate: ready once there's a request to pop, or the track aborted.
+	let mut guard = ready!(state.poll(waiter, |state| {
+		if state.fetches.is_empty() && state.abort.is_none() {
+			Poll::Pending
+		} else {
+			Poll::Ready(())
 		}
-		Poll::Ready(Ok(state.fetches.pop_front().unwrap()))
 	}))
 	.map_err(|state| state.abort.clone().unwrap_or(Error::Dropped))?;
 
-	Poll::Ready(req.map(|req| GroupRequest {
+	let req = match guard.fetches.pop_front() {
+		Some(req) => req,
+		// Woke because the track aborted while the fetch queue was empty.
+		None => return Poll::Ready(Err(guard.abort.clone().unwrap_or(Error::Dropped))),
+	};
+
+	Poll::Ready(Ok(GroupRequest {
 		state: state.clone(),
 		sequence: req.sequence,
 		priority: req.priority,
@@ -839,39 +854,21 @@ impl Drop for TrackProducer {
 	}
 }
 
-/// Aggregate every live subscriber's preferences into the most demanding request,
-/// returning `Poll::Ready` only when the result differs from `prev`.
+/// Aggregate every live subscriber's preferences into the most demanding request.
 ///
-/// Iterates `subscriptions` immutably so it never flags the [`TrackState`] as
-/// modified on a no-op poll. Marking it modified would drain and wake unrelated
-/// waiters on the channel (e.g. a [`TrackSubscribe`] parked on track
-/// info), which races with [`TrackRequest::accept`] and can drop that wakeup.
-/// Closed subscribers are pruned only when one has actually closed, which is a
-/// real change that legitimately wakes other waiters.
-fn poll_combined_subscriptions(
-	state: &mut kio::Mut<'_, TrackState>,
-	waiter: &kio::Waiter,
-	prev: &Option<Subscription>,
-) -> Poll<Option<Subscription>> {
+/// Read-only: iterates `subscriptions` immutably and registers `waiter` on each, so it
+/// never flags the [`TrackState`] as modified. Marking it modified would drain and wake
+/// unrelated waiters on the channel (e.g. a [`TrackSubscribe`] parked on track info),
+/// which races with [`TrackRequest::accept`] and can drop that wakeup. Callers decide
+/// readiness from the returned value, then prune closed subscribers through the `Mut`.
+fn combined_subscription(state: &TrackState, waiter: &kio::Waiter) -> Option<Subscription> {
 	let mut combined = None;
-	let mut any_closed = false;
 	for sub in state.subscriptions.iter() {
-		match sub.poll(waiter, |sub| sub.poll_combined(&combined)) {
-			Poll::Ready(Ok(sub)) => combined = Some(sub),
-			Poll::Ready(Err(_)) => any_closed = true,
-			Poll::Pending => {}
+		if let Poll::Ready(Ok(sub)) = sub.poll(waiter, |sub| sub.poll_combined(&combined)) {
+			combined = Some(sub);
 		}
 	}
-
-	if any_closed {
-		state.subscriptions.retain(|sub| !sub.is_closed());
-	}
-
-	if &combined == prev {
-		Poll::Pending
-	} else {
-		Poll::Ready(combined)
-	}
+	combined
 }
 
 /// A weak reference to a track that doesn't prevent auto-close.
@@ -1424,14 +1421,23 @@ impl TrackRequest {
 
 	pub fn poll_subscription_changed(&mut self, waiter: &kio::Waiter) -> Poll<Option<Subscription>> {
 		let prev = &self.prev_subscription;
+		let mut combined = None;
 		// The request owns the only producer, so the channel can't be closed here.
-		let combined = match ready!(
-			self.state
-				.poll(waiter, |state| poll_combined_subscriptions(state, waiter, prev))
-		) {
-			Ok(combined) => combined,
+		let mut state = match ready!(self.state.poll(waiter, |state| {
+			let next = combined_subscription(state, waiter);
+			if &next == prev {
+				Poll::Pending
+			} else {
+				combined = next;
+				Poll::Ready(())
+			}
+		})) {
+			Ok(state) => state,
 			Err(_) => unreachable!("a TrackRequest holds the only producer"),
 		};
+		// The aggregate changed: prune any closed subscribers now that we hold the lock.
+		state.subscriptions.retain(|sub| !sub.is_closed());
+		drop(state);
 		self.prev_subscription = combined.clone();
 		Poll::Ready(combined)
 	}
