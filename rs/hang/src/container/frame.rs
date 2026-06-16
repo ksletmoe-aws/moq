@@ -54,8 +54,7 @@ impl Frame {
 		// wire independently of the container-level prefix, but only when the track
 		// advertises a timescale. Untimed tracks (e.g. an on-demand TrackRequest
 		// accepted with default info) carry the timestamp in the container prefix
-		// alone, matching the timeless net frames LOC/CMAF already produce. This
-		// container reports no per-frame duration, so it stays unknown (`None`).
+		// alone, matching the timeless net frames LOC/CMAF already produce.
 		let net_timestamp = group
 			.timescale()
 			.map(|scale| self.timestamp.convert(scale))
@@ -63,7 +62,6 @@ impl Frame {
 		let net_frame = moq_net::Frame {
 			size,
 			timestamp: net_timestamp,
-			duration: None,
 		};
 		let mut chunked = group.create_frame(net_frame)?;
 		chunked.write(header.freeze())?;
