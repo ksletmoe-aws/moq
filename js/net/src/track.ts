@@ -1,5 +1,6 @@
 import { Signal } from "@moq/signals";
-import { CacheFull, Group } from "./group.ts";
+import { CacheFull, type Frame, Group } from "./group.ts";
+import { Timescale } from "./time.ts";
 
 /** Default {@link TrackInfo.cache} window (milliseconds) when the publisher doesn't set one. */
 export const DEFAULT_CACHE_MS = 5000;
@@ -14,6 +15,12 @@ export const DEFAULT_CACHE_MS = 5000;
 export interface TrackInfo {
 	/** Hint that frames are worth compressing (e.g. a JSON catalog). */
 	compress: boolean;
+	/**
+	 * Units per second for this track's frame timestamps (reported in TRACK_INFO on
+	 * Lite05+). Defaults to milliseconds; set it finer (e.g. {@link Timescale.MICRO})
+	 * for media that needs sub-millisecond timing.
+	 */
+	timescale: Timescale;
 	/** How long (milliseconds) old groups stay available before eviction. */
 	cache: number;
 	/** Tie-break priority between subscriptions of equal subscriber priority. */
@@ -26,6 +33,7 @@ export interface TrackInfo {
 export function trackInfoDefaults(info: Partial<TrackInfo> = {}): TrackInfo {
 	return {
 		compress: info.compress ?? false,
+		timescale: info.timescale ?? Timescale.MILLI,
 		cache: info.cache ?? DEFAULT_CACHE_MS,
 		priority: info.priority ?? 0,
 		ordered: info.ordered ?? true,
@@ -261,8 +269,8 @@ export class TrackProducer extends TrackHandle {
 		this.#sinks.clear();
 	}
 
-	/** Append a frame as its own single-frame group. */
-	writeFrame(frame: Uint8Array) {
+	/** Append a frame as its own single-frame group; a frame with no timestamp uses wall-clock now. */
+	writeFrame(frame: Frame) {
 		const group = this.appendGroup();
 		group.writeFrame(frame);
 		group.close();
@@ -363,7 +371,7 @@ export class TrackSubscriber extends TrackHandle {
 				const next = frames.shift();
 				if (next) {
 					const frame = groups[0].state.total.peek() - frames.length - 1;
-					return { group: groups[0].sequence, frame, data: next };
+					return { group: groups[0].sequence, frame, data: next.data };
 				}
 
 				// Skip this old group
@@ -393,7 +401,7 @@ export class TrackSubscriber extends TrackHandle {
 			const next = frames.shift();
 			if (next) {
 				const frame = group.state.total.peek() - frames.length - 1;
-				return { group: group.sequence, frame, data: next };
+				return { group: group.sequence, frame, data: next.data };
 			}
 
 			// If the track is closed, return undefined.

@@ -1,10 +1,27 @@
 import { Signal } from "@moq/signals";
+import { Timestamp } from "./time.ts";
 
 /** Maximum bytes of frames cached in a group before old frames are evicted from the front. */
 export const MAX_GROUP_CACHE_BYTES = 32 * 1024 * 1024;
 
 /** Maximum number of frames cached in a group before old frames are evicted from the front. */
 export const MAX_GROUP_FRAMES = 1024;
+
+/**
+ * A frame buffered in a {@link Group}: its presentation {@link Timestamp} and payload bytes.
+ *
+ * The timestamp carries its own scale, so a track can pick its units; the wire layer
+ * converts it into the track's negotiated timescale.
+ */
+export interface Frame {
+	/** The frame payload. */
+	data: Uint8Array;
+	/**
+	 * Presentation timestamp. Required: for data with no presentation time of its own
+	 * (a JSON catalog, control state) pass {@link Timestamp.now} explicitly.
+	 */
+	timestamp: Timestamp;
+}
 
 /**
  * Thrown by a frame read when the reader fell behind the group's eviction window: frames
@@ -21,7 +38,7 @@ export class CacheFull extends Error {
 
 /** Reactive backing state for a {@link Group}: buffered frames, a closed flag, and the running frame count. */
 export class GroupState {
-	frames = new Signal<Uint8Array[]>([]);
+	frames = new Signal<Frame[]>([]);
 	closed = new Signal<boolean | Error>(false);
 	total = new Signal<number>(0); // The total number of frames in the group thus far
 
@@ -61,14 +78,13 @@ export class Group {
 		});
 	}
 
-	/**
-	 * Writes a frame to the group.
-	 * @param frame - The frame to write
-	 */
-	writeFrame(frame: Uint8Array) {
+	/** Writes a frame to the group. */
+	writeFrame(frame: Frame) {
 		if (this.state.closed.peek()) throw new Error("group is closed");
 
-		this.#cacheBytes += frame.byteLength;
+		const { data } = frame;
+
+		this.#cacheBytes += data.byteLength;
 		this.state.frames.mutate((frames) => {
 			frames.push(frame);
 
@@ -77,7 +93,7 @@ export class Group {
 			while (frames.length > MAX_GROUP_FRAMES || this.#cacheBytes > MAX_GROUP_CACHE_BYTES) {
 				const evicted = frames.shift();
 				if (!evicted) break;
-				this.#cacheBytes -= evicted.byteLength;
+				this.#cacheBytes -= evicted.data.byteLength;
 				this.state.offset++;
 			}
 		});
@@ -118,26 +134,26 @@ export class Group {
 		return dst;
 	}
 
-	/** Write a string as a single UTF-8 encoded frame. */
+	/** Write a string as a single UTF-8 encoded frame, stamped with wall-clock now. */
 	writeString(str: string) {
-		this.writeFrame(new TextEncoder().encode(str));
+		this.writeFrame({ data: new TextEncoder().encode(str), timestamp: Timestamp.now() });
 	}
 
-	/** Write a value as a single JSON-encoded frame. */
+	/** Write a value as a single JSON-encoded frame, stamped with wall-clock now. */
 	writeJson(json: unknown) {
 		this.writeString(JSON.stringify(json));
 	}
 
-	/** Write a boolean as a single one-byte frame. */
+	/** Write a boolean as a single one-byte frame, stamped with wall-clock now. */
 	writeBool(bool: boolean) {
-		this.writeFrame(new Uint8Array([bool ? 1 : 0]));
+		this.writeFrame({ data: new Uint8Array([bool ? 1 : 0]), timestamp: Timestamp.now() });
 	}
 
 	/**
-	 * Reads the next frame from the group.
+	 * Reads the next frame (timestamp + payload) from the group.
 	 * @returns A promise that resolves to the next frame or undefined
 	 */
-	async readFrame(): Promise<Uint8Array | undefined> {
+	async readFrame(): Promise<Frame | undefined> {
 		for (;;) {
 			if (this.state.offset > 0) throw new CacheFull();
 
@@ -153,14 +169,14 @@ export class Group {
 		}
 	}
 
-	/** Reads the next frame along with its sequence number within the group. */
+	/** Reads the next frame's payload along with its sequence number within the group. */
 	async readFrameSequence(): Promise<{ sequence: number; data: Uint8Array } | undefined> {
 		for (;;) {
 			if (this.state.offset > 0) throw new CacheFull();
 
 			const frames = this.state.frames.peek();
 			const frame = frames.shift();
-			if (frame) return { sequence: this.state.total.peek() - frames.length - 1, data: frame };
+			if (frame) return { sequence: this.state.total.peek() - frames.length - 1, data: frame.data };
 
 			const closed = this.state.closed.peek();
 			if (closed instanceof Error) throw closed;
@@ -170,22 +186,22 @@ export class Group {
 		}
 	}
 
-	/** Reads the next frame and decodes it as a UTF-8 string. */
+	/** Reads the next frame and decodes its payload as a UTF-8 string. */
 	async readString(): Promise<string | undefined> {
 		const frame = await this.readFrame();
-		return frame ? new TextDecoder().decode(frame) : undefined;
+		return frame ? new TextDecoder().decode(frame.data) : undefined;
 	}
 
-	/** Reads the next frame and parses it as JSON. */
+	/** Reads the next frame and parses its payload as JSON. */
 	async readJson(): Promise<unknown | undefined> {
 		const frame = await this.readString();
 		return frame ? JSON.parse(frame) : undefined;
 	}
 
-	/** Reads the next frame and decodes it as a one-byte boolean. */
+	/** Reads the next frame and decodes its payload as a one-byte boolean. */
 	async readBool(): Promise<boolean | undefined> {
 		const frame = await this.readFrame();
-		return frame ? frame[0] === 1 : undefined;
+		return frame ? frame.data[0] === 1 : undefined;
 	}
 
 	/** Closes the group, optionally with an error to abort readers. */

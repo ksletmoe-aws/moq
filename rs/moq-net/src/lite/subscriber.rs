@@ -648,7 +648,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				Compression::None => {
 					// `create_frame` is the allocation chokepoint and rejects an
 					// oversized `size` before allocating, so no pre-check is needed.
-					let mut frame = group.create_frame(FrameInfo { size, timestamp })?;
+					// No wire timestamp (pre-lite-05) means wall-clock at receive.
+					let mut frame = match timestamp {
+						Some(ts) => group.create_frame(FrameInfo { size, timestamp: ts })?,
+						None => group.create_frame_now(size)?,
+					};
 					track_stats.frame();
 
 					if let Err(err) = self.run_frame(stream, &mut frame, &track_stats).await {
@@ -672,10 +676,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					track_stats.bytes(size);
 
 					let payload = compression.decompress(&packed)?;
-					let mut frame = group.create_frame(FrameInfo {
-						size: payload.len() as u64,
-						timestamp,
-					})?;
+					let size = payload.len() as u64;
+					let mut frame = match timestamp {
+						Some(ts) => group.create_frame(FrameInfo { size, timestamp: ts })?,
+						None => group.create_frame_now(size)?,
+					};
 					frame.write(bytes::Bytes::from(payload))?;
 					frame.finish()?;
 				}
@@ -833,7 +838,9 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 		let (mut track, compression, timescale) = if self.subscriber.version.has_timestamps() {
 			match self.track_info().await {
 				Ok((info, compression)) => {
-					let timescale = info.timescale;
+					// Lite05 carries per-frame timestamps on the wire at this scale; `Some`
+					// tells `run_group` to decode them (vs. wall-clock-stamping locally).
+					let timescale = Some(info.timescale);
 					(Some(Track::Active(request.accept(info))), compression, timescale)
 				}
 				Err(err) => {
@@ -1242,7 +1249,9 @@ impl<S: web_transport_trait::Session> TrackServe<S> {
 		// TrackInfo only takes effect if the track isn't accepted yet (a fetch with no
 		// live subscription); otherwise the group inherits the accepted timescale.
 		let group_info = TrackInfo {
-			timescale,
+			// FETCH is lite-05+, so `timescale` is `Some`; fall back to the default scale
+			// defensively rather than panicking.
+			timescale: timescale.unwrap_or_default(),
 			..Default::default()
 		};
 		let mut producer = match request.accept(group_info) {

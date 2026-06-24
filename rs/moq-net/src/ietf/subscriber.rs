@@ -599,7 +599,12 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		// Accept right away: IETF group data can arrive before SubscribeOk, so we
 		// need the producer in place to route it. This also unblocks the
 		// downstream subscriber's `consume_track`.
-		let mut track = request.accept(None);
+		//
+		// Set the track timescale to microseconds: IETF object timestamps default to
+		// microseconds, and `create_frame` normalizes each frame into the track scale.
+		// Accepting at milliseconds (the default) would truncate microsecond precision.
+		let info = crate::TrackInfo::default().with_timescale(crate::Timescale::MICRO);
+		let mut track = request.accept(info);
 
 		let request_id = match self.control.next_request_id().await {
 			Ok(id) => id,
@@ -818,19 +823,24 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				return Err(Error::Unsupported);
 			}
 
-			if group.flags.has_extensions {
+			// Per-object extension headers may carry the frame's presentation timestamp
+			// (Timestamp/Timescale Object Properties). Absent it, we wall-clock-stamp.
+			let timestamp = if group.flags.has_extensions {
 				let size: usize = stream.decode().await?;
-				stream.skip(size).await?;
-			}
+				let mut ext = stream.read_exact(size).await?;
+				ietf::decode_object_time(&mut ext, self.version)?
+			} else {
+				None
+			};
 
 			let size: u64 = stream.decode().await?;
 			if size == 0 {
 				let status: u64 = stream.decode().await?;
 				if status == 0 {
-					let mut frame = producer.create_frame(FrameInfo {
-						size: 0,
-						timestamp: None,
-					})?;
+					let mut frame = match timestamp {
+						Some(ts) => producer.create_frame(FrameInfo { size: 0, timestamp: ts })?,
+						None => producer.create_frame_now(0)?,
+					};
 					track_stats.frame();
 					frame.finish()?;
 				} else if status == 3 && !group.flags.has_end {
@@ -839,9 +849,12 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					return Err(Error::Unsupported);
 				}
 			} else {
-				// `create_frame` is the allocation chokepoint and rejects an oversized
+				// `create_frame*` is the allocation chokepoint and rejects an oversized
 				// `size` before allocating, so no pre-check is needed.
-				let mut frame = producer.create_frame(FrameInfo { size, timestamp: None })?;
+				let mut frame = match timestamp {
+					Some(ts) => producer.create_frame(FrameInfo { size, timestamp: ts })?,
+					None => producer.create_frame_now(size)?,
+				};
 				track_stats.frame();
 
 				if let Err(err) = self.run_frame(stream, frame.clone(), &track_stats).await {

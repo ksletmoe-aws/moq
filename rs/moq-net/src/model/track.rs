@@ -13,7 +13,7 @@
 //!
 //! The track is closed with [Error] when all writers or readers are dropped.
 
-use crate::{BroadcastInfo, Error, Result, Subscription, Timescale, coding};
+use crate::{BroadcastInfo, Error, Result, Subscription, Timescale, Timestamp, coding};
 
 use super::{Fetch, GroupConsumer, GroupInfo, GroupProducer};
 
@@ -43,13 +43,12 @@ pub struct TrackInfo {
 	pub compress: bool,
 	/// Units per second for per-frame timestamps on this track.
 	///
-	/// `None` means the publisher hasn't advertised a timescale; subscribers
-	/// receive frames with `timestamp: None`. On Lite05+ a `Some(_)` value is
-	/// reported in TRACK_INFO and the publisher zigzag-delta encodes
-	/// per-frame timestamps at that scale on the wire; rejecting a frame at
-	/// the wrong scale prevents silent corruption.
-	#[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-	pub timescale: Option<Timescale>,
+	/// Every track is timed; this defaults to [`Timescale::MILLI`]. On Lite05+ it is
+	/// reported in TRACK_INFO and the publisher zigzag-delta encodes per-frame
+	/// timestamps at this scale on the wire. Protocols whose wire can't carry it
+	/// (pre-Lite05 moq-lite, IETF moq-transport) fall back to wall-clock milliseconds.
+	#[cfg_attr(feature = "serde", serde(default))]
+	pub timescale: Timescale,
 	/// How long the publisher keeps old groups available before evicting them
 	/// (the newest group is always retained). A subscriber's
 	/// [`Subscription::stale`] window is clamped to this, since a group can't be
@@ -104,7 +103,7 @@ impl Default for TrackInfo {
 	fn default() -> Self {
 		Self {
 			compress: false,
-			timescale: None,
+			timescale: Timescale::default(),
 			cache: DEFAULT_CACHE,
 			priority: 0,
 			ordered: true,
@@ -121,9 +120,10 @@ impl TrackInfo {
 
 	/// Set the per-frame timestamp scale, returning `self` for chaining.
 	///
-	/// Required for Lite05+ peers to encode per-frame timestamps on the wire.
+	/// Defaults to [`Timescale::MILLI`]. On Lite05+ this scale is reported in TRACK_INFO
+	/// and used to encode per-frame timestamps on the wire.
 	pub fn with_timescale(mut self, timescale: Timescale) -> Self {
-		self.timescale = Some(timescale);
+		self.timescale = timescale;
 		self
 	}
 
@@ -562,10 +562,22 @@ impl TrackProducer {
 		Ok(group)
 	}
 
-	/// Create a group with a single frame.
-	pub fn write_frame<B: Into<bytes::Bytes>>(&mut self, frame: B) -> Result<()> {
+	/// Create a group with a single frame, at the given presentation timestamp.
+	///
+	/// The timestamp is converted into the track's timescale. Use
+	/// [`Self::write_frame_now`] to stamp wall-clock time instead.
+	pub fn write_frame<B: Into<bytes::Bytes>>(&mut self, timestamp: Timestamp, frame: B) -> Result<()> {
 		let mut group = self.append_group()?;
-		group.write_frame(frame.into())?;
+		group.write_frame(timestamp, frame.into())?;
+		group.finish()?;
+		Ok(())
+	}
+
+	/// Like [`Self::write_frame`] but stamps the frame with wall-clock now
+	/// ([`Timestamp::now`]).
+	pub fn write_frame_now<B: Into<bytes::Bytes>>(&mut self, frame: B) -> Result<()> {
+		let mut group = self.append_group()?;
+		group.write_frame_now(frame.into())?;
 		group.finish()?;
 		Ok(())
 	}
@@ -2172,8 +2184,8 @@ mod test {
 		let mut producer = track_producer("test", None);
 		let mut consumer = producer.subscribe(None);
 
-		producer.write_frame(b"hello".as_slice()).unwrap();
-		producer.write_frame(b"world".as_slice()).unwrap();
+		producer.write_frame_now(b"hello".as_slice()).unwrap();
+		producer.write_frame_now(b"world".as_slice()).unwrap();
 
 		let frame = consumer
 			.read_frame()
@@ -2201,7 +2213,7 @@ mod test {
 		let _stalled = producer.create_group(GroupInfo { sequence: 3 }).unwrap();
 		// Seq 5: fully-written group with a frame.
 		let mut g5 = producer.create_group(GroupInfo { sequence: 5 }).unwrap();
-		g5.write_frame(bytes::Bytes::from_static(b"later")).unwrap();
+		g5.write_frame_now(bytes::Bytes::from_static(b"later")).unwrap();
 		g5.finish().unwrap();
 
 		// read_frame should not block on the stalled seq 3 — it returns seq 5's frame.
@@ -2221,12 +2233,12 @@ mod test {
 
 		// Group 0 has two frames; only the first is returned.
 		let mut g0 = producer.create_group(GroupInfo { sequence: 0 }).unwrap();
-		g0.write_frame(bytes::Bytes::from_static(b"one")).unwrap();
-		g0.write_frame(bytes::Bytes::from_static(b"two")).unwrap();
+		g0.write_frame_now(bytes::Bytes::from_static(b"one")).unwrap();
+		g0.write_frame_now(bytes::Bytes::from_static(b"two")).unwrap();
 		g0.finish().unwrap();
 
 		// Group 1 is a normal single-frame group.
-		producer.write_frame(b"next".as_slice()).unwrap();
+		producer.write_frame_now(b"next".as_slice()).unwrap();
 
 		let frame = consumer
 			.read_frame()
@@ -2263,7 +2275,7 @@ mod test {
 		);
 
 		// A late frame on the pending group is still delivered.
-		g0.write_frame(bytes::Bytes::from_static(b"late")).unwrap();
+		g0.write_frame_now(bytes::Bytes::from_static(b"late")).unwrap();
 		let frame = consumer
 			.read_frame()
 			.now_or_never()
@@ -2283,11 +2295,11 @@ mod test {
 
 		// Seq 3 has a frame but is below min_sequence — must be skipped.
 		let mut g3 = producer.create_group(GroupInfo { sequence: 3 }).unwrap();
-		g3.write_frame(bytes::Bytes::from_static(b"skip-me")).unwrap();
+		g3.write_frame_now(bytes::Bytes::from_static(b"skip-me")).unwrap();
 		g3.finish().unwrap();
 
 		let mut g5 = producer.create_group(GroupInfo { sequence: 5 }).unwrap();
-		g5.write_frame(bytes::Bytes::from_static(b"keep")).unwrap();
+		g5.write_frame_now(bytes::Bytes::from_static(b"keep")).unwrap();
 		g5.finish().unwrap();
 
 		let frame = consumer
@@ -2304,7 +2316,7 @@ mod test {
 		let mut producer = track_producer("test", None);
 		let mut consumer = producer.subscribe(None);
 
-		producer.write_frame(b"only".as_slice()).unwrap();
+		producer.write_frame_now(b"only".as_slice()).unwrap();
 		producer.finish().unwrap();
 
 		let frame = consumer
@@ -2363,7 +2375,7 @@ mod test {
 
 		// Produce a cached group.
 		let mut group = producer.append_group().unwrap(); // seq 0
-		group.write_frame(bytes::Bytes::from_static(b"hello")).unwrap();
+		group.write_frame_now(bytes::Bytes::from_static(b"hello")).unwrap();
 		group.finish().unwrap();
 
 		// A cached group resolves immediately and never queues a request. `get_group`
@@ -2402,7 +2414,7 @@ mod test {
 
 		// Serve it by accepting the request; the fetch then resolves.
 		let mut group = req.accept(None).unwrap();
-		group.write_frame(bytes::Bytes::from_static(b"hi")).unwrap();
+		group.write_frame_now(bytes::Bytes::from_static(b"hi")).unwrap();
 		group.finish().unwrap();
 
 		let mut g = pending.await.unwrap();

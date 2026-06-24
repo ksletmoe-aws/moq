@@ -61,8 +61,9 @@ export class TrackInfo {
 	priority: number;
 	ordered: boolean;
 	/**
-	 * Per-frame timestamp scale (units per second). `0` means frames carry no
-	 * per-frame timestamps on the wire.
+	 * Per-frame timestamp scale (units per second). Mandatory on Lite05: a real
+	 * (non-zero) scale, and every frame on the wire is prefixed with a zigzag-delta
+	 * timestamp at this scale.
 	 */
 	timescale: number;
 	/** Codec applied to every frame payload on this track. */
@@ -96,6 +97,9 @@ export class TrackInfo {
 		const priority = await r.u8();
 		const ordered = await r.bool();
 		const timescale = await r.u53();
+		// Mandatory on Lite05: a zero scale is invalid (mirrors Rust's Timescale::new rejection),
+		// and would otherwise throw later when wrapped in Timescale().
+		if (timescale === 0) throw new Error("track timescale must be non-zero");
 		const compression = compressionFromCode(await r.u53());
 		return new TrackInfo({ priority, ordered, timescale, compression });
 	}

@@ -4,8 +4,9 @@
  *
  * @module
  */
-import type { Time } from "@moq/net";
+
 import * as Moq from "@moq/net";
+import { Time } from "@moq/net";
 
 /** A decoded LOC frame: the codec bitstream plus its timing metadata. */
 export interface Frame {
@@ -116,7 +117,10 @@ export class Producer {
 			throw new Error("must start with a keyframe");
 		}
 
-		this.#group?.writeFrame(this.#encode(data, timestamp));
+		this.#group?.writeFrame({
+			data: this.#encode(data, timestamp),
+			timestamp: Time.Timestamp.fromMicros(timestamp),
+		});
 	}
 
 	#encode(source: Uint8Array | Source, timestamp: Time.Micro): Uint8Array {

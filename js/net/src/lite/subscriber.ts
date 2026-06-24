@@ -26,6 +26,11 @@ import { Version } from "./version.ts";
 // The timeout turns that into a clear error.
 const SUBSCRIBE_SETUP_TIMEOUT_MS = 10_000;
 
+/** Decode an unsigned zigzag varint back to a signed delta (mirrors Rust `VarInt::to_zigzag`). */
+function unzigzag(v: bigint): bigint {
+	return (v >> 1n) ^ -(v & 1n);
+}
+
 // The TRACK stream and implicit SUBSCRIBE acceptance are lite-05+.
 function supportsTrackStream(version: Version): boolean {
 	switch (version) {
@@ -229,6 +234,7 @@ export class Subscriber {
 			const info = await this.#trackInfo(path, name);
 			return {
 				compress: info.compression !== Compression.None,
+				timescale: Time.Timescale(info.timescale),
 				// The wire no longer carries a cache hint (retention is best-effort),
 				// so the local retention window falls back to the model default.
 				cache: DEFAULT_CACHE_MS,
@@ -348,6 +354,7 @@ export class Subscriber {
 			const info = await this.#trackInfo(msg.broadcast, msg.track);
 			producer = request.accept({
 				compress: info.compression !== Compression.None,
+				timescale: Time.Timescale(info.timescale),
 				// The wire no longer carries a cache hint (retention is best-effort),
 				// so the local retention window falls back to the model default.
 				cache: DEFAULT_CACHE_MS,
@@ -494,20 +501,23 @@ export class Subscriber {
 				codec = compression.peek();
 			}
 
-			// timescale resolves together with compression (from TRACK_INFO). A
-			// non-zero scale means every frame is prefixed with a zigzag-delta
-			// timestamp (see the lite-05 FRAME format). We don't surface it to the
-			// application yet, but we must still read the varint to keep the frame
-			// framing in sync with the publisher.
+			// timescale resolves together with compression (from TRACK_INFO). A non-zero
+			// scale means every frame is prefixed with a zigzag-delta timestamp (the
+			// lite-05 FRAME format), which we decode into a Timestamp at that scale.
+			// Scale 0 (pre-lite-05) carries no timestamp, so we wall-clock-stamp.
 			const scale = timescale.peek() ?? 0;
+			let prevTs = 0n;
 
 			for (;;) {
 				const done = await Promise.race([stream.done(), track.closed, producer.closed]);
 				if (done !== false) break;
 
+				let timestamp: Time.Timestamp;
 				if (scale !== 0) {
-					// Consume (and discard) the per-frame timestamp delta.
-					await stream.u62();
+					prevTs += unzigzag(await stream.u62());
+					timestamp = new Time.Timestamp(Number(prevTs), Time.Timescale(scale));
+				} else {
+					timestamp = Time.Timestamp.now();
 				}
 
 				const size = await stream.u53();
@@ -516,7 +526,8 @@ export class Subscriber {
 
 				// On a compressed track the wire size is the compressed length;
 				// inflate it back to the original frame the consumer sees.
-				producer.writeFrame(codec === Compression.None ? payload : await decompress(codec, payload));
+				const data = codec === Compression.None ? payload : await decompress(codec, payload);
+				producer.writeFrame({ data, timestamp });
 			}
 
 			producer.close();
