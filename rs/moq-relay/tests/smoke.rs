@@ -92,10 +92,18 @@ async fn spawn_relay() -> (u16, tokio::task::JoinHandle<()>) {
 }
 
 fn client() -> moq_native::Client {
+	client_version(None)
+}
+
+/// A client pinned to a single MoQ version, or all versions when `None`.
+fn client_version(version: Option<moq_net::Version>) -> moq_native::Client {
 	let mut config = moq_native::ClientConfig::default();
 	config.tls.disable_verify = Some(true);
 	// Zero head start so the WebSocket path runs immediately.
 	config.websocket.delay = None;
+	if let Some(version) = version {
+		config.version = vec![version];
+	}
 	config.init().expect("client init")
 }
 
@@ -420,8 +428,11 @@ async fn spawn_internal_unix_relay() -> (std::path::PathBuf, tokio::task::JoinHa
 	let cluster = Cluster::new(ClusterConfig::default()).expect("cluster init");
 
 	// Keep the path short: macOS caps AF_UNIX paths around 104 bytes, and the
-	// system temp dir is long. /tmp is fine on macOS and Linux.
-	let path = std::path::PathBuf::from(format!("/tmp/moq-internal-{}.sock", std::process::id()));
+	// system temp dir is long. /tmp is fine on macOS and Linux. A per-call counter
+	// keeps concurrent tests in the same process off each other's socket.
+	static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+	let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	let path = std::path::PathBuf::from(format!("/tmp/moq-internal-{}-{seq}.sock", std::process::id()));
 
 	let mut internal = InternalConfig::default();
 	internal.uds.listen = Some(path.clone());
@@ -510,6 +521,109 @@ async fn internal_unix_round_trip() {
 	drop(broadcast);
 	drop(pub_session);
 	drop(sub_session);
+	handle.abort();
+}
+
+/// Every version whose SETUP carries a request path the server reads: moq-lite-05
+/// (Setup Stream) and moq-transport 14-18 (the `Path` SETUP parameter, in-band on
+/// the bidi stream for 14-16 and the uni Setup Stream for 17-18).
+fn path_versions() -> Vec<moq_net::Version> {
+	[
+		"moq-lite-05-wip",
+		"moq-transport-14",
+		"moq-transport-15",
+		"moq-transport-16",
+		"moq-transport-17",
+		"moq-transport-18",
+	]
+	.iter()
+	.map(|alpn| alpn.parse().expect("parse version alpn"))
+	.collect()
+}
+
+/// Publisher and subscriber (both pinned to `version`) that announce/observe
+/// `broadcast` over the internal listener at `pub_url` / `sub_url`. Returns the
+/// path the subscriber sees the publisher's broadcast announced at, proving
+/// whether the request path reached the server (it scopes the publisher's grant
+/// to that root).
+async fn path_round_trip(version: moq_net::Version, pub_url: url::Url, sub_url: url::Url, broadcast: &str) -> String {
+	let pub_origin = Origin::random().produce();
+	let mut bc = pub_origin.create_broadcast(broadcast).expect("create broadcast");
+	let mut track = bc.create_track("video", None).expect("create track");
+	let mut group = track.append_group().expect("append group");
+	group.write_frame_now(b"hello".as_ref()).expect("write frame");
+	group.finish().expect("finish group");
+
+	let pub_client = client_version(Some(version)).with_publisher(pub_origin.consume());
+	let pub_session = tokio::time::timeout(TIMEOUT, pub_client.connect(pub_url))
+		.await
+		.expect("publisher connect timeout")
+		.expect("publisher connect failed");
+
+	let sub_origin = Origin::random().produce();
+	let mut announcements = sub_origin.consume().announced();
+	let sub_client = client_version(Some(version)).with_subscriber(sub_origin);
+	let sub_session = tokio::time::timeout(TIMEOUT, sub_client.connect(sub_url))
+		.await
+		.expect("subscriber connect timeout")
+		.expect("subscriber connect failed");
+
+	let (path, _) = tokio::time::timeout(TIMEOUT, announcements.next())
+		.await
+		.expect("announcement timeout")
+		.expect("origin closed");
+
+	drop(track);
+	drop(bc);
+	drop(pub_session);
+	drop(sub_session);
+	path.as_str().to_string()
+}
+
+/// A `tcp://host:port/<path>` client advertises `<path>` in the SETUP; the relay
+/// scopes its grant to that root, so the publisher's broadcast lands prefixed.
+/// Proves the request path can be specified and reaches the server over plain TCP,
+/// across every version whose SETUP carries a path.
+#[tokio::test]
+async fn internal_tcp_path_reaches_server() {
+	let (port, handle) = spawn_internal_relay().await;
+
+	// Publisher addresses `/room`; subscriber addresses the bare root.
+	let pub_url: url::Url = format!("tcp://127.0.0.1:{port}/room").parse().expect("parse url");
+	let sub_url: url::Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+
+	for version in path_versions() {
+		let announced = path_round_trip(version, pub_url.clone(), sub_url.clone(), "test").await;
+		assert_eq!(
+			announced, "room/test",
+			"the SETUP path should scope the publisher's grant ({version})"
+		);
+	}
+
+	handle.abort();
+}
+
+/// `unix://<socket>` carries no resource path in its URL (that's the socket), so
+/// the request path rides in the `?path=` query. Same assertion as TCP, across
+/// every version whose SETUP carries a path.
+#[cfg(unix)]
+#[tokio::test]
+async fn internal_unix_path_reaches_server() {
+	let (path, handle) = spawn_internal_unix_relay().await;
+
+	let pub_url: url::Url = format!("unix://{}?path=room", path.display())
+		.parse()
+		.expect("parse url");
+	let sub_url: url::Url = format!("unix://{}", path.display()).parse().expect("parse url");
+
+	for version in path_versions() {
+		let announced = path_round_trip(version, pub_url.clone(), sub_url.clone(), "test").await;
+		assert_eq!(
+			announced, "room/test",
+			"the SETUP path should scope the publisher's grant ({version})"
+		);
+	}
+
 	handle.abort();
 }
 

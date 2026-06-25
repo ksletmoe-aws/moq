@@ -68,12 +68,13 @@ impl Client {
 		self
 	}
 
-	/// Set the request path to advertise in the lite-05 SETUP message.
+	/// Set the request path to advertise in the SETUP (moq-lite-05 and moq-transport
+	/// 14-18).
 	///
 	/// Required on transports that carry no request URI (native QUIC, qmux over
 	/// TCP/TLS) so the server learns which path the client wants; omit it on bindings
-	/// that already carry a URI (WebTransport). Ignored by the IETF transport and by
-	/// pre-lite-05 versions, which have no SETUP message.
+	/// that already carry a URI (WebTransport). Ignored by versions with no in-band
+	/// request path (lite 01-04).
 	pub fn with_path(mut self, path: impl Into<String>) -> Self {
 		self.setup_path = Some(path.into());
 		self
@@ -95,6 +96,7 @@ impl Client {
 					.ok_or(Error::Version)?;
 
 				// Draft-17+: SETUP is exchanged in the background by the session.
+				// We advertise the request path in our SETUP for URL-less transports.
 				ietf::start(
 					session.clone(),
 					None,
@@ -104,6 +106,8 @@ impl Client {
 					self.subscribe.clone(),
 					self.stats.clone(),
 					ietf::Version::Draft18,
+					self.setup_path.clone(),
+					None,
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -116,6 +120,7 @@ impl Client {
 					.ok_or(Error::Version)?;
 
 				// Draft-17+: SETUP is exchanged in the background by the session.
+				// We advertise the request path in our SETUP for URL-less transports.
 				ietf::start(
 					session.clone(),
 					None,
@@ -125,6 +130,8 @@ impl Client {
 					self.subscribe.clone(),
 					self.stats.clone(),
 					ietf::Version::Draft17,
+					self.setup_path.clone(),
+					None,
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -171,6 +178,7 @@ impl Client {
 					self.stats.clone(),
 					lite::Version::Lite05Wip,
 					our_setup,
+					None,
 				)?;
 
 				// Block until the initial announce set has landed (Lite05 reports it
@@ -193,6 +201,7 @@ impl Client {
 					self.stats.clone(),
 					lite::Version::Lite04,
 					lite::Setup::default(),
+					None,
 				)?;
 
 				// Lite04 has no initial-set boundary, so this resolves immediately.
@@ -214,6 +223,7 @@ impl Client {
 					self.stats.clone(),
 					lite::Version::Lite03,
 					lite::Setup::default(),
+					None,
 				)?;
 
 				// Lite03 has no initial-set boundary, so this resolves immediately.
@@ -236,6 +246,10 @@ impl Client {
 		let mut parameters = ietf::Parameters::default();
 		parameters.set_varint(ietf::ParameterVarInt::MaxRequestId, u32::MAX as u64);
 		parameters.set_bytes(ietf::ParameterBytes::Implementation, b"moq-lite-rs".to_vec());
+		// Advertise the request path in-band (draft 14-16), same as the lite-05 SETUP.
+		if let Some(path) = &self.setup_path {
+			parameters.set_bytes(ietf::ParameterBytes::Path, path.clone().into_bytes());
+		}
 		let parameters = parameters.encode_bytes(ietf_encoding)?;
 
 		let client = setup::Client {
@@ -266,6 +280,7 @@ impl Client {
 					// This path only handles versions negotiated via the bidi SETUP exchange
 					// (pre-lite-05), which have no Setup Stream.
 					lite::Setup::default(),
+					None,
 				)?;
 
 				// Block until the initial announce set has landed (for versions that
@@ -282,6 +297,7 @@ impl Client {
 					.map(ietf::RequestId);
 
 				let stream = stream.with_version(v);
+				// Draft 14-16: the path rode in the bidi SETUP above, not the uni one.
 				ietf::start(
 					session.clone(),
 					Some(stream),
@@ -291,6 +307,8 @@ impl Client {
 					self.subscribe.clone(),
 					self.stats.clone(),
 					v,
+					None,
+					None,
 				)?;
 				None
 			}
