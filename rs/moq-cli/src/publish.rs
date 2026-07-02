@@ -133,6 +133,7 @@ impl PublishDecoder {
 			Self::Avc3 { split, import } => {
 				let tail = split.flush(None)?;
 				import.decode(tail)?;
+				import.finish()?;
 			}
 			Self::Fmp4(d) => d.finish()?,
 			Self::Ts(d) => d.finish()?,
