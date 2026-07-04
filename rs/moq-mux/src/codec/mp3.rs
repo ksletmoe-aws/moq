@@ -145,11 +145,11 @@ impl<E: CatalogExt> Import<E> {
 	}
 
 	/// Publish one MP3 frame as its own group, stamping `pts` or a wall clock when absent.
-	pub fn decode(&mut self, frame: &[u8], pts: Option<Timestamp>) -> crate::Result<()> {
+	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<Timestamp>) -> crate::Result<()> {
 		let timestamp = self.rendition.timestamp(pts)?;
 		self.track.write(Frame {
 			timestamp,
-			payload: bytes::Bytes::copy_from_slice(frame),
+			payload: frame.into_bytes(),
 			keyframe: true,
 			duration: None,
 		})?;
