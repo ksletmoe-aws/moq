@@ -18,7 +18,7 @@
 import "./highlight";
 import "@moq/publish/element"; // defines <moq-publish>
 import "@moq/publish/ui"; // defines <moq-publish-ui>
-import { type Audio, Json, Net, Signals } from "@moq/publish";
+import { type Audio, Json, Net, Signals, Source, type Video } from "@moq/publish";
 import type MoqPublish from "@moq/publish/element";
 import MoqPublishSupport from "@moq/publish/support/element";
 import { formatBitrate, formatFps, graph } from "./viz";
@@ -91,6 +91,12 @@ const volume = new Signals.Signal(1);
 const sampleRate = new Signals.Signal<number | undefined>(undefined);
 const channelCount = new Signals.Signal<number | undefined>(undefined);
 
+// Mic processing constraints; undefined means "browser default". macOS defaults these on, which
+// engages voice processing: auto gain can slowly pull the level down and other audio gets ducked.
+const echoCancellation = new Signals.Signal<boolean | undefined>(undefined);
+const autoGainControl = new Signals.Signal<boolean | undefined>(undefined);
+const noiseSuppression = new Signals.Signal<boolean | undefined>(undefined);
+
 // Opus-specific knobs (the "Opus options" panel), mapping 1:1 onto OpusConfig.
 const opusBitrateKbps = new Signals.Signal<number | undefined>(undefined);
 const opusFrameDuration = new Signals.Signal<number | undefined>(undefined); // ms (2.5 to 60)
@@ -101,20 +107,58 @@ const opusDtx = new Signals.Signal(false); // discontinuous transmission (silenc
 
 const ui = new Signals.Effect();
 
+type VideoTarget = {
+	width?: number;
+	height?: number;
+	frameRate?: number;
+};
+
+function readVideoTarget(effect: Signals.Effect): VideoTarget {
+	const res = effect.get(resolution);
+	const [rawWidth, rawHeight] = res ? res.split("x").map(Number) : [undefined, undefined];
+	return {
+		width: rawWidth && Number.isFinite(rawWidth) ? rawWidth : undefined,
+		height: rawHeight && Number.isFinite(rawHeight) ? rawHeight : undefined,
+		frameRate: effect.get(framerate),
+	};
+}
+
+function cameraConstraints(target: VideoTarget): Video.Constraints | undefined {
+	const constraints: Video.Constraints = {};
+	if (target.width !== undefined) constraints.width = { ideal: target.width, max: target.width };
+	if (target.height !== undefined) constraints.height = { ideal: target.height, max: target.height };
+	if (target.frameRate !== undefined) constraints.frameRate = { ideal: target.frameRate, max: target.frameRate };
+
+	return Object.keys(constraints).length ? constraints : undefined;
+}
+
+function encoderConfig(effect: Signals.Effect, target: VideoTarget): Video.EncoderConfig {
+	const br = effect.get(bitrateKbps);
+	const kf = effect.get(keyframeMs);
+	return {
+		codec: effect.get(codec),
+		maxPixels: target.width && target.height ? target.width * target.height : undefined,
+		maxBitrate: br != null ? br * 1000 : undefined,
+		keyframeInterval: kf != null ? Net.Time.Milli(kf) : undefined,
+		frameRate: target.frameRate,
+	};
+}
+
 // Compose the WebCodecs/MoQ video encoder config and push it onto the HD
 // rendition. Undefined fields are omitted, so the encoder auto-sizes them.
 ui.run((effect) => {
-	const res = effect.get(resolution);
-	const [w, h] = res ? res.split("x").map(Number) : [undefined, undefined];
-	const br = effect.get(bitrateKbps);
-	const kf = effect.get(keyframeMs);
-	publish.broadcast.video.hd.config.set({
-		codec: effect.get(codec),
-		maxPixels: w && h ? w * h : undefined,
-		maxBitrate: br != null ? br * 1000 : undefined,
-		keyframeInterval: kf != null ? (kf as Net.Time.Milli) : undefined,
-		frameRate: effect.get(framerate),
-	});
+	publish.broadcast.video.hd.config.set(encoderConfig(effect, readVideoTarget(effect)));
+});
+
+// Request the selected resolution from the camera itself, not just cap the encoder. publish.video
+// holds the active Camera source (undefined for screen/file); its constraints re-acquire the track
+// on change. getUserMedia uses `ideal`, so a camera that can't reach the target falls back to its
+// best (the green "actual" readout shows what it gave).
+ui.run((effect) => {
+	const source = effect.get(publish.video);
+	if (!(source instanceof Source.Camera)) return;
+
+	effect.set(source.constraints, cameraConstraints(readVideoTarget(effect)));
 });
 
 // Audio general settings (volume gain, output sample rate, channel mix).
@@ -122,6 +166,21 @@ ui.run((effect) => {
 	publish.broadcast.audio.volume.set(effect.get(volume));
 	publish.broadcast.audio.sampleRate.set(effect.get(sampleRate));
 	publish.broadcast.audio.channelCount.set(effect.get(channelCount));
+});
+
+// Mic processing constraints go to the capture itself (getUserMedia re-acquires the track on
+// change). publish.audio holds the active Microphone source (undefined for screen/file).
+ui.run((effect) => {
+	const source = effect.get(publish.audio);
+	if (!source || !("constraints" in source)) return;
+
+	const constraints = {
+		echoCancellation: effect.get(echoCancellation),
+		autoGainControl: effect.get(autoGainControl),
+		noiseSuppression: effect.get(noiseSuppression),
+	};
+	const any = Object.values(constraints).some((v) => v !== undefined);
+	source.constraints.set(any ? constraints : undefined);
 });
 
 // Compose the structured audio codec config; today only Opus. Undefined knobs
@@ -180,6 +239,14 @@ const bindOptionalSelect = (id: string, signal: Signals.Signal<number | undefine
 	el.addEventListener("change", sync);
 };
 
+// An optional on/off select where the empty value ("Auto") means undefined (browser default).
+const bindOptionalBoolean = (id: string, signal: Signals.Signal<boolean | undefined>) => {
+	const el = $<HTMLSelectElement>(id);
+	const sync = () => signal.set(el.value === "" ? undefined : el.value === "on");
+	sync();
+	el.addEventListener("change", sync);
+};
+
 const bindCheckbox = (id: string, signal: Signals.Signal<boolean>) => {
 	const el = $<HTMLInputElement>(id);
 	signal.set(el.checked);
@@ -196,6 +263,9 @@ bindOptionalNumber("keyframe", keyframeMs);
 bindNumber("volume", volume);
 bindOptionalSelect("samplerate", sampleRate);
 bindOptionalSelect("channels", channelCount);
+bindOptionalBoolean("echo-cancellation", echoCancellation);
+bindOptionalBoolean("auto-gain-control", autoGainControl);
+bindOptionalBoolean("noise-suppression", noiseSuppression);
 bindOptionalNumber("opus-bitrate", opusBitrateKbps);
 bindOptionalSelect("opus-frame-duration", opusFrameDuration);
 bindOptionalNumber("opus-complexity", opusComplexity);
