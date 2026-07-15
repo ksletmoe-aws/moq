@@ -1015,6 +1015,69 @@ test("GoAway v18: round trip (timeout field still present)", async () => {
 	expect(decoded.timeout).toBe(5000n);
 });
 
+test("GoAway v18: tolerates trailing Request ID", async () => {
+	// Draft-18 added an optional trailing Request ID (#1559). The decoder calls
+	// readAll() to drain it. Verify that a v18 payload with trailing bytes
+	// decodes cleanly by manually constructing one.
+	const uri = "https://relay.example/";
+	const timeout = 3000n;
+
+	// Build the inner message payload: string(uri) + u62(timeout) + u62(trailing request ID)
+	const { stream: innerStream, written: innerWritten } = createTestWritableStream();
+	const innerW = new Writer(innerStream, Version.DRAFT_18);
+	await innerW.string(uri);
+	await innerW.u62(timeout);
+	await innerW.u62(99n); // trailing Request ID that draft-18 tolerates
+	innerW.close();
+	await innerW.closed;
+	const innerPayload = concatChunks(innerWritten);
+
+	// Wrap with u16 size prefix (matching IETF Message.encode)
+	const { stream: outerStream, written: outerWritten } = createTestWritableStream();
+	const outerW = new Writer(outerStream, Version.DRAFT_18);
+	await outerW.u16(innerPayload.byteLength);
+	await outerW.write(innerPayload);
+	outerW.close();
+	await outerW.closed;
+	const wireBytes = concatChunks(outerWritten);
+
+	// Decode as v18: should succeed and drain the trailing Request ID
+	const decoded = await decodeVersioned(wireBytes, GoAway.GoAway.decode, Version.DRAFT_18);
+	expect(decoded.newSessionUri).toBe(uri);
+	expect(decoded.timeout).toBe(timeout);
+});
+
+test("GoAway v19: round trip (no trailing Request ID)", async () => {
+	const msg = new GoAway.GoAway({ newSessionUri: "https://new-relay.example/session", timeout: 10000n });
+
+	const encoded = await encodeVersioned(msg, Version.DRAFT_19);
+	const decoded = await decodeVersioned(encoded, GoAway.GoAway.decode, Version.DRAFT_19);
+
+	expect(decoded.newSessionUri).toBe("https://new-relay.example/session");
+	expect(decoded.timeout).toBe(10000n);
+});
+
+test("GoAway v19: empty URI with zero timeout", async () => {
+	const msg = new GoAway.GoAway({ newSessionUri: "" });
+
+	const encoded = await encodeVersioned(msg, Version.DRAFT_19);
+	const decoded = await decodeVersioned(encoded, GoAway.GoAway.decode, Version.DRAFT_19);
+
+	expect(decoded.newSessionUri).toBe("");
+	expect(decoded.timeout).toBe(0n);
+});
+
+test("GoAway v19: wire matches v17 (both skip trailing Request ID)", async () => {
+	// Draft-19 removed the optional trailing Request ID that draft-18 added,
+	// so the wire format is identical to draft-17.
+	const msg = new GoAway.GoAway({ newSessionUri: "https://example.com/migrate", timeout: 7500n });
+
+	const v17 = await encodeVersioned(msg, Version.DRAFT_17);
+	const v19 = await encodeVersioned(msg, Version.DRAFT_19);
+
+	expect(Array.from(v19)).toEqual(Array.from(v17));
+});
+
 test("Parameters v18 wire is identical to v17 (no count prefix, delta encoded keys)", async () => {
 	const params = new SetupOptions();
 	params.setVarint(0x2n, 42n);

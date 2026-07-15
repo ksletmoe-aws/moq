@@ -1,9 +1,17 @@
+use std::borrow::Cow;
+
 use crate::{
-	BandwidthConsumer, BandwidthProducer, Error, OriginConsumer, OriginProducer, StatsHandle, coding::Stream,
+	BandwidthConsumer, BandwidthProducer, Error, OriginConsumer, OriginProducer, StatsHandle,
+	coding::Stream,
 	lite::SessionInfo,
+	session::{GoawayReceivedSignal, GoawaySignal, SourcedPaths},
 };
 
-use super::{Publisher, PublisherConfig, Setup, Subscriber, SubscriberConfig, Version, send_setup};
+use super::{
+	ControlType, Goaway, Publisher, PublisherConfig, Setup, Subscriber, SubscriberConfig, Version, send_setup,
+};
+
+#[allow(clippy::too_many_arguments)]
 pub fn start<S: web_transport_trait::Session>(
 	session: S,
 	// The stream used to setup the session, after exchanging setup messages.
@@ -20,6 +28,15 @@ pub fn start<S: web_transport_trait::Session>(
 	// The SETUP message to advertise on the Setup stream (moq-lite-05+). Ignored on
 	// earlier versions, which have no Setup stream.
 	our_setup: Setup,
+	// Signal to send a GOAWAY frame to the peer.
+	goaway: GoawaySignal,
+	// Signal to fire when a GOAWAY frame is received from the peer.
+	goaway_received: GoawayReceivedSignal,
+	// Flag set when GOAWAY is received; checked by subscribers before opening new streams.
+	going_away: crate::session::GoingAwayFlag,
+	// Shared set of paths the subscriber sources into the origin. The caller retains
+	// a clone so Session::begin_failover can read the same set.
+	sourced_paths: SourcedPaths,
 ) -> Result<Option<BandwidthConsumer>, Error> {
 	let recv_bw = BandwidthProducer::new();
 
@@ -38,11 +55,18 @@ pub fn start<S: web_transport_trait::Session>(
 	// stamped onto outbound hops and checked against incoming hops, so it
 	// must be stable across every session that shares the local origin.
 	// Required for cross-session cluster loop detection.
+	//
+	// Keep a clone of the goaway_received signal in the session task so the
+	// channel stays open even if the publisher drops its copy (e.g. transport
+	// error races the GOAWAY decode).
+	let goaway_received_keepalive = goaway_received.clone();
 	let publisher = Publisher::new(PublisherConfig {
 		session: session.clone(),
 		origin: publish,
 		stats: stats.clone(),
 		version,
+		goaway_received,
+		going_away: going_away.clone(),
 	});
 	let subscriber = Subscriber::new(SubscriberConfig {
 		session: session.clone(),
@@ -50,6 +74,8 @@ pub fn start<S: web_transport_trait::Session>(
 		recv_bandwidth: recv_bw_for_sub,
 		stats,
 		version,
+		going_away,
+		sourced_paths,
 	});
 
 	// moq-lite-05 reintroduced a Setup stream: each endpoint opens one and sends a
@@ -66,7 +92,46 @@ pub fn start<S: web_transport_trait::Session>(
 		});
 	}
 
+	// Spawn a task that waits for the drain signal and sends GOAWAY.
+	// Only Lite04+ supports the GOAWAY control stream.
+	if matches!(version, Version::Lite04 | Version::Lite05Wip) {
+		let session = session.clone();
+		web_async::spawn(async move {
+			let payload = crate::session::await_goaway(&goaway).await;
+
+			// moq-lite has no timeout field on the wire; only the URI is sent.
+			// The force-close timer (if configured) still applies locally via
+			// Draining::complete(), but the peer does not receive a deadline.
+			let msg = Goaway {
+				uri: Cow::Owned(payload.uri.to_string()),
+			};
+
+			// Open a dedicated bidi control stream and send the GOAWAY.
+			let mut stream = match crate::coding::Stream::open(&session, version).await {
+				Ok(s) => s,
+				Err(err) => {
+					tracing::warn!(%err, "failed to open goaway stream");
+					return;
+				}
+			};
+
+			if let Err(err) = stream.writer.encode(&ControlType::Goaway).await {
+				tracing::warn!(%err, "failed to write goaway type");
+				return;
+			}
+			if let Err(err) = stream.writer.encode(&msg).await {
+				tracing::warn!(%err, "failed to write goaway message");
+				return;
+			}
+			let _ = stream.writer.finish();
+		});
+	}
+
 	web_async::spawn(async move {
+		// Hold the signal clone alive for the entire session lifetime so the
+		// consumer channel doesn't close prematurely.
+		let _goaway_received_keepalive = goaway_received_keepalive;
+
 		let res = tokio::select! {
 			Err(res) = run_session(setup) => Err(res),
 			res = publisher.run() => res,

@@ -1152,6 +1152,7 @@ impl GroupPublisher {
 		let create = |broadcast: &mut crate::BroadcastProducer, name: &str| match broadcast.create_track(Track {
 			name: name.into(),
 			priority: 0,
+			start: None,
 		}) {
 			Ok(t) => Some(t),
 			Err(err) => {
@@ -1732,6 +1733,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "publisher.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		let frame = read_frame(track).await;
@@ -1779,6 +1781,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "publisher.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		let frame = read_frame(track).await;
@@ -1804,6 +1807,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "publisher.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		let frame = read_frame(track).await;
@@ -1840,6 +1844,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "publisher.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		let frame = read_frame(track).await;
@@ -1968,6 +1973,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "sessions.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		let frame = read_session_frame(track).await;
@@ -1983,6 +1989,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "internal/sessions.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		let snap = *read_session_frame(int_track).await.get("peer").expect("internal entry");
@@ -2034,6 +2041,7 @@ mod tests {
 			.subscribe_track(&Track {
 				name: "publisher.json".into(),
 				priority: 0,
+				start: None,
 			})
 			.expect("subscribe");
 		assert!(
@@ -2048,6 +2056,7 @@ mod tests {
 				.subscribe_track(&Track {
 					name: name.into(),
 					priority: 0,
+					start: None,
 				})
 				.expect("subscribe");
 			let frame = read_frame(t).await;

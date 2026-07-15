@@ -34,12 +34,24 @@ pub struct Connection {
 	pub cluster: Cluster,
 	/// The authenticator used to verify credentials.
 	pub auth: Auth,
+	/// How long to wait for the peer to close after GOAWAY before force-closing.
+	pub drain_timeout: std::time::Duration,
 }
 
 impl Connection {
 	/// Authenticates and serves this connection until it closes.
 	#[tracing::instrument("conn", skip_all, fields(id = self.id))]
 	pub async fn run(self) -> anyhow::Result<()> {
+		// Hold the sender for the whole call so the drain receiver never fires.
+		// Dropping it (e.g. passing `channel(false).1`) makes `changed()` resolve
+		// immediately, which would drain the session the instant it connects.
+		let (_drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+		self.run_with_drain(drain_rx).await
+	}
+
+	/// Authenticates and serves this connection, draining on shutdown signal.
+	#[tracing::instrument("conn", skip_all, fields(id = self.id))]
+	pub async fn run_with_drain(self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> anyhow::Result<()> {
 		let token = match self.authenticate().await {
 			Ok(token) => token,
 			Err(err) => {
@@ -102,15 +114,39 @@ impl Connection {
 		// connect time, so hold the session open no longer than the credential is
 		// valid. Without an expiry, just wait for the session to close.
 		let Some(expires) = token.expires else {
-			return Ok(session.closed().await?);
+			tokio::select! {
+				res = session.closed() => return Ok(res?),
+				_ = shutdown.changed() => {
+					tracing::info!("draining session");
+					if let Some(drain) = session.drain() {
+						// moq-transport draft-19 section 3.6: the sender SHOULD close
+						// the session after the advertised Timeout.
+						drain.start_with_timeout("", self.drain_timeout).complete().await;
+					}
+					return Ok(());
+				}
+			}
 		};
 
 		let remaining = expires.duration_since(std::time::SystemTime::now()).unwrap_or_default();
-		match tokio::time::timeout(remaining, session.closed()).await {
-			Ok(res) => Ok(res?),
-			Err(_) => {
-				tracing::info!("credential expired, closing session");
-				session.close(moq_net::Error::Unauthorized);
+		tokio::select! {
+			res = tokio::time::timeout(remaining, session.closed()) => {
+				match res {
+					Ok(res) => Ok(res?),
+					Err(_) => {
+						tracing::info!("credential expired, closing session");
+						session.close(moq_net::Error::Unauthorized);
+						Ok(())
+					}
+				}
+			}
+			_ = shutdown.changed() => {
+				tracing::info!("draining session");
+				if let Some(drain) = session.drain() {
+					// moq-transport draft-19 section 3.6: the sender SHOULD close
+					// the session after the advertised Timeout.
+					drain.start_with_timeout("", self.drain_timeout).complete().await;
+				}
 				Ok(())
 			}
 		}

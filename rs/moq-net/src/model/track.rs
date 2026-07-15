@@ -26,14 +26,90 @@ use std::{
 // TODO: Replace with a configurable cache size.
 const MAX_GROUP_AGE: Duration = Duration::from_secs(5);
 
+/// Where the publisher should begin delivery when a subscription starts.
+///
+/// Used as a hint in the SUBSCRIBE message to control which group the publisher
+/// delivers first. The default ([`StartPosition::LatestObject`]) requests the
+/// newest available content, which is what most live viewers want.
+///
+/// For reconnection after GOAWAY, use [`StartPosition::NextGroup`] to avoid
+/// receiving a duplicate of the group that was already in flight on the old
+/// session. NextGroup is a >= threshold: the publisher delivers the first
+/// group whose sequence is strictly greater than anything it has already sent,
+/// which is safe even with non-sequential (sparse) group IDs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum StartPosition {
+	/// Begin at the latest available object (the default for live viewers).
+	///
+	/// Maps to IETF `FilterType::LargestObject` (0x2) and lite `start_group: None`
+	/// (server picks the latest).
+	#[default]
+	LatestObject,
+
+	/// Begin at the next complete group boundary.
+	///
+	/// The publisher finishes delivering the current group to existing subscribers,
+	/// then starts the new subscriber at the next group. This is the correct choice
+	/// when re-subscribing after a reconnect: it avoids duplicate or partial groups
+	/// across the session boundary.
+	///
+	/// Maps to IETF `FilterType::NextGroup` (0x1). On lite, sends `start_group: None`;
+	/// the publisher resolves the next group boundary server-side.
+	NextGroup,
+
+	/// Resume delivery at an absolute group and object location (draft-19 sect 5.1.2).
+	///
+	/// Used for seek/DVR scenarios where the subscriber knows exactly where to resume.
+	/// Maps to IETF `FilterType::AbsoluteStart` (0x3) with a `Location { group, object }`.
+	///
+	/// On moq-lite connections, delivery starts at the beginning of the group regardless
+	/// of `object` (lite has no object-level start position on the wire).
+	Absolute {
+		/// Group sequence to start from.
+		group: u64,
+		/// Object index within the group.
+		object: u64,
+	},
+
+	/// Deliver only groups within an absolute range [start_group, end_group].
+	///
+	/// The publisher delivers groups starting at `start_group` and stops after delivering
+	/// the last group whose sequence is <= `end_group`, then finishes the subscription.
+	/// Maps to IETF `FilterType::AbsoluteRange` (0x4).
+	///
+	/// On moq-lite connections, only `start_group` is honored (lite has no range concept
+	/// on the wire); the end bound is not enforced.
+	AbsoluteRange {
+		/// Group sequence to start from.
+		start_group: u64,
+		/// Object index within the start group.
+		start_object: u64,
+		/// Last group sequence to deliver (inclusive). The publisher stops after this group.
+		end_group: u64,
+	},
+}
+
 /// A track is a collection of groups, delivered out-of-order until expired.
+///
+/// Construct via [`Track::new`] and the builder methods ([`with_priority`](Self::with_priority),
+/// [`with_start`](Self::with_start)) rather than struct literals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Track {
 	/// Identifier within a broadcast. Unique per [`crate::Broadcast`].
 	pub name: String,
 	/// Delivery priority. Higher values preempt lower ones when bandwidth is constrained.
 	pub priority: u8,
+	/// Where the publisher should start delivery for this subscription.
+	///
+	/// `None` uses the protocol default ([`StartPosition::LatestObject`]).
+	/// Set to `Some(StartPosition::NextGroup)` when re-subscribing after a
+	/// reconnect for clean group-boundary resume.
+	#[cfg_attr(feature = "serde", serde(default))]
+	pub start: Option<StartPosition>,
 }
 
 impl Track {
@@ -42,12 +118,22 @@ impl Track {
 		Self {
 			name: name.into(),
 			priority: 0,
+			start: None,
 		}
 	}
 
 	/// Set the delivery priority, returning `self` for chaining.
 	pub fn with_priority(mut self, priority: u8) -> Self {
 		self.priority = priority;
+		self
+	}
+
+	/// Set the start position for this subscription, returning `self` for chaining.
+	///
+	/// Use [`StartPosition::NextGroup`] when re-subscribing after a reconnect to
+	/// avoid receiving a duplicate of the group already delivered by the old session.
+	pub fn with_start(mut self, start: StartPosition) -> Self {
+		self.start = Some(start);
 		self
 	}
 

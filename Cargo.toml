@@ -25,6 +25,7 @@ members = [
     "rs/moq-token-cli",
     "rs/moq-video",
     "rs/moq-wasm",
+    "demo/goaway",
 ]
 default-members = [
     "rs/kio",

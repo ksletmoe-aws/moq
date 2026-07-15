@@ -4075,6 +4075,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-goaway-demo"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "humantime",
+ "moq-native",
+ "moq-net",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "moq-gst"
 version = "0.2.10"
 dependencies = [

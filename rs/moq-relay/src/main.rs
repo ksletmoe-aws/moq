@@ -80,38 +80,131 @@ async fn main() -> anyhow::Result<()> {
 	// Notify systemd that we're ready after all initialization is complete
 	let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
+	let drain_timeout = std::time::Duration::from_secs(config.drain_timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS));
+
 	#[cfg(feature = "jemalloc")]
 	let jemalloc = moq_native::jemalloc::run();
 	#[cfg(not(feature = "jemalloc"))]
 	let jemalloc = std::future::pending::<anyhow::Result<()>>();
 
-	tokio::select! {
-		Err(err) = cluster.clone().run() => return Err(err).context("cluster failed"),
-		Err(err) = web.run() => return Err(err).context("web server failed"),
-		Err(err) = serve(server, cluster, auth) => return Err(err).context("server failed"),
-		Err(err) = jemalloc => return Err(err).context("jemalloc profiler failed"),
-		else => Ok(()),
+	// Spawn the cluster task so we can abort it once serve() returns (all
+	// connections drained). Without this, the infinite reconnect-retry loops
+	// inside cluster.run() would prevent the process from exiting on a single
+	// SIGTERM.
+	let mut cluster_handle = tokio::spawn(cluster.clone().run());
+
+	// serve() completing (Ok or Err) is the normal shutdown trigger: it returns
+	// Ok(()) once all connections have drained after SIGTERM.
+	//
+	// The cluster arm only matches errors. A standalone relay has no peers, so
+	// cluster.run() returns Ok(()) immediately; that resolves as Ok(Ok(())) on
+	// the JoinHandle, which does NOT match `Ok(Err(_))`, so the branch is
+	// effectively disabled and the relay keeps running.
+	let result = tokio::select! {
+		res = serve(server, cluster, auth, drain_timeout) => res.context("server failed"),
+		Err(err) = web.run() => Err(err).context("web server failed"),
+		Err(err) = jemalloc => Err(err).context("jemalloc profiler failed"),
+		Ok(Err(err)) = &mut cluster_handle => Err(err).context("cluster failed"),
+	};
+
+	// Abort the cluster task unconditionally so the process exits on a single
+	// SIGTERM even when cluster.run() has infinite reconnect loops.
+	cluster_handle.abort();
+
+	result
+}
+
+/// Wait for a shutdown signal: SIGINT (Ctrl-C) on any platform, or SIGTERM on
+/// unix. Orchestrators (Kubernetes, systemd, Docker) send SIGTERM on shutdown,
+/// so both must trigger the graceful drain for zero-downtime deploys to work.
+async fn shutdown_signal() {
+	#[cfg(unix)]
+	{
+		let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+			Ok(sig) => sig,
+			Err(err) => {
+				tracing::warn!(%err, "failed to install SIGTERM handler; falling back to SIGINT only");
+				tokio::signal::ctrl_c().await.ok();
+				return;
+			}
+		};
+		tokio::select! {
+			_ = tokio::signal::ctrl_c() => {}
+			_ = sigterm.recv() => {}
+		}
+	}
+
+	#[cfg(not(unix))]
+	{
+		tokio::signal::ctrl_c().await.ok();
 	}
 }
 
-async fn serve(mut server: moq_native::Server, cluster: Cluster, auth: Auth) -> anyhow::Result<()> {
+async fn serve(
+	server: moq_native::Server,
+	cluster: Cluster,
+	auth: Auth,
+	drain_timeout: std::time::Duration,
+) -> anyhow::Result<()> {
 	let mut conn_id = 0;
 
-	while let Some(request) = server.accept().await {
-		let conn = Connection {
-			id: conn_id,
-			request,
-			cluster: cluster.clone(),
-			auth: auth.clone(),
-		};
+	// Two-stage shutdown: first signal drains, second signal force-drops.
+	let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+	let (active_tx, mut active_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-		conn_id += 1;
-		tokio::spawn(async move {
-			if let Err(err) = conn.run().await {
-				tracing::warn!(%err, "connection closed");
+	// Register the shutdown signal handler.
+	let shutdown_handle = tokio::spawn(async move {
+		// First signal: broadcast drain.
+		shutdown_signal().await;
+		tracing::info!("received shutdown signal, draining connections");
+		let _ = drain_tx.send(true);
+
+		// Second signal: force exit.
+		shutdown_signal().await;
+		tracing::warn!("received second signal, forcing shutdown");
+		std::process::exit(0);
+	});
+
+	// Disable the built-in ctrl_c handler since we manage signals ourselves.
+	let mut server = server.with_ctrl_c_handler(false);
+	let mut accept_drain = drain_rx.clone();
+
+	loop {
+		tokio::select! {
+			request = server.accept() => {
+				let Some(request) = request else {
+					break;
+				};
+
+				let conn = Connection {
+					id: conn_id,
+					request,
+					cluster: cluster.clone(),
+					auth: auth.clone(),
+					drain_timeout,
+				};
+
+				conn_id += 1;
+				let drain = drain_rx.clone();
+				let _active = active_tx.clone();
+				tokio::spawn(async move {
+					if let Err(err) = conn.run_with_drain(drain).await {
+						tracing::warn!(%err, "connection closed");
+					}
+					drop(_active);
+				});
 			}
-		});
+			_ = accept_drain.changed() => {
+				// Stop accepting new connections once drain fires.
+				break;
+			}
+		}
 	}
 
-	anyhow::bail!("stopped accepting connections")
+	// Drop the sender; wait for all active connections to finish draining.
+	drop(active_tx);
+	let _ = active_rx.recv().await;
+	shutdown_handle.abort();
+
+	Ok(())
 }

@@ -31,11 +31,16 @@ export class GoAway {
 
 	static async #decode(r: Reader, version: IetfVersion): Promise<GoAway> {
 		const newSessionUri = await r.string();
-		const timeout =
-			version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16
-				? 0n
-				: await r.u62();
-		// Draft-18 optional trailing Request ID (#1559) — read and discard if present.
+		let timeout = 0n;
+		if (version !== Version.DRAFT_14 && version !== Version.DRAFT_15 && version !== Version.DRAFT_16) {
+			timeout = await r.u62();
+		}
+		// Draft-18 optional trailing Request ID (#1559). Drain remaining bytes
+		// so the outer message-frame size check passes.
+		// Draft-19 removed this field again (#1623).
+		if (version === Version.DRAFT_18) {
+			await r.readAll();
+		}
 		return new GoAway({ newSessionUri, timeout });
 	}
 }

@@ -1,0 +1,29 @@
+# BOTTOM relay: edge node. The consumer subscribes here.
+# Cluster-connects to MID-A (port 5551) as primary upstream.
+# When MID-A sends GOAWAY pointing at MID-B (port 5552), BOTTOM migrates.
+# Port 5553 (QUIC + HTTP).
+
+[log]
+level = "info"
+
+[server]
+listen = "[::]:5553"
+tls.cert = ["bottom.crt"]
+tls.key = ["bottom.key"]
+tls.root = ["ca.pem"]
+version = ["moq-transport-19"]
+
+[client]
+tls.cert = "bottom.crt"
+tls.key = "bottom.key"
+tls.root = ["ca.pem"]
+version = ["moq-transport-19"]
+
+[web.http]
+listen = "[::]:5553"
+
+[cluster]
+connect = ["https://localhost:5551/"]
+
+[auth]
+public = ""

@@ -2,7 +2,9 @@ use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_LITE, ALPN_LITE_03, ALPN_LITE_04, ALPN_LITE_05_WIP,
 	Error, NEGOTIATED, OriginConsumer, OriginProducer, Session, StatsHandle, Version, Versions,
 	coding::{self, Decode, Encode, Stream},
-	ietf, lite, setup,
+	ietf, lite,
+	session::{goaway_channel, goaway_received_channel, sourced_paths_new},
+	setup,
 };
 
 /// A MoQ client session builder.
@@ -85,6 +87,10 @@ impl Client {
 					.select(Version::Ietf(ietf::Version::Draft19))
 					.ok_or(Error::Version)?;
 
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+				let sourced_paths = sourced_paths_new();
 				// Draft-17+: SETUP is exchanged in the background by the session.
 				ietf::start(
 					session.clone(),
@@ -95,10 +101,18 @@ impl Client {
 					self.consume.clone(),
 					self.stats.clone(),
 					ietf::Version::Draft19,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
-				return Ok(Session::new(session, v, None));
+				let mut s = Session::new(session, v, None, trigger, goaway_recv_consumer, going_away);
+				if let Some(origin) = self.consume.clone() {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Some(ALPN_18) => {
 				let v = self
@@ -106,6 +120,10 @@ impl Client {
 					.select(Version::Ietf(ietf::Version::Draft18))
 					.ok_or(Error::Version)?;
 
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+				let sourced_paths = sourced_paths_new();
 				// Draft-17+: SETUP is exchanged in the background by the session.
 				ietf::start(
 					session.clone(),
@@ -116,10 +134,18 @@ impl Client {
 					self.consume.clone(),
 					self.stats.clone(),
 					ietf::Version::Draft18,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
-				return Ok(Session::new(session, v, None));
+				let mut s = Session::new(session, v, None, trigger, goaway_recv_consumer, going_away);
+				if let Some(origin) = self.consume.clone() {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Some(ALPN_17) => {
 				let v = self
@@ -127,6 +153,10 @@ impl Client {
 					.select(Version::Ietf(ietf::Version::Draft17))
 					.ok_or(Error::Version)?;
 
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+				let sourced_paths = sourced_paths_new();
 				// Draft-17+: SETUP is exchanged in the background by the session.
 				ietf::start(
 					session.clone(),
@@ -137,10 +167,18 @@ impl Client {
 					self.consume.clone(),
 					self.stats.clone(),
 					ietf::Version::Draft17,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
-				return Ok(Session::new(session, v, None));
+				let mut s = Session::new(session, v, None, trigger, goaway_recv_consumer, going_away);
+				if let Some(origin) = self.consume.clone() {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Some(ALPN_16) => {
 				let v = self
@@ -168,6 +206,10 @@ impl Client {
 					.select(Version::Lite(lite::Version::Lite05Wip))
 					.ok_or(Error::Version)?;
 
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+				let sourced_paths = sourced_paths_new();
 				let setup = lite::Setup {
 					path: self.path.clone(),
 				};
@@ -179,15 +221,34 @@ impl Client {
 					self.stats.clone(),
 					lite::Version::Lite05Wip,
 					setup,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 
-				return Ok(Session::new(session, lite::Version::Lite05Wip.into(), recv_bw));
+				let mut s = Session::new(
+					session,
+					lite::Version::Lite05Wip.into(),
+					recv_bw,
+					trigger,
+					goaway_recv_consumer,
+					going_away,
+				);
+				if let Some(origin) = self.consume.clone() {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Some(ALPN_LITE_04) => {
 				self.versions
 					.select(Version::Lite(lite::Version::Lite04))
 					.ok_or(Error::Version)?;
 
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+				let sourced_paths = sourced_paths_new();
 				let recv_bw = lite::start(
 					session.clone(),
 					None,
@@ -196,15 +257,34 @@ impl Client {
 					self.stats.clone(),
 					lite::Version::Lite04,
 					lite::Setup::default(),
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 
-				return Ok(Session::new(session, lite::Version::Lite04.into(), recv_bw));
+				let mut s = Session::new(
+					session,
+					lite::Version::Lite04.into(),
+					recv_bw,
+					trigger,
+					goaway_recv_consumer,
+					going_away,
+				);
+				if let Some(origin) = self.consume.clone() {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Some(ALPN_LITE_03) => {
 				self.versions
 					.select(Version::Lite(lite::Version::Lite03))
 					.ok_or(Error::Version)?;
 
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+				let sourced_paths = sourced_paths_new();
 				// Starting with draft-03, there's no more SETUP control stream.
 				let recv_bw = lite::start(
 					session.clone(),
@@ -214,9 +294,24 @@ impl Client {
 					self.stats.clone(),
 					lite::Version::Lite03,
 					lite::Setup::default(),
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 
-				return Ok(Session::new(session, lite::Version::Lite03.into(), recv_bw));
+				let mut s = Session::new(
+					session,
+					lite::Version::Lite03.into(),
+					recv_bw,
+					trigger,
+					goaway_recv_consumer,
+					going_away,
+				);
+				if let Some(origin) = self.consume.clone() {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Some(ALPN_LITE) | None => {
 				let supported = self.versions.filter(&NEGOTIATED.into()).ok_or(Error::Version)?;
@@ -250,6 +345,10 @@ impl Client {
 			.copied()
 			.ok_or(Error::Version)?;
 
+		let (trigger, signal) = goaway_channel();
+		let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+		let sourced_paths = sourced_paths_new();
 		let recv_bw = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
@@ -262,6 +361,10 @@ impl Client {
 					self.stats.clone(),
 					v,
 					lite::Setup::default(),
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?
 			}
 			Version::Ietf(v) => {
@@ -281,12 +384,20 @@ impl Client {
 					self.consume.clone(),
 					self.stats.clone(),
 					v,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 				None
 			}
 		};
 
-		Ok(Session::new(session, version, recv_bw))
+		let mut s = Session::new(session, version, recv_bw, trigger, goaway_recv_consumer, going_away);
+		if let Some(origin) = self.consume.clone() {
+			s.attach_subscriber_state(sourced_paths, origin);
+		}
+		Ok(s)
 	}
 }
 

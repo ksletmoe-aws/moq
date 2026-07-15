@@ -45,6 +45,12 @@ pub struct Config {
 	#[serde(default)]
 	pub stats: StatsConfig,
 
+	/// How long to wait for clients to finish after sending GOAWAY, in seconds.
+	/// After this deadline the relay force-closes the session with GOAWAY_TIMEOUT
+	/// (moq-transport draft-19 section 3.6). Defaults to 10 seconds.
+	#[arg(id = "drain-timeout", long = "drain-timeout", env = "MOQ_DRAIN_TIMEOUT")]
+	pub drain_timeout: Option<u64>,
+
 	/// If provided, load the configuration from this file.
 	#[serde(default)]
 	pub file: Option<String>,

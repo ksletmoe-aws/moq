@@ -1,7 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use web_async::FuturesExt;
 use web_transport_trait::Stats;
 
 use crate::{
@@ -13,6 +13,7 @@ use crate::{
 		priority::{Priority, PriorityHandle, PriorityQueue},
 	},
 	model::GroupConsumer,
+	session::GoawayReceivedSignal,
 };
 
 use super::Version;
@@ -26,6 +27,10 @@ pub(super) struct PublisherConfig<S: web_transport_trait::Session> {
 	/// to opt out.
 	pub stats: MoqStats,
 	pub version: Version,
+	/// Signal to fire when a GOAWAY is received from the peer.
+	pub goaway_received: GoawayReceivedSignal,
+	/// Flag set when GOAWAY is received; checked by subscribers before opening new streams.
+	pub going_away: crate::session::GoingAwayFlag,
 }
 
 pub(super) struct Publisher<S: web_transport_trait::Session> {
@@ -39,6 +44,8 @@ pub(super) struct Publisher<S: web_transport_trait::Session> {
 	self_origin: Origin,
 	priority: PriorityQueue,
 	version: Version,
+	goaway_received: GoawayReceivedSignal,
+	going_away: crate::session::GoingAwayFlag,
 }
 
 impl<S: web_transport_trait::Session> Publisher<S> {
@@ -58,6 +65,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			self_origin,
 			priority: Default::default(),
 			version: config.version,
+			goaway_received: config.goaway_received,
+			going_away: config.going_away,
 		}
 	}
 
@@ -78,7 +87,19 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					Ok(())
 				}
 				lite::ControlType::Goaway => {
-					tracing::info!("received goaway stream");
+					let msg: lite::Goaway = stream.reader.decode().await?;
+					tracing::info!(uri = %msg.uri, "received goaway");
+
+					// Set the going-away flag so new requests are rejected immediately.
+					self.going_away.set();
+
+					let received = crate::session::GoawayReceived {
+						uri: Arc::from(msg.uri.as_ref()),
+						timeout: None,
+					};
+					if let Ok(mut state) = self.goaway_received.write() {
+						*state = Some(received);
+					}
 					Ok(())
 				}
 				lite::ControlType::Session | lite::ControlType::Fetch => Err(Error::UnexpectedStream),
@@ -315,12 +336,14 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 								// Count the broadcast name length, not the encoded message size, so
 								// stats don't penalize the broadcast for hop/framing overhead.
 								bs.publisher_announced_bytes(absolute.as_str().len() as u64);
+
 								let prev = stats_guards.insert(absolute, bs.publisher());
 								debug_assert!(prev.is_none(), "origin announced a path that was already active");
 								let msg = lite::Announce::Active { suffix, hops };
 								stream.writer.encode(&msg).await?;
 							} else {
 								let absolute = origin.absolute(&path).to_owned();
+
 								tracing::debug!(broadcast = %absolute, "unannounce");
 								// Count the name length whether or not a guard is held: the Ended
 								// message is sent even for announces we filtered out above.
@@ -427,7 +450,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let broadcast = consumer.await?;
 		// Resolve the track to read its publisher properties. The query carries no
 		// priority; a reused producer reports its own authored value.
-		let track = broadcast.subscribe_track(&Track { name, priority: 0 })?;
+		let track = broadcast.subscribe_track(&Track {
+			name,
+			priority: 0,
+			start: None,
+		})?;
 
 		// ordered/max_latency aren't tracked in the model yet; the timescale is
 		// milliseconds to match the wall-clock frame timestamps we stamp on the wire.
@@ -443,6 +470,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		stream.writer.closed().await
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	async fn run_subscribe(
 		session: S,
 		stream: &mut Stream<S, Version>,
@@ -459,6 +487,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let track = Track {
 			name: subscribe.track.to_string(),
 			priority: subscribe.priority,
+			start: None,
 		};
 
 		let broadcast = consumer.await?;
@@ -550,19 +579,23 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let mut tasks = FuturesUnordered::new();
 
 		// Highest group sequence handed to a Group stream, reported in SUBSCRIBE_END (moq-lite-05+).
-		// The consumer was already positioned by `run_subscribe` from the resolved start group.
 		let mut last_sequence: Option<u64> = None;
 
 		loop {
-			let group = tokio::select! {
+			let recv_result = tokio::select! {
 				// Poll all active group futures; never matches but keeps them running.
 				true = async {
 					while tasks.next().await.is_some() {}
 					false
 				} => unreachable!(),
-				Some(group) = track.recv_group().transpose() => group,
-				else => return Ok(last_sequence),
-			}?;
+				group = track.recv_group() => group,
+			};
+
+			let group = match recv_result {
+				Ok(Some(g)) => g,
+				Ok(None) | Err(Error::Dropped) => return Ok(last_sequence),
+				Err(e) => return Err(e),
+			};
 
 			let sequence = group.sequence;
 			last_sequence = last_sequence.max(Some(sequence));

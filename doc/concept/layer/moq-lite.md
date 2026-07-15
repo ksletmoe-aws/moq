@@ -119,6 +119,37 @@ When combined with a local jitter buffer, this should result in different user e
 There's no optimal solution for this, but we think these subscription properties provide a GOOD ENOUGH user experience for most use-cases.
 They're simple to implement and easy enough to understand.
 
+### GOAWAY (Graceful Shutdown)
+
+A server can gracefully drain a session by sending a `GOAWAY` message.
+This tells the client to reconnect, either to a different endpoint (specified by a URI in the message) or to the same endpoint (empty URI).
+
+The lifecycle on the sending side is:
+
+1. Call `session.drain()` to claim the session for draining. Returns a `Drain` handle.
+2. Call `drain.start(uri)` or `drain.start_with_timeout(uri, duration)` to send the GOAWAY frame.
+3. Call `draining.complete()` to wait for the peer to close. If a timeout was set, the session is force-closed when it expires.
+
+On the receiving side:
+
+1. `session.goaway()` resolves with the URI and optional timeout.
+2. Once GOAWAY is received, new subscribe/publish requests are rejected.
+3. Call `session.reconnect(connector, options)` to establish a new session at the GOAWAY URI.
+4. Re-subscribe to tracks on the new session using `StartPosition::NextGroup` for clean group-boundary resume.
+
+`StartPosition` controls where delivery begins on a subscription:
+
+| Variant | Use case |
+|---------|----------|
+| `LatestObject` (default) | Live viewers joining fresh |
+| `NextGroup` | Reconnect after GOAWAY (no duplicate groups) |
+| `Absolute { group, object }` | Seek/DVR to a known position |
+| `AbsoluteRange { start_group, start_object, end_group }` | Bounded playback window |
+
+On moq-lite connections, `Absolute` is group-granular (no object-level start) and `AbsoluteRange` only honors the start group (the end bound is not enforced on the wire).
+
+GOAWAY is supported on moq-lite-04+ and IETF moq-transport draft-14+. The timeout field is carried on the wire only for IETF draft-17+ (moq-lite does not send a timeout, but the local force-close timer still applies).
+
 ## Compatibility
 
 `moq-lite` is forward compatible with `moq-transport`.

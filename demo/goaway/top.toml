@@ -1,0 +1,18 @@
+# TOP relay: ingest node. The publisher connects here.
+# Port 5550 (QUIC + HTTP).
+
+[log]
+level = "info"
+
+[server]
+listen = "[::]:5550"
+tls.cert = ["top.crt"]
+tls.key = ["top.key"]
+tls.root = ["ca.pem"]
+version = ["moq-transport-19"]
+
+[web.http]
+listen = "[::]:5550"
+
+[auth]
+public = ""

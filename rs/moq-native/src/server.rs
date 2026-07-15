@@ -254,6 +254,7 @@ pub struct Server {
 	moq: moq_net::Server,
 	versions: moq_net::Versions,
 	accept: FuturesUnordered<BoxFuture<'static, crate::Result<Request>>>,
+	handle_ctrl_c: bool,
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 	streams: StreamListeners,
 	#[cfg(feature = "iroh")]
@@ -354,6 +355,7 @@ impl Server {
 			accept: Default::default(),
 			moq: moq_net::Server::new().with_versions(versions.clone()),
 			versions,
+			handle_ctrl_c: true,
 			#[cfg(any(feature = "tcp", all(feature = "uds", unix)))]
 			streams,
 			#[cfg(feature = "iroh")]
@@ -399,6 +401,15 @@ impl Server {
 	/// Attach a tier-scoped [`moq_net::StatsHandle`] to all sessions accepted by this server.
 	pub fn with_stats(mut self, stats: moq_net::StatsHandle) -> Self {
 		self.moq = self.moq.with_stats(stats);
+		self
+	}
+
+	/// Control whether `accept()` returns `None` on Ctrl-C (SIGINT).
+	///
+	/// Defaults to `true`. Set to `false` when the caller handles shutdown
+	/// signals externally (e.g. the relay's two-stage graceful shutdown).
+	pub fn with_ctrl_c_handler(mut self, enabled: bool) -> Self {
+		self.handle_ctrl_c = enabled;
 		self
 	}
 
@@ -628,7 +639,13 @@ impl Server {
 						Err(err) => tracing::debug!(%err, "failed to accept session"),
 					}
 				}
-				_ = tokio::signal::ctrl_c() => {
+				_ = async {
+					if self.handle_ctrl_c {
+						tokio::signal::ctrl_c().await.ok();
+					} else {
+						std::future::pending::<()>().await;
+					}
+				} => {
 					self.close().await;
 					return None;
 				}

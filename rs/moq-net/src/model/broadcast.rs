@@ -126,7 +126,11 @@ impl BroadcastProducer {
 	/// one not already used in this broadcast.
 	pub fn unique_track(&mut self, suffix: &str) -> Result<TrackProducer, Error> {
 		let name = self.unique_name(suffix);
-		self.create_track(Track { name, priority: 0 })
+		self.create_track(Track {
+			name,
+			priority: 0,
+			start: None,
+		})
 	}
 
 	/// Generate a unique track name from a suffix without creating the track.

@@ -1,0 +1,28 @@
+# MID-B relay: sibling node. Subscribes to TOP for the same broadcast.
+# BOTTOM migrates here after receiving GOAWAY from MID-A.
+# Port 5552 (QUIC + HTTP).
+
+[log]
+level = "info"
+
+[server]
+listen = "[::]:5552"
+tls.cert = ["mid-b.crt"]
+tls.key = ["mid-b.key"]
+tls.root = ["ca.pem"]
+version = ["moq-transport-19"]
+
+[client]
+tls.cert = "mid-b.crt"
+tls.key = "mid-b.key"
+tls.root = ["ca.pem"]
+version = ["moq-transport-19"]
+
+[web.http]
+listen = "[::]:5552"
+
+[cluster]
+connect = ["https://localhost:5550/"]
+
+[auth]
+public = ""

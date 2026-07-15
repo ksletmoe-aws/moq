@@ -33,11 +33,12 @@ impl Message for GoAway<'_> {
 		let new_session_uri = Cow::<str>::decode(r, version)?;
 		let timeout = match version {
 			Version::Draft14 | Version::Draft15 | Version::Draft16 => 0,
-			Version::Draft17 => u64::decode(r, version)?,
-			_ => {
+			Version::Draft17 | Version::Draft19 => u64::decode(r, version)?,
+			Version::Draft18 => {
 				let timeout = u64::decode(r, version)?;
-				// Draft-18+: optional trailing Request ID (#1559). Drain if present;
+				// Draft-18 optional trailing Request ID (#1559). Drain if present;
 				// moq-lite doesn't act on per-request GOAWAY so the value is discarded.
+				// Draft-19 removed this field again (#1623).
 				if r.has_remaining() {
 					let _ = u64::decode(r, version)?;
 				}

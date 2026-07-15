@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use moq_net::{BroadcastProducer, Origin, OriginConsumer, OriginProducer, Path, Stats, Tier};
+use moq_net::{BroadcastProducer, Connector, Origin, OriginConsumer, OriginProducer, Path, Stats, Tier};
 use reqwest_middleware::ClientWithMiddleware;
 use tokio::task::AbortHandle;
 use url::Url;
@@ -855,7 +855,8 @@ impl Cluster {
 			.context("internal: cluster peer dial without an attached QUIC client")?;
 
 		// Cluster-to-cluster traffic is internal by definition.
-		let session = client
+		let mut session = client
+			.clone()
 			.with_publish(self.origin.consume())
 			.with_consume(self.origin.clone())
 			.with_stats(self.stats.tier(Tier::Internal))
@@ -863,7 +864,151 @@ impl Cluster {
 			.await
 			.context("failed to connect to cluster peer")?;
 
-		session.closed().await.map_err(Into::into)
+		// Watch for upstream GOAWAY and transparently reconnect. The new session
+		// feeds the same shared OriginProducer, so downstream subscribers see
+		// re-announcements from the new upstream and keep receiving without any
+		// GOAWAY of their own.
+		loop {
+			tokio::select! {
+				res = session.closed() => return res.map_err(Into::into),
+				goaway = session.goaway() => {
+					let Some(goaway) = goaway else {
+						// Channel dropped without GOAWAY; session is closing.
+						return session.closed().await.map_err(Into::into);
+					};
+
+					tracing::info!(
+						goaway_uri = %goaway.uri,
+						"upstream GOAWAY received; reconnecting transparently"
+					);
+
+					// Seamless failover overlap (holding the old session alive so
+					// in-flight groups finish) only applies when the GOAWAY
+					// carries a non-empty URI pointing at a distinct sibling.
+					// An empty URI means "graceful shutdown, reconnect to the same
+					// endpoint" and should not stall the reconnect.
+					let is_sibling_failover = !goaway.uri.is_empty();
+
+					let failover_guard = if is_sibling_failover {
+						let guard = session.begin_failover();
+						Some(guard)
+					} else {
+						None
+					};
+
+					let origin = self.origin.clone();
+					let stats = self.stats.tier(Tier::Internal);
+					let client_for_reconnect = client.clone();
+					let fallback_url = url.clone();
+
+					let connector = move |uri: &str| {
+						let reconnect_url = if uri.is_empty() {
+							fallback_url.clone()
+						} else {
+							match uri.parse::<Url>() {
+								Ok(parsed)
+									if scheme_security_tier(parsed.scheme())
+										>= scheme_security_tier(fallback_url.scheme()) =>
+								{
+									parsed
+								}
+								Ok(parsed) => {
+									tracing::warn!(
+										redirect_scheme = parsed.scheme(),
+										current_scheme = fallback_url.scheme(),
+										uri,
+										"GOAWAY redirect is a security downgrade; falling back to original URL"
+									);
+									fallback_url.clone()
+								}
+								Err(err) => {
+									tracing::warn!(%err, uri, "malformed GOAWAY URI; falling back to original URL");
+									fallback_url.clone()
+								}
+							}
+						};
+						let origin = origin.clone();
+						let stats = stats.clone();
+						let client = client_for_reconnect.clone();
+						async move {
+							client
+								.with_publish(origin.consume())
+								.with_consume(origin)
+								.with_stats(stats)
+								.connect(reconnect_url)
+								.await
+								.map_err(|e| moq_net::Error::Transport(e.to_string()))
+						}
+					};
+
+					const MAX_RETRIES: u32 = 3;
+					/// How long to wait for the old upstream to drain in-flight groups
+					/// before force-closing the connection after a successful reconnect.
+					/// Must be <= FAILOVER_RESOLVE_TIMEOUT in the publisher (moq-net
+					/// lite/publisher.rs and ietf/publisher.rs) so the publisher keeps
+					/// waiting while the drain completes.
+					const DEFAULT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+					let mut last_err = None;
+					for attempt in 0..=MAX_RETRIES {
+						if attempt > 0 {
+							let backoff = std::time::Duration::from_millis(100 * 2u64.pow(attempt - 1));
+							tracing::warn!(err = ?last_err, attempt, "upstream reconnect failed; retrying after {backoff:?}");
+							tokio::time::sleep(backoff).await;
+						}
+						match connector.connect(goaway.uri.as_ref()).await {
+							Ok(new_session) => {
+								tracing::info!("upstream reconnect successful; new session active");
+
+								let mut old_session = std::mem::replace(&mut session, new_session);
+
+								if let Some(failover_guard) = failover_guard {
+									// Sibling failover: keep the old session alive so
+									// its subscriber tasks finish relaying in-flight
+									// groups. The failover guard moves into the drain
+									// task so publishers keep re-resolving until the
+									// old source has fully drained.
+									let drain_timeout = goaway.timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT);
+
+									tokio::spawn(async move {
+										let drain_result = tokio::time::timeout(
+											drain_timeout,
+											old_session.closed(),
+										).await;
+
+										match drain_result {
+											Ok(_) => {
+												tracing::debug!("old upstream drained cleanly");
+											}
+											Err(_elapsed) => {
+												tracing::warn!(
+													timeout = ?drain_timeout,
+													"old upstream did not drain in time; force-closing"
+												);
+												old_session.close(moq_net::Error::GoawayTimeout);
+											}
+										}
+
+										drop(failover_guard);
+									});
+								}
+								// Empty-URI path: old session drops here, no drain delay.
+
+								last_err = None;
+								break;
+							}
+							Err(err) => {
+								last_err = Some(err);
+							}
+						}
+					}
+					if let Some(err) = last_err {
+						tracing::warn!(%err, "upstream reconnect failed after {MAX_RETRIES} retries");
+						return Err(err.into());
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -933,6 +1078,31 @@ where
 			BoolOrString::Str(value) => value,
 		}),
 	)
+}
+
+/// Map a URL scheme to a security tier for the GOAWAY redirect no-downgrade guard.
+///
+/// The relay follows a peer-supplied GOAWAY redirect only when the redirect's scheme
+/// is at least as secure as the current upstream connection. This prevents an untrusted
+/// peer from downgrading a TLS session to plaintext via a crafted GOAWAY URI. It replaces
+/// a previous scheme allowlist that mirrored `moq-native connect`'s supported schemes
+/// and had broken tcp:// redirects.
+///
+/// Unknown schemes default to tier 0 (lowest) so that a forgotten classification is
+/// fail-safe: treated as a downgrade from any known-secure connection and refused.
+///
+/// NOTE: Constraining the redirect HOST to a set of trusted cluster peers is a deliberate
+/// follow-up and not handled here.
+fn scheme_security_tier(scheme: &str) -> u8 {
+	match scheme {
+		// Encrypted transports (QUIC/TLS/WebTransport/WSS), iroh's built-in encryption,
+		// and local IPC (unix sockets, no network exposure).
+		"https" | "moqt" | "moql" | "wss" | "iroh" | "unix" => 2,
+		// Plaintext network transports.
+		"tcp" | "ws" | "http" => 1,
+		// Unknown: fail-safe to lowest tier.
+		_ => 0,
+	}
 }
 
 #[cfg(test)]

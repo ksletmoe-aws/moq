@@ -6,7 +6,7 @@ use crate::{
 	Broadcast, BroadcastDynamic, Error, Frame, FrameProducer, Group, GroupProducer, MAX_FRAME_SIZE, OriginProducer,
 	Path, PathOwned, StatsHandle, SubscriberStats, SubscriberTrack, Track, TrackProducer,
 	coding::{Reader, Stream},
-	ietf::{self, Control, FilterType, GroupOrder, RequestId},
+	ietf::{self, Control, FilterType, GroupOrder, Location, RequestId},
 	model::BroadcastProducer,
 };
 
@@ -66,6 +66,8 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	session_origin: crate::Origin,
 	state: Lock<State>,
 	version: Version,
+	going_away: crate::session::GoingAwayFlag,
+	sourced_paths: crate::session::SourcedPaths,
 }
 
 impl<S: web_transport_trait::Session> Subscriber<S> {
@@ -75,6 +77,8 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		control: Control,
 		stats: StatsHandle,
 		version: Version,
+		going_away: crate::session::GoingAwayFlag,
+		sourced_paths: crate::session::SourcedPaths,
 	) -> Self {
 		let broadcasts = stats.subscriber_broadcasts();
 		Self {
@@ -86,6 +90,8 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			session_origin: crate::Origin::random(),
 			state: Default::default(),
 			version,
+			going_away,
+			sourced_paths,
 		}
 	}
 
@@ -100,6 +106,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		&mut self,
 		mut stream: Stream<T, Version>,
 	) -> Result<(), Error> {
+		// Reject new namespace subscriptions after GOAWAY.
+		if self.going_away.is_set() {
+			return Err(Error::GoingAway);
+		}
+
 		let prefix = self.origin.as_ref().ok_or(Error::InvalidRole)?.root().to_owned();
 		let request_id = self.control.next_request_id().await?;
 
@@ -497,6 +508,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					_stats: self.stats.broadcast(&abs).subscriber(),
 				});
 
+				// Track this path as sourced by this session for failover scoping.
+				if let Ok(mut sp) = self.sourced_paths.lock() {
+					sp.insert(abs.clone());
+				}
+
 				tracing::debug!(broadcast = %origin.absolute(&path), "announce");
 
 				let this = self.clone();
@@ -538,6 +554,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				entry.get_mut().count -= 1;
 				if entry.get().count == 0 {
 					tracing::debug!(broadcast = %origin.absolute(&path), "unannounced");
+					// Remove from sourced paths for failover scoping.
+					let abs = origin.absolute(&path).to_owned();
+					if let Ok(mut sp) = self.sourced_paths.lock() {
+						sp.remove(&abs);
+					}
 					entry.remove();
 				}
 			}
@@ -553,6 +574,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		let track = Track {
 			name: msg.track_name.to_string(),
 			priority: 0,
+			start: None,
 		}
 		.produce();
 
@@ -618,6 +640,12 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	}
 
 	async fn run_subscribe(&mut self, broadcast_path: Path<'_>, broadcast: BroadcastDynamic, mut track: TrackProducer) {
+		// Reject new subscriptions after GOAWAY.
+		if self.going_away.is_set() {
+			let _ = track.abort(Error::GoingAway);
+			return;
+		}
+
 		let request_id = match self.control.next_request_id().await {
 			Ok(id) => id,
 			Err(err) => {
@@ -705,7 +733,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				tracing::info!(broadcast = %self.origin.as_ref().expect("origin set by start_announce").absolute(&broadcast_path), track = %track.name, "broadcast closed");
 				let _ = track.abort(err);
 			}
-			res = stream.reader.closed() => {
+			res = Self::read_subscribe_done(&mut stream.reader, self.version) => {
 				match res {
 					Ok(()) => {
 						tracing::info!(broadcast = %self.origin.as_ref().expect("origin set by start_announce").absolute(&broadcast_path), track = %track.name, "subscribe complete");
@@ -735,6 +763,26 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		broadcast: &Path<'_>,
 		track: &TrackProducer,
 	) -> Result<(), Error> {
+		let (filter_type, start_location, end_group) = match track.start {
+			Some(crate::StartPosition::NextGroup) => (FilterType::NextGroup, None, None),
+			Some(crate::StartPosition::Absolute { group, object }) => {
+				(FilterType::AbsoluteStart, Some(Location { group, object }), None)
+			}
+			Some(crate::StartPosition::AbsoluteRange {
+				start_group,
+				start_object,
+				end_group,
+			}) => (
+				FilterType::AbsoluteRange,
+				Some(Location {
+					group: start_group,
+					object: start_object,
+				}),
+				Some(end_group),
+			),
+			Some(crate::StartPosition::LatestObject) | None => (FilterType::LargestObject, None, None),
+		};
+
 		stream.writer.encode(&ietf::Subscribe::ID).await?;
 		stream
 			.writer
@@ -744,7 +792,9 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				track_name: (&track.name).into(),
 				subscriber_priority: track.priority,
 				group_order: GroupOrder::Descending,
-				filter_type: FilterType::LargestObject,
+				filter_type,
+				start_location,
+				end_group,
 			})
 			.await?;
 		Ok(())
@@ -773,6 +823,35 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				Err(Error::Cancel)
 			}
 			_ => Err(Error::UnexpectedMessage),
+		}
+	}
+
+	/// Read messages from the subscribe bidi stream until the publisher signals
+	/// completion (PublishDone) or cleanly FINs the stream.
+	///
+	/// For draft-14 the control-stream adapter forwards PublishDone on the virtual
+	/// stream then closes it; for draft-17+ the publisher writes PublishDone on
+	/// the real bidi stream before FIN. Both paths are handled: a decoded
+	/// PublishDone or a clean FIN both finish the track.
+	async fn read_subscribe_done(reader: &mut Reader<S::RecvStream, Version>, version: Version) -> Result<(), Error> {
+		let type_id: u64 = match reader.decode_maybe().await? {
+			Some(id) => id,
+			// Clean FIN with no trailing bytes: subscription ended normally.
+			None => return Ok(()),
+		};
+		let size: u16 = reader.decode().await?;
+		let mut data = reader.read_exact(size as usize).await?;
+
+		match type_id {
+			ietf::PublishDone::ID => {
+				let msg = ietf::PublishDone::decode_msg(&mut data, version)?;
+				tracing::debug!(status_code = %msg.status_code, reason = %msg.reason_phrase, "received publish done");
+				Ok(())
+			}
+			_ => {
+				tracing::warn!(type_id, "unexpected message on subscribe stream after SubscribeOk");
+				Err(Error::UnexpectedMessage)
+			}
 		}
 	}
 

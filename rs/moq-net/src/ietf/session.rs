@@ -1,7 +1,11 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::{
 	Error, OriginConsumer, OriginProducer, StatsHandle,
 	coding::{Encode, Reader, Stream, Writer},
 	ietf::{self, FetchHeader, RequestId},
+	session::{GoawayReceivedSignal, GoawaySignal, SourcedPaths},
 	setup,
 };
 
@@ -20,6 +24,12 @@ pub fn start<S: web_transport_trait::Session>(
 	// Tier-scoped stats handle. Pass [`StatsHandle::default`] to opt out.
 	stats: StatsHandle,
 	version: Version,
+	goaway: GoawaySignal,
+	goaway_received: GoawayReceivedSignal,
+	going_away: crate::session::GoingAwayFlag,
+	// Shared set of paths the subscriber sources into the origin. The caller retains
+	// a clone so Session::begin_failover can read the same set.
+	sourced_paths: SourcedPaths,
 ) -> Result<(), Error> {
 	web_async::spawn(async move {
 		let res = match version {
@@ -32,15 +42,33 @@ pub fn start<S: web_transport_trait::Session>(
 				let adapter = ControlStreamAdapter::new(session.clone(), tx, control.clone(), version);
 
 				let publisher = Publisher::new(adapter.clone(), publish, control.clone(), stats.clone(), version);
-				let subscriber = Subscriber::new(adapter.clone(), subscribe, control, stats, version);
+				let subscriber = Subscriber::new(
+					adapter.clone(),
+					subscribe,
+					control,
+					stats,
+					version,
+					going_away.clone(),
+					sourced_paths.clone(),
+				);
+
+				// Spawn goaway send task for draft-14-16 (shared control stream).
+				let goaway_adapter = adapter.clone();
+				let goaway_signal = goaway;
+				web_async::spawn(async move {
+					let payload = crate::session::await_goaway(&goaway_signal).await;
+					let timeout_ms = payload.timeout.map(|d| d.as_millis() as u64).unwrap_or(0);
+
+					goaway_adapter.send_goaway(&payload.uri, timeout_ms, version).await;
+				});
 
 				let dispatch_session = adapter.clone();
 				let mut sub_ns = subscriber.clone();
 				let sub_ns_adapter = adapter.clone();
 
 				tokio::select! {
-					Err(err) = adapter.run(setup.reader, setup.writer, rx) => Err::<(), Error>(err),
-					Err(err) = run_unis(adapter.clone(), subscriber.clone(), version) => Err(err),
+					Err(err) = adapter.run_with_goaway(setup.reader, setup.writer, rx, goaway_received.clone(), going_away.clone()) => Err::<(), Error>(err),
+					Err(err) = run_unis(adapter.clone(), subscriber.clone(), version, goaway_received, going_away) => Err(err),
 					Err(err) = run_dispatch(dispatch_session, publisher.clone(), subscriber.clone(), version) => Err(err),
 					Err(err) = publisher.run() => Err(err),
 					Err(err) = async {
@@ -66,10 +94,11 @@ pub fn start<S: web_transport_trait::Session>(
 			}
 			_ => {
 				// Spawn SETUP sender (keeps stream alive for GOAWAY).
+				let mut goaway_signal = goaway;
 				web_async::spawn({
 					let session = session.clone();
 					async move {
-						if let Err(err) = run_setup(session, version).await {
+						if let Err(err) = run_setup_with_goaway(session, version, &mut goaway_signal).await {
 							tracing::warn!(%err, "setup send error");
 						}
 					}
@@ -77,13 +106,21 @@ pub fn start<S: web_transport_trait::Session>(
 
 				let control = Control::new(None, client);
 				let publisher = Publisher::new(session.clone(), publish, control.clone(), stats.clone(), version);
-				let subscriber = Subscriber::new(session.clone(), subscribe, control, stats, version);
+				let subscriber = Subscriber::new(
+					session.clone(),
+					subscribe,
+					control,
+					stats,
+					version,
+					going_away.clone(),
+					sourced_paths,
+				);
 
 				let sub_ns_session = session.clone();
 				let mut sub_ns = subscriber.clone();
 
 				tokio::select! {
-					Err(err) = run_unis(session.clone(), subscriber.clone(), version) => Err(err),
+					Err(err) = run_unis(session.clone(), subscriber.clone(), version, goaway_received, going_away.clone()) => Err(err),
 					Err(err) = run_dispatch(session.clone(), publisher.clone(), subscriber.clone(), version) => Err(err),
 					Err(err) = publisher.run() => Err(err),
 					Err(err) = async {
@@ -119,8 +156,16 @@ pub fn start<S: web_transport_trait::Session>(
 	Ok(())
 }
 
-/// Send our SETUP on a uni stream and keep it alive for potential GOAWAY.
-async fn run_setup<S: web_transport_trait::Session>(session: S, version: Version) -> Result<(), Error> {
+/// Send SETUP on a uni stream, then hold it alive for GOAWAY.
+///
+/// When the goaway signal fires, encodes and sends a GOAWAY message on the
+/// same stream before waiting for session close. Draft-17+ uses the SETUP uni
+/// stream as the GOAWAY channel.
+async fn run_setup_with_goaway<S: web_transport_trait::Session>(
+	session: S,
+	version: Version,
+	goaway: &mut GoawaySignal,
+) -> Result<(), Error> {
 	let outer_version = crate::Version::Ietf(version);
 
 	let send = session.open_uni().await.map_err(Error::from_transport)?;
@@ -132,7 +177,37 @@ async fn run_setup<S: web_transport_trait::Session>(session: S, version: Version
 
 	writer.encode(&setup::Setup { parameters }).await?;
 
-	// Hold the writer alive until the session closes.
+	// Wait for either the goaway signal or session close.
+	let payload = tokio::select! {
+		_ = session.closed() => {
+			writer.finish().ok();
+			return Ok(());
+		}
+		payload = crate::session::await_goaway(goaway) => payload,
+	};
+
+	// Send the GOAWAY message on the setup stream.
+	let timeout_ms = payload.timeout.map(|d| d.as_millis() as u64).unwrap_or(0);
+	let goaway_msg = ietf::GoAway {
+		new_session_uri: std::borrow::Cow::Owned(payload.uri.to_string()),
+		timeout: timeout_ms,
+	};
+
+	// Encode as [type_id varint][size u16][body].
+	let mut body = bytes::BytesMut::new();
+	goaway_msg.encode_msg(&mut body, version)?;
+	let type_id: u64 = ietf::GoAway::ID;
+	let size: u16 = body
+		.len()
+		.try_into()
+		.map_err(|_| Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
+
+	let mut writer = writer.with_version(version);
+	writer.encode(&type_id).await?;
+	writer.encode(&size).await?;
+	writer.write_all(&mut std::io::Cursor::new(body)).await?;
+
+	// Hold the stream alive until the session closes.
 	session.closed().await;
 	writer.finish().ok();
 
@@ -141,12 +216,16 @@ async fn run_setup<S: web_transport_trait::Session>(session: S, version: Version
 
 /// Accept incoming uni streams and dispatch each to a handler.
 ///
-/// For v17, this also handles the SETUP stream (0x2F00) and GOAWAY.
-/// For v14-16, all uni streams are group data.
+/// For draft-17+, this also handles the SETUP stream (0x2F00), which then
+/// becomes the GOAWAY channel; a decoded GOAWAY is surfaced through the signal.
+/// For draft-14-16, all uni streams are group data (GOAWAY arrives on the shared
+/// control stream instead), but the signal is still threaded through uniformly.
 async fn run_unis<S: web_transport_trait::Session>(
 	session: S,
 	subscriber: Subscriber<S>,
 	version: Version,
+	goaway_received: GoawayReceivedSignal,
+	going_away: crate::session::GoingAwayFlag,
 ) -> Result<(), Error> {
 	let outer_version = crate::Version::Ietf(version);
 
@@ -159,6 +238,8 @@ async fn run_unis<S: web_transport_trait::Session>(
 		// We accept it in the background without blocking, since there are no
 		// extensions that require waiting on the SETUP before proceeding.
 		if kind == setup::SETUP_V17 {
+			let signal = goaway_received.clone();
+			let flag = going_away.clone();
 			web_async::spawn(async move {
 				// Decode and discard the unified SETUP message.
 				if let Err(err) = reader.decode::<setup::Setup>().await {
@@ -167,7 +248,7 @@ async fn run_unis<S: web_transport_trait::Session>(
 				}
 
 				// Monitor for GOAWAY after setup completes.
-				if let Err(err) = run_goaway(reader.with_version(version), version).await {
+				if let Err(err) = run_goaway(reader.with_version(version), version, signal, flag).await {
 					tracing::warn!(%err, "goaway error");
 				}
 			});
@@ -245,9 +326,14 @@ async fn run_dispatch<S: web_transport_trait::Session>(
 }
 
 /// Block until GOAWAY or stream close.
+///
+/// The decoded GOAWAY is written to `signal` so the public [`Session::goaway`]
+/// accessor resolves, and `going_away` is set so new requests are rejected.
 async fn run_goaway<R: web_transport_trait::RecvStream>(
 	mut reader: Reader<R, Version>,
 	version: Version,
+	signal: GoawayReceivedSignal,
+	going_away: crate::session::GoingAwayFlag,
 ) -> Result<(), Error> {
 	let id: u64 = match reader.decode_maybe().await? {
 		Some(id) => id,
@@ -257,11 +343,24 @@ async fn run_goaway<R: web_transport_trait::RecvStream>(
 	let size: u16 = reader.decode::<u16>().await?;
 	let mut data = reader.read_exact(size as usize).await?;
 
-	if id == ietf::GoAway::ID {
-		let msg = ietf::GoAway::decode_msg(&mut data, version)?;
-		tracing::debug!(message = ?msg, "received GOAWAY");
-		Err(Error::Unsupported)
-	} else {
-		Err(Error::UnexpectedMessage)
+	if id != ietf::GoAway::ID {
+		return Err(Error::UnexpectedMessage);
 	}
+
+	let msg = ietf::GoAway::decode_msg(&mut data, version)?;
+	tracing::debug!(message = ?msg, "received GOAWAY");
+
+	// Set the going-away flag so new requests are rejected immediately.
+	going_away.set();
+
+	let timeout = (msg.timeout > 0).then(|| Duration::from_millis(msg.timeout));
+	let received = crate::session::GoawayReceived {
+		uri: Arc::from(msg.new_session_uri.as_ref()),
+		timeout,
+	};
+	if let Ok(mut state) = signal.write() {
+		*state = Some(received);
+	}
+
+	Ok(())
 }

@@ -1,7 +1,10 @@
 use std::{
-	collections::{BTreeMap, HashMap, VecDeque},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque},
 	fmt,
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU64, Ordering},
+	},
 	task::{Poll, ready},
 };
 
@@ -522,6 +525,18 @@ impl OriginNode {
 		}
 	}
 
+	fn consume_backup_broadcast(&self, rest: impl AsPath) -> Option<BroadcastConsumer> {
+		let rest = rest.as_path();
+
+		if let Some((dir, rest)) = rest.next_part() {
+			let node = self.nested.get(dir)?.lock();
+			node.consume_backup_broadcast(&rest)
+		} else {
+			let entry = self.broadcast.as_ref()?;
+			entry.backup.iter().find(|b| !b.is_closed()).cloned()
+		}
+	}
+
 	fn unconsume(&mut self, id: ConsumerId) {
 		self.notify.lock().consumers.remove(&id).expect("consumer not found");
 		if self.is_empty() {
@@ -672,6 +687,19 @@ impl Default for OriginNodes {
 /// A broadcast path and its associated consumer, or None if closed.
 pub type OriginAnnounce = (PathOwned, Option<BroadcastConsumer>);
 
+/// Shared set of broadcast paths currently undergoing a failover.
+///
+/// When a path is in this set, the downstream publisher knows to re-resolve the
+/// broadcast from the origin at the group boundary instead of tearing down the
+/// subscription. The set is shared (via `Arc`) between all `OriginProducer` and
+/// `OriginConsumer` handles derived from the same origin.
+#[derive(Default)]
+struct FailoverState {
+	paths: HashSet<PathOwned>,
+}
+
+type FailoverPaths = Arc<Mutex<FailoverState>>;
+
 /// Announces broadcasts to consumers over the network.
 #[derive(Clone)]
 pub struct OriginProducer {
@@ -691,6 +719,10 @@ pub struct OriginProducer {
 	// `nodes` because dynamic broadcasts are never announced: they only resolve a
 	// consumer's `request_broadcast` when no live announcement exists.
 	dynamic: kio::Producer<OriginDynamicState>,
+
+	// Paths currently undergoing a seamless failover. Shared with consumers so
+	// the publisher serving loop can check whether to re-resolve at a group boundary.
+	failover_paths: FailoverPaths,
 }
 
 impl std::ops::Deref for OriginProducer {
@@ -705,11 +737,13 @@ impl OriginProducer {
 	/// Build a producer for the given origin id with no scoped prefix and no
 	/// pre-existing broadcasts. Prefer [`Origin::produce`].
 	pub fn new(info: Origin) -> Self {
+		let fp = Arc::new(Mutex::new(FailoverState::default()));
 		Self {
 			info,
 			nodes: OriginNodes::default(),
 			root: PathOwned::default(),
 			dynamic: kio::Producer::default(),
+			failover_paths: fp,
 		}
 	}
 
@@ -771,6 +805,7 @@ impl OriginProducer {
 			nodes: self.nodes.select(&prefixes)?,
 			root: self.root.clone(),
 			dynamic: self.dynamic.clone(),
+			failover_paths: self.failover_paths.clone(),
 		})
 	}
 
@@ -788,7 +823,13 @@ impl OriginProducer {
 
 	/// Subscribe to all announced broadcasts.
 	pub fn consume(&self) -> OriginConsumer {
-		OriginConsumer::new(self.info, self.root.clone(), self.nodes.clone(), self.dynamic.consume())
+		OriginConsumer::new(
+			self.info,
+			self.root.clone(),
+			self.nodes.clone(),
+			self.dynamic.consume(),
+			self.failover_paths.clone(),
+		)
 	}
 
 	/// Get a broadcast by path if it has *already* been published.
@@ -815,6 +856,7 @@ impl OriginProducer {
 			root: self.root.join(&prefix).to_owned(),
 			nodes: self.nodes.root(&prefix)?,
 			dynamic: self.dynamic.clone(),
+			failover_paths: self.failover_paths.clone(),
 		})
 	}
 
@@ -832,6 +874,86 @@ impl OriginProducer {
 	/// Converts a relative path to an absolute path.
 	pub fn absolute(&self, path: impl AsPath) -> Path<'_> {
 		self.root.join(path)
+	}
+
+	/// Begin a seamless failover for a broadcast path.
+	///
+	/// While the returned [`FailoverGuard`] is held, downstream publishers serving
+	/// this path will re-resolve the broadcast from the origin at each group boundary
+	/// instead of tearing down the subscription when the current source ends. This
+	/// enables gap-free, duplicate-free handoff from an old upstream to a new one.
+	///
+	/// The guard is RAII: dropping it (including on panic) clears the failover marker,
+	/// so a crashed or errored failover cannot leave a stale marker that prevents
+	/// normal teardown behavior.
+	///
+	/// # Usage (relay)
+	///
+	/// 1. On upstream GOAWAY, call `begin_failover(path)` for the affected broadcast.
+	/// 2. Connect the new upstream to the same origin (it queues as a backup).
+	/// 3. Close the old upstream session. The origin promotes the backup to active and
+	///    fires a reannounce.
+	/// 4. The publisher re-resolves at the group boundary and picks up the new source.
+	/// 5. Drop the guard once the new source is confirmed to be delivering.
+	pub fn begin_failover(&self, path: impl AsPath) -> FailoverGuard {
+		let absolute = self.root.join(path.as_path()).to_owned();
+		self.failover_paths
+			.lock()
+			.expect("failover_paths poisoned")
+			.paths
+			.insert(absolute.clone());
+		FailoverGuard {
+			kind: FailoverGuardKind::Path(absolute),
+			state: self.failover_paths.clone(),
+		}
+	}
+}
+
+/// RAII guard that holds a failover marker for a broadcast path (or all paths).
+///
+/// While this guard is alive, downstream publishers will re-resolve the broadcast
+/// at group boundaries rather than tearing down when the current source ends.
+/// Dropping the guard (including on panic) clears the marker so normal teardown
+/// behavior resumes.
+///
+/// Obtained from [`OriginProducer::begin_failover`] or
+/// [`Session::begin_failover`](crate::Session::begin_failover).
+pub struct FailoverGuard {
+	kind: FailoverGuardKind,
+	state: FailoverPaths,
+}
+
+enum FailoverGuardKind {
+	Path(PathOwned),
+	/// A combined guard that holds multiple individual path guards.
+	Combined(Vec<FailoverGuard>),
+}
+
+impl FailoverGuard {
+	/// Create a combined guard from multiple per-path guards.
+	///
+	/// Dropping the combined guard releases all contained path markers at once.
+	pub(crate) fn combined(guards: Vec<FailoverGuard>) -> Self {
+		// Use an empty placeholder state since each inner guard owns its own.
+		Self {
+			kind: FailoverGuardKind::Combined(guards),
+			state: Arc::new(std::sync::Mutex::new(FailoverState::default())),
+		}
+	}
+}
+
+impl Drop for FailoverGuard {
+	fn drop(&mut self) {
+		match &mut self.kind {
+			FailoverGuardKind::Path(path) => {
+				let mut state = self.state.lock().expect("failover_paths poisoned");
+				state.paths.remove(path);
+			}
+			FailoverGuardKind::Combined(guards) => {
+				// Drop inner guards, each of which clears its own path.
+				guards.clear();
+			}
+		}
 	}
 }
 
@@ -854,6 +976,9 @@ pub struct OriginConsumer {
 	// Shared fallback request queue, fed to any `OriginDynamic` handler on the
 	// producer side. Used only by `request_broadcast`; announced lookups ignore it.
 	dynamic: kio::Consumer<OriginDynamicState>,
+
+	// Shared set of paths currently undergoing failover.
+	failover_paths: FailoverPaths,
 }
 
 impl std::ops::Deref for OriginConsumer {
@@ -865,7 +990,13 @@ impl std::ops::Deref for OriginConsumer {
 }
 
 impl OriginConsumer {
-	fn new(info: Origin, root: PathOwned, nodes: OriginNodes, dynamic: kio::Consumer<OriginDynamicState>) -> Self {
+	fn new(
+		info: Origin,
+		root: PathOwned,
+		nodes: OriginNodes,
+		dynamic: kio::Consumer<OriginDynamicState>,
+		failover_paths: FailoverPaths,
+	) -> Self {
 		let state = kio::Producer::<OriginConsumerState>::default();
 		let id = ConsumerId::new();
 
@@ -884,6 +1015,7 @@ impl OriginConsumer {
 			state,
 			root,
 			dynamic,
+			failover_paths,
 		}
 	}
 
@@ -945,6 +1077,22 @@ impl OriginConsumer {
 		state.consume_broadcast(&rest)
 	}
 
+	/// Get the incoming/backup broadcast for a path that is currently failing over.
+	///
+	/// During a seamless failover the new upstream publishes into the origin as a
+	/// backup while the old source is still active. This method returns that backup
+	/// broadcast (if present and not closed) so the downstream publisher can switch
+	/// to it at a group boundary without waiting for the old source to die and the
+	/// backup to be promoted.
+	///
+	/// Returns `None` if no non-closed backup exists for this path.
+	pub(crate) fn get_incoming_broadcast(&self, path: impl AsPath) -> Option<BroadcastConsumer> {
+		let path = path.as_path();
+		let (root, rest) = self.nodes.get(&path)?;
+		let state = root.lock();
+		state.consume_backup_broadcast(&rest)
+	}
+
 	/// Block until a broadcast with the given path is announced and return it.
 	///
 	/// Returns `None` if the path is outside this consumer's allowed prefixes or if the consumer
@@ -989,6 +1137,7 @@ impl OriginConsumer {
 			self.root.clone(),
 			self.nodes.select(&prefixes)?,
 			self.dynamic.clone(),
+			self.failover_paths.clone(),
 		))
 	}
 
@@ -1004,6 +1153,7 @@ impl OriginConsumer {
 			self.root.join(&prefix).to_owned(),
 			self.nodes.root(&prefix)?,
 			self.dynamic.clone(),
+			self.failover_paths.clone(),
 		))
 	}
 
@@ -1071,6 +1221,17 @@ impl OriginConsumer {
 	pub fn absolute(&self, path: impl AsPath) -> Path<'_> {
 		self.root.join(path)
 	}
+
+	/// Check whether the given path is currently undergoing a seamless failover.
+	///
+	/// When this returns true, a publisher serving this path should re-resolve the
+	/// broadcast from the origin at the next group boundary rather than tearing down
+	/// the subscription.
+	pub(crate) fn is_failing_over(&self, path: impl AsPath) -> bool {
+		let state = self.failover_paths.lock().expect("failover_paths poisoned");
+		let absolute = self.root.join(path.as_path()).to_owned();
+		state.paths.contains(&absolute)
+	}
 }
 
 impl Drop for OriginConsumer {
@@ -1083,7 +1244,13 @@ impl Drop for OriginConsumer {
 
 impl Clone for OriginConsumer {
 	fn clone(&self) -> Self {
-		OriginConsumer::new(self.info, self.root.clone(), self.nodes.clone(), self.dynamic.clone())
+		OriginConsumer::new(
+			self.info,
+			self.root.clone(),
+			self.nodes.clone(),
+			self.dynamic.clone(),
+			self.failover_paths.clone(),
+		)
 	}
 }
 

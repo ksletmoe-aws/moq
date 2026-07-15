@@ -186,6 +186,32 @@ Check:
 - TLS certificate is valid
 - Relay is actually running
 
+## Graceful Shutdown
+
+`moq-relay` implements a two-stage shutdown sequence triggered by SIGINT or SIGTERM:
+
+1. **First signal (drain):** The relay stops accepting new connections. Each active session receives a GOAWAY frame, telling the peer to reconnect elsewhere. The relay then waits for all peers to disconnect.
+
+2. **Second signal (force):** If peers have not disconnected after the first signal, a second SIGINT/SIGTERM immediately terminates the process.
+
+This allows zero-downtime deployments: send the first signal, wait for connections to drain (peers reconnect to a healthy instance), then the process exits cleanly. If a peer is unresponsive, the second signal forces an immediate exit.
+
+## Upstream GOAWAY Handling
+
+When a relay receives a GOAWAY from an upstream cluster peer or origin, it reconnects transparently without disrupting downstream subscribers:
+
+1. The upstream session signals GOAWAY with a URI (or empty for "same endpoint").
+2. The relay establishes a new session to the target, sharing the same internal origin so new broadcast announcements flow to existing downstream subscribers.
+3. The old upstream session closes.
+4. Downstream subscribers continue receiving without observing any GOAWAY or data gap. The re-announcement from the new upstream is handled internally.
+
+This makes upstream maintenance (rolling restarts, migration, scaling) invisible to subscribers connected to the relay. The relay acts as a stability boundary: upstream churn does not cascade downstream.
+
+**Limitations:**
+
+- Transparent reconnect applies to all upstream connections (static cluster peers and gossip-discovered peers alike). Hop-based loop detection on broadcast announcements prevents forwarding cycles regardless of topology, so no relay-to-relay GOAWAY cascade is needed or performed.
+- During the brief reconnection window, a subscriber may observe a short pause in delivery (one group boundary). No data is lost.
+
 ## Next Steps
 
 - Set up [Authentication](/bin/relay/auth)

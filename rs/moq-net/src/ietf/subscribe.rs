@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use bytes::Buf;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use crate::{
@@ -48,6 +49,99 @@ pub struct Subscribe<'a> {
 	pub subscriber_priority: u8,
 	pub group_order: GroupOrder,
 	pub filter_type: FilterType,
+	/// Start location for `FilterType::AbsoluteStart` and `FilterType::AbsoluteRange`.
+	/// Ignored for other filter types.
+	pub start_location: Option<Location>,
+	/// Absolute end group (inclusive) for `FilterType::AbsoluteRange`. The publisher
+	/// delivers groups up to and including this sequence, then finishes the subscription.
+	/// `None` when the filter has no end bound.
+	pub end_group: Option<u64>,
+}
+
+/// Combined filter type + optional start location + optional end group for parameter 0x21.
+///
+/// The parameter value contains the filter varint followed by a Location
+/// (group + object) when the filter is AbsoluteStart or AbsoluteRange.
+/// For AbsoluteRange, an End Group Delta varint follows (draft-17+: the wire
+/// value is a delta from start_group; internally we store the absolute end group).
+#[derive(Clone, Debug, Default)]
+struct FilterWithLocation {
+	filter_type: FilterType,
+	start_location: Option<Location>,
+	/// Absolute end group (inclusive). On the wire for draft-17+ this is encoded
+	/// as a delta from start_location.group.
+	end_group: Option<u64>,
+}
+
+impl super::Param for FilterWithLocation {
+	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+		let sv = match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => Version::Draft15,
+			_ => version,
+		};
+		let mut buf = Vec::new();
+		self.filter_type.encode(&mut buf, sv)?;
+		match self.filter_type {
+			FilterType::AbsoluteStart => {
+				let loc = self
+					.start_location
+					.as_ref()
+					.unwrap_or(&Location { group: 0, object: 0 });
+				loc.group.encode(&mut buf, sv)?;
+				loc.object.encode(&mut buf, sv)?;
+			}
+			FilterType::AbsoluteRange => {
+				let loc = self
+					.start_location
+					.as_ref()
+					.unwrap_or(&Location { group: 0, object: 0 });
+				loc.group.encode(&mut buf, sv)?;
+				loc.object.encode(&mut buf, sv)?;
+				// Wire format is End Group Delta (absolute_end - start_group).
+				let end_abs = self.end_group.unwrap_or(loc.group);
+				let delta = end_abs.saturating_sub(loc.group);
+				delta.encode(&mut buf, sv)?;
+			}
+			_ => {}
+		}
+		buf.encode(w, version)?;
+		Ok(())
+	}
+
+	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+		let data = Vec::<u8>::decode(r, version)?;
+		let mut buf = bytes::Bytes::from(data);
+		let sv = match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => Version::Draft15,
+			_ => version,
+		};
+		let filter_type = FilterType::decode(&mut buf, sv)?;
+		let (start_location, end_group) = match filter_type {
+			FilterType::AbsoluteStart if buf.has_remaining() => {
+				let group = u64::decode(&mut buf, sv)?;
+				let object = u64::decode(&mut buf, sv)?;
+				(Some(Location { group, object }), None)
+			}
+			FilterType::AbsoluteRange if buf.has_remaining() => {
+				let group = u64::decode(&mut buf, sv)?;
+				let object = u64::decode(&mut buf, sv)?;
+				// Wire value is End Group Delta; convert to absolute.
+				let end = if buf.has_remaining() {
+					let delta = u64::decode(&mut buf, sv)?;
+					Some(group.saturating_add(delta))
+				} else {
+					None
+				};
+				(Some(Location { group, object }), end)
+			}
+			_ => (None, None),
+		};
+		Ok(Self {
+			filter_type,
+			start_location,
+			end_group,
+		})
+	}
 }
 
 impl Message for Subscribe<'_> {
@@ -72,15 +166,14 @@ impl Message for Subscribe<'_> {
 				}
 
 				let filter_type = FilterType::decode(r, version)?;
-				match filter_type {
-					FilterType::AbsoluteStart => {
-						let _start = Location::decode(r, version)?;
-					}
+				let (start_location, end_group) = match filter_type {
+					FilterType::AbsoluteStart => (Some(Location::decode(r, version)?), None),
 					FilterType::AbsoluteRange => {
-						let _start = Location::decode(r, version)?;
-						let _end_group = u64::decode(r, version)?;
+						let start = Location::decode(r, version)?;
+						let end = u64::decode(r, version)?;
+						(Some(start), Some(end))
 					}
-					FilterType::NextGroup | FilterType::LargestObject => {}
+					FilterType::NextGroup | FilterType::LargestObject => (None, None),
 				};
 
 				let _params = Parameters::decode(r, version)?;
@@ -92,13 +185,15 @@ impl Message for Subscribe<'_> {
 					subscriber_priority,
 					group_order,
 					filter_type,
+					start_location,
+					end_group,
 				})
 			}
 			_ => {
 				decode_params!(r, version,
 					0x10 => forward: Option<bool>,
 					0x20 => subscriber_priority: Option<u8>,
-					0x21 => filter_type: Option<FilterType>,
+					0x21 => filter_with_loc: Option<FilterWithLocation>,
 					0x22 => group_order: Option<GroupOrder>,
 				);
 
@@ -108,7 +203,7 @@ impl Message for Subscribe<'_> {
 
 				let subscriber_priority = subscriber_priority.unwrap_or(128);
 				let group_order = group_order.unwrap_or(GroupOrder::Descending);
-				let filter_type = filter_type.unwrap_or(FilterType::LargestObject);
+				let fwl = filter_with_loc.unwrap_or_default();
 
 				Ok(Self {
 					request_id,
@@ -116,7 +211,9 @@ impl Message for Subscribe<'_> {
 					track_name,
 					subscriber_priority,
 					group_order,
-					filter_type,
+					filter_type: fwl.filter_type,
+					start_location: fwl.start_location,
+					end_group: fwl.end_group,
 				})
 			}
 		}
@@ -136,19 +233,38 @@ impl Message for Subscribe<'_> {
 				self.group_order.encode(w, version)?;
 				true.encode(w, version)?; // forward
 
-				debug_assert!(
-					!matches!(self.filter_type, FilterType::AbsoluteStart | FilterType::AbsoluteRange),
-					"Absolute subscribe not supported"
-				);
-
 				self.filter_type.encode(w, version)?;
+				match self.filter_type {
+					FilterType::AbsoluteStart => {
+						let loc = self
+							.start_location
+							.as_ref()
+							.unwrap_or(&Location { group: 0, object: 0 });
+						loc.encode(w, version)?;
+					}
+					FilterType::AbsoluteRange => {
+						let loc = self
+							.start_location
+							.as_ref()
+							.unwrap_or(&Location { group: 0, object: 0 });
+						loc.encode(w, version)?;
+						let end = self.end_group.unwrap_or(0);
+						end.encode(w, version)?;
+					}
+					_ => {}
+				}
 				0u8.encode(w, version)?; // no parameters
 			}
 			_ => {
+				let fwl = FilterWithLocation {
+					filter_type: self.filter_type,
+					start_location: self.start_location.clone(),
+					end_group: self.end_group,
+				};
 				encode_params!(w, version,
 					0x10 => true,
 					0x20 => self.subscriber_priority,
-					0x21 => self.filter_type,
+					0x21 => fwl,
 					0x22 => self.group_order,
 				);
 			}
@@ -438,6 +554,8 @@ mod tests {
 			subscriber_priority: 128,
 			group_order: GroupOrder::Descending,
 			filter_type: FilterType::LargestObject,
+			start_location: None,
+			end_group: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft14);
@@ -458,6 +576,8 @@ mod tests {
 			subscriber_priority: 128,
 			group_order: GroupOrder::Descending,
 			filter_type: FilterType::LargestObject,
+			start_location: None,
+			end_group: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft15);
@@ -478,6 +598,8 @@ mod tests {
 			subscriber_priority: 255,
 			group_order: GroupOrder::Descending,
 			filter_type: FilterType::LargestObject,
+			start_location: None,
+			end_group: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft14);
@@ -626,6 +748,8 @@ mod tests {
 			subscriber_priority: 128,
 			group_order: GroupOrder::Descending,
 			filter_type: FilterType::LargestObject,
+			start_location: None,
+			end_group: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft17);
@@ -680,6 +804,8 @@ mod tests {
 			subscriber_priority: 128,
 			group_order: GroupOrder::Descending,
 			filter_type: FilterType::LargestObject,
+			start_location: None,
+			end_group: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft18);
@@ -745,5 +871,189 @@ mod tests {
 		let v17 = encode_message(&v17_msg, Version::Draft17);
 		let v18 = encode_message(&v18_msg, Version::Draft18);
 		assert_eq!(v17.len(), v18.len() + 1);
+	}
+
+	#[test]
+	fn test_subscribe_next_group_v14_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(5),
+			track_namespace: Path::new("live"),
+			track_name: "video".into(),
+			subscriber_priority: 200,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::NextGroup,
+			start_location: None,
+			end_group: None,
+		};
+
+		let encoded = encode_message(&msg, Version::Draft14);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft14).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::NextGroup);
+		assert_eq!(decoded.start_location, None);
+	}
+
+	#[test]
+	fn test_subscribe_next_group_v17_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(5),
+			track_namespace: Path::new("live"),
+			track_name: "video".into(),
+			subscriber_priority: 200,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::NextGroup,
+			start_location: None,
+			end_group: None,
+		};
+
+		let encoded = encode_message(&msg, Version::Draft17);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft17).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::NextGroup);
+		assert_eq!(decoded.start_location, None);
+	}
+
+	#[test]
+	fn test_subscribe_next_group_v18_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(5),
+			track_namespace: Path::new("live"),
+			track_name: "video".into(),
+			subscriber_priority: 200,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::NextGroup,
+			start_location: None,
+			end_group: None,
+		};
+
+		let encoded = encode_message(&msg, Version::Draft18);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft18).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::NextGroup);
+		assert_eq!(decoded.start_location, None);
+	}
+
+	#[test]
+	fn test_subscribe_absolute_start_v14_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(7),
+			track_namespace: Path::new("vod"),
+			track_name: "audio".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::AbsoluteStart,
+			start_location: Some(Location { group: 42, object: 3 }),
+			end_group: None,
+		};
+
+		let encoded = encode_message(&msg, Version::Draft14);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft14).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::AbsoluteStart);
+		assert_eq!(decoded.start_location, Some(Location { group: 42, object: 3 }));
+	}
+
+	#[test]
+	fn test_subscribe_absolute_start_v17_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(7),
+			track_namespace: Path::new("vod"),
+			track_name: "audio".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::AbsoluteStart,
+			start_location: Some(Location { group: 42, object: 3 }),
+			end_group: None,
+		};
+
+		let encoded = encode_message(&msg, Version::Draft17);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft17).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::AbsoluteStart);
+		assert_eq!(decoded.start_location, Some(Location { group: 42, object: 3 }));
+	}
+
+	#[test]
+	fn test_subscribe_absolute_start_v18_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(7),
+			track_namespace: Path::new("vod"),
+			track_name: "audio".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::AbsoluteStart,
+			start_location: Some(Location { group: 100, object: 0 }),
+			end_group: None,
+		};
+
+		let encoded = encode_message(&msg, Version::Draft18);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft18).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::AbsoluteStart);
+		assert_eq!(decoded.start_location, Some(Location { group: 100, object: 0 }));
+	}
+
+	#[test]
+	fn test_subscribe_absolute_range_v14_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(9),
+			track_namespace: Path::new("vod"),
+			track_name: "video".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::AbsoluteRange,
+			start_location: Some(Location { group: 1, object: 0 }),
+			end_group: Some(5),
+		};
+
+		let encoded = encode_message(&msg, Version::Draft14);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft14).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::AbsoluteRange);
+		assert_eq!(decoded.start_location, Some(Location { group: 1, object: 0 }));
+		assert_eq!(decoded.end_group, Some(5));
+	}
+
+	#[test]
+	fn test_subscribe_absolute_range_v17_round_trip() {
+		let msg = Subscribe {
+			request_id: RequestId(9),
+			track_namespace: Path::new("vod"),
+			track_name: "video".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::AbsoluteRange,
+			start_location: Some(Location { group: 1, object: 0 }),
+			end_group: Some(2),
+		};
+
+		let encoded = encode_message(&msg, Version::Draft17);
+		let decoded: Subscribe = decode_message(&encoded, Version::Draft17).unwrap();
+
+		assert_eq!(decoded.filter_type, FilterType::AbsoluteRange);
+		assert_eq!(decoded.start_location, Some(Location { group: 1, object: 0 }));
+		assert_eq!(decoded.end_group, Some(2));
+		// Verify no leftover bytes (simulates publisher's !data.is_empty() check)
+	}
+
+	#[test]
+	fn test_subscribe_absolute_range_v17_no_leftover() {
+		let msg = Subscribe {
+			request_id: RequestId(9),
+			track_namespace: Path::new("vod"),
+			track_name: "video".into(),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Descending,
+			filter_type: FilterType::AbsoluteRange,
+			start_location: Some(Location { group: 1, object: 0 }),
+			end_group: Some(2),
+		};
+
+		// Encode, then decode using the raw Message trait (same path the publisher uses).
+		let mut buf = BytesMut::new();
+		msg.encode_msg(&mut buf, Version::Draft17).unwrap();
+		let mut data = buf.freeze();
+		let _decoded = Subscribe::decode_msg(&mut data, Version::Draft17).unwrap();
+		assert!(data.is_empty(), "leftover bytes after decode: {} remaining", data.len());
 	}
 }

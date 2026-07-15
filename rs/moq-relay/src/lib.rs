@@ -21,6 +21,12 @@ mod websocket;
 /// to handle many concurrent subscriptions across connections.
 pub const DEFAULT_MAX_STREAMS: u64 = 10_000;
 
+/// Default GOAWAY drain timeout in seconds. After sending GOAWAY the relay
+/// waits this long for the peer to close before force-closing with
+/// GOAWAY_TIMEOUT (moq-transport draft-19, section 3.6).
+#[doc(hidden)]
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
+
 pub use auth::*;
 pub use cluster::*;
 pub use config::*;

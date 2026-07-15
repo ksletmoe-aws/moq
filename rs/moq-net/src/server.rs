@@ -2,7 +2,9 @@ use crate::{
 	ALPN_14, ALPN_15, ALPN_16, ALPN_17, ALPN_18, ALPN_19, ALPN_LITE, ALPN_LITE_03, ALPN_LITE_04, ALPN_LITE_05_WIP,
 	Error, NEGOTIATED, OriginConsumer, OriginProducer, Session, StatsHandle, Version, Versions,
 	coding::{Decode, Encode, Stream},
-	ietf, lite, setup,
+	ietf, lite,
+	session::{goaway_channel, goaway_received_channel, sourced_paths_new},
+	setup,
 };
 
 /// A MoQ server session builder.
@@ -269,43 +271,90 @@ impl<S: web_transport_trait::Session> Request<S> {
 
 		let (session, mut stream, version, request_id_max) = match self.handshake {
 			Handshake::IetfModern { session, version } => {
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+				let sourced_paths = sourced_paths_new();
 				ietf::start(
 					session.clone(),
 					None,
 					None,
 					false,
 					server.publish,
-					server.consume,
+					server.consume.clone(),
 					server.stats,
 					version,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 				tracing::debug!(?version, "connected");
-				return Ok(Session::new(session, version.into(), None));
+				let mut s = Session::new(session, version.into(), None, trigger, goaway_recv_consumer, going_away);
+				if let Some(origin) = server.consume {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Handshake::LiteBare { session, version } => {
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+				let sourced_paths = sourced_paths_new();
 				let recv_bw = lite::start(
 					session.clone(),
 					None,
 					server.publish,
-					server.consume,
+					server.consume.clone(),
 					server.stats,
 					version,
 					lite::Setup::default(),
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
-				return Ok(Session::new(session, version.into(), recv_bw));
+				let mut s = Session::new(
+					session,
+					version.into(),
+					recv_bw,
+					trigger,
+					goaway_recv_consumer,
+					going_away,
+				);
+				if let Some(origin) = server.consume {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Handshake::Lite05 { session } => {
+				let (trigger, signal) = goaway_channel();
+				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+				let sourced_paths = sourced_paths_new();
 				// A server never advertises a request path.
 				let recv_bw = lite::start(
 					session.clone(),
 					None,
 					server.publish,
-					server.consume,
+					server.consume.clone(),
 					server.stats,
 					lite::Version::Lite05Wip,
 					lite::Setup::default(),
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
-				return Ok(Session::new(session, lite::Version::Lite05Wip.into(), recv_bw));
+				let mut s = Session::new(
+					session,
+					lite::Version::Lite05Wip.into(),
+					recv_bw,
+					trigger,
+					goaway_recv_consumer,
+					going_away,
+				);
+				if let Some(origin) = server.consume {
+					s.attach_subscriber_state(sourced_paths, origin);
+				}
+				return Ok(s);
 			}
 			Handshake::Legacy {
 				session,
@@ -332,6 +381,10 @@ impl<S: web_transport_trait::Session> Request<S> {
 		};
 		stream.writer.encode(&server_setup).await?;
 
+		let (trigger, signal) = goaway_channel();
+		let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
+
+		let sourced_paths = sourced_paths_new();
 		let recv_bw = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
@@ -340,10 +393,14 @@ impl<S: web_transport_trait::Session> Request<S> {
 					session.clone(),
 					Some(stream),
 					server.publish,
-					server.consume,
+					server.consume.clone(),
 					server.stats,
 					v,
 					lite::Setup::default(),
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?
 			}
 			Version::Ietf(v) => {
@@ -354,15 +411,23 @@ impl<S: web_transport_trait::Session> Request<S> {
 					request_id_max,
 					false,
 					server.publish,
-					server.consume,
+					server.consume.clone(),
 					server.stats,
 					v,
+					signal,
+					goaway_recv_signal,
+					going_away.clone(),
+					sourced_paths.clone(),
 				)?;
 				None
 			}
 		};
 
-		Ok(Session::new(session, version, recv_bw))
+		let mut s = Session::new(session, version, recv_bw, trigger, goaway_recv_consumer, going_away);
+		if let Some(origin) = server.consume {
+			s.attach_subscriber_state(sourced_paths, origin);
+		}
+		Ok(s)
 	}
 
 	/// Reject the session, closing the transport with `err`'s wire code.

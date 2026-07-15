@@ -372,17 +372,51 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 		Ok((AdapterSend::Real(send), AdapterRecv::Real(recv)))
 	}
 
-	/// Run the control stream read + write tasks.
-	/// This reads from the control stream and routes messages to virtual streams,
-	/// and also drains the write channel to the control stream writer.
-	pub async fn run(
+	/// Send a GOAWAY message on the shared control stream.
+	///
+	/// Encodes the GOAWAY with `[type_id varint][size u16][body]` framing and
+	/// forwards it to the control stream TX channel.
+	pub(super) async fn send_goaway(&self, uri: &str, timeout_ms: u64, version: Version) {
+		use crate::coding::Encode;
+
+		let goaway_msg = crate::ietf::GoAway {
+			new_session_uri: std::borrow::Cow::Borrowed(uri),
+			timeout: timeout_ms,
+		};
+
+		let mut body = bytes::BytesMut::new();
+		if goaway_msg.encode_msg(&mut body, version).is_err() {
+			return;
+		}
+
+		let mut raw = bytes::BytesMut::new();
+		if crate::ietf::GoAway::ID.encode(&mut raw, version).is_err() {
+			return;
+		}
+		if (body.len() as u16).encode(&mut raw, version).is_err() {
+			return;
+		}
+		raw.extend_from_slice(&body);
+
+		let _ = self.shared.control_tx.send(raw.freeze());
+	}
+
+	/// Run the control stream read + write tasks, signaling received GOAWAY.
+	///
+	/// Reads from the control stream and routes messages to virtual streams,
+	/// and also drains the write channel to the control stream writer. A decoded
+	/// GOAWAY is surfaced through the signal producer so [`Session::goaway`]
+	/// resolves instead of the session tearing down.
+	pub async fn run_with_goaway(
 		&self,
 		reader: Reader<S::RecvStream, Version>,
 		writer: Writer<S::SendStream, Version>,
 		rx: mpsc::UnboundedReceiver<Bytes>,
+		goaway_received: crate::session::GoawayReceivedSignal,
+		going_away: crate::session::GoingAwayFlag,
 	) -> Result<(), Error> {
 		tokio::select! {
-			res = self.run_read(reader) => res,
+			res = self.run_read(reader, Some(goaway_received), Some(going_away)) => res,
 			res = Self::run_write(writer, rx) => res,
 		}
 	}
@@ -400,7 +434,12 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 	}
 
 	/// Dispatcher loop that reads control stream messages and routes them.
-	async fn run_read(&self, mut reader: Reader<S::RecvStream, Version>) -> Result<(), Error> {
+	async fn run_read(
+		&self,
+		mut reader: Reader<S::RecvStream, Version>,
+		goaway_received: Option<crate::session::GoawayReceivedSignal>,
+		going_away: Option<crate::session::GoingAwayFlag>,
+	) -> Result<(), Error> {
 		loop {
 			let type_id: u64 = match reader.decode_maybe().await? {
 				Some(id) => id,
@@ -444,7 +483,27 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 					self.control.max_request_id(max);
 				}
 				Route::GoAway => {
-					return Err(Error::Unsupported);
+					// Decode the GoAway body and signal through the channel.
+					let mut data = body;
+					let msg = ietf::GoAway::decode_msg(&mut data, self.version)?;
+					tracing::debug!(message = ?msg, "received GOAWAY (draft-14-16)");
+
+					// Set the going-away flag so new requests are rejected immediately.
+					if let Some(ref flag) = going_away {
+						flag.set();
+					}
+
+					if let Some(ref signal) = goaway_received {
+						let received = crate::session::GoawayReceived {
+							uri: Arc::from(msg.new_session_uri.as_ref()),
+							// Draft-14-16 have no timeout field.
+							timeout: None,
+						};
+						if let Ok(mut state) = signal.write() {
+							*state = Some(received);
+						}
+					}
+					// Continue processing control messages after GOAWAY.
 				}
 			}
 		}

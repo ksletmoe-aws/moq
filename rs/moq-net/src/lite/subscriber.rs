@@ -28,6 +28,10 @@ pub(super) struct SubscriberConfig<S: web_transport_trait::Session> {
 	/// to opt out.
 	pub stats: StatsHandle,
 	pub version: Version,
+	/// Flag set when GOAWAY is received; checked before opening new streams.
+	pub going_away: crate::session::GoingAwayFlag,
+	/// Shared set of paths this subscriber is sourcing into the origin.
+	pub sourced_paths: crate::session::SourcedPaths,
 }
 
 #[derive(Clone)]
@@ -55,6 +59,8 @@ pub(super) struct Subscriber<S: web_transport_trait::Session> {
 	subscribes: Lock<HashMap<u64, TrackEntry>>,
 	next_id: Arc<atomic::AtomicU64>,
 	version: Version,
+	going_away: crate::session::GoingAwayFlag,
+	sourced_paths: crate::session::SourcedPaths,
 }
 
 #[derive(Clone)]
@@ -83,6 +89,8 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			subscribes: Default::default(),
 			next_id: Default::default(),
 			version: config.version,
+			going_away: config.going_away,
+			sourced_paths: config.sourced_paths,
 		}
 	}
 
@@ -219,6 +227,10 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 					if let Some(mut producer) = producers.remove(&path) {
 						producer.abort(Error::Cancel).ok();
 						stats_guards.remove(&abs);
+						// Remove from sourced paths for failover scoping.
+						if let Ok(mut sp) = self.sourced_paths.lock() {
+							sp.remove(&abs);
+						}
 					}
 				}
 			}
@@ -348,6 +360,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			.unwrap()
 			.publish_broadcast(path.clone(), broadcast.consume());
 
+		// Track this path as sourced by this session for failover scoping.
+		if let Ok(mut paths) = self.sourced_paths.lock() {
+			paths.insert(self.origin.as_ref().unwrap().absolute(&path).to_owned());
+		}
+
 		web_async::spawn(self.clone().run_broadcast(path, dynamic));
 
 		Ok(true)
@@ -407,7 +424,20 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			priority: track.priority,
 			ordered: true,
 			max_latency: std::time::Duration::ZERO,
-			start_group: None,
+			start_group: match track.start {
+				// Absolute: group-granular; the object component has no lite wire
+				// representation and is dropped per the documented gap.
+				Some(crate::StartPosition::Absolute { group, .. }) => Some(group),
+				// AbsoluteRange: lite has no range concept on the wire; only the start
+				// group is sent. The end bound is not enforced on lite connections.
+				Some(crate::StartPosition::AbsoluteRange { start_group, .. }) => Some(start_group),
+				// NextGroup: lite has no wire-level "next group" filter. start_group: None
+				// asks the publisher for its latest group. The publisher resolves the actual
+				// next-group boundary (lite/publisher.rs), so None is the best we can do.
+				Some(crate::StartPosition::NextGroup) => None,
+				// LatestObject / None: server picks the latest.
+				Some(crate::StartPosition::LatestObject) | None => None,
+			},
 			end_group: None,
 		};
 
@@ -436,6 +466,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	}
 
 	async fn run_track(&mut self, msg: lite::Subscribe<'_>) -> Result<(), Error> {
+		// Reject new subscriptions after GOAWAY.
+		if self.going_away.is_set() {
+			return Err(Error::GoingAway);
+		}
+
 		let mut stream = Stream::open(&self.session, self.version).await?;
 		stream.writer.encode(&lite::ControlType::Subscribe).await?;
 
@@ -592,5 +627,60 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 	/// received chain is empty (Lite01/02) or anonymous placeholders (Lite03).
 	fn version_lacks_hops(&self) -> bool {
 		matches!(self.version, Version::Lite01 | Version::Lite02 | Version::Lite03)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::StartPosition;
+
+	/// Map a StartPosition to the lite start_group value, mirroring the logic
+	/// in the subscriber's subscribe message construction.
+	fn start_group_for(pos: Option<StartPosition>) -> Option<u64> {
+		match pos {
+			Some(StartPosition::Absolute { group, .. }) => Some(group),
+			Some(StartPosition::AbsoluteRange { start_group, .. }) => Some(start_group),
+			Some(StartPosition::NextGroup) => None,
+			Some(StartPosition::LatestObject) | None => None,
+		}
+	}
+
+	#[test]
+	fn lite_start_position_mapping() {
+		// None (default) => publisher picks latest
+		assert_eq!(start_group_for(None), None);
+
+		// LatestObject => publisher picks latest
+		assert_eq!(start_group_for(Some(StartPosition::LatestObject)), None);
+
+		// NextGroup => None (publisher resolves next boundary)
+		assert_eq!(start_group_for(Some(StartPosition::NextGroup)), None);
+
+		// Absolute => group-granular; object is dropped on lite
+		assert_eq!(
+			start_group_for(Some(StartPosition::Absolute { group: 7, object: 3 })),
+			Some(7)
+		);
+		assert_eq!(
+			start_group_for(Some(StartPosition::Absolute { group: 0, object: 0 })),
+			Some(0)
+		);
+		assert_eq!(
+			start_group_for(Some(StartPosition::Absolute {
+				group: u64::MAX,
+				object: 99
+			})),
+			Some(u64::MAX)
+		);
+
+		// AbsoluteRange => start_group sent; end_group not enforced on lite
+		assert_eq!(
+			start_group_for(Some(StartPosition::AbsoluteRange {
+				start_group: 5,
+				start_object: 0,
+				end_group: 10,
+			})),
+			Some(5)
+		);
 	}
 }
