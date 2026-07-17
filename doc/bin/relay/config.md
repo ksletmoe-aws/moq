@@ -164,6 +164,12 @@ connect_api = "https://api.example.com/cluster/connect"
 # whose URL has no inline ?jwt=. Required to authenticate gossip / connect_api
 # discovered peers; for static `connect` peers, prefer an inline ?jwt=.
 token = "cluster.jwt"
+
+# Optional. Fallback drain time in seconds for an upstream peer that sends a
+# GOAWAY without its own timeout. After reconnecting, the relay keeps the old
+# upstream alive this long so its in-flight groups finish, then force-closes
+# it. A timeout carried on the received GOAWAY takes precedence. Defaults to 10.
+drain_timeout = 10
 ```
 
 See [Clustering](/bin/relay/cluster) for topology choices and the trade-off between hand-listed peers and gossip.

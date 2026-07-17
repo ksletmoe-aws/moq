@@ -32,6 +32,8 @@ pub(super) struct SubscriberConfig<S: web_transport_trait::Session> {
 	pub going_away: crate::session::GoingAwayFlag,
 	/// Shared set of paths this subscriber is sourcing into the origin.
 	pub sourced_paths: crate::session::SourcedPaths,
+	/// Per-session origin id, shared with the Session for `origin_id()` exposure.
+	pub session_origin: crate::Origin,
 }
 
 #[derive(Clone)]
@@ -85,7 +87,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			broadcasts,
 			recv_bandwidth: config.recv_bandwidth,
 			self_origin,
-			session_origin: crate::Origin::random(),
+			session_origin: config.session_origin,
 			subscribes: Default::default(),
 			next_id: Default::default(),
 			version: config.version,
@@ -355,10 +357,11 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		let dynamic = broadcast.dynamic();
 
 		// Run the broadcast in the background until all consumers are dropped.
-		self.origin
-			.as_mut()
-			.unwrap()
-			.publish_broadcast(path.clone(), broadcast.consume());
+		self.origin.as_mut().unwrap().publish_broadcast_from(
+			path.clone(),
+			broadcast.consume(),
+			Some(self.session_origin),
+		);
 
 		// Track this path as sourced by this session for failover scoping.
 		if let Ok(mut paths) = self.sourced_paths.lock() {

@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use moq_net::{BroadcastProducer, Connector, Origin, OriginConsumer, OriginProducer, Path, Stats, Tier};
+use moq_net::{BroadcastProducer, Origin, OriginConsumer, OriginProducer, Path, Stats, Tier};
 use reqwest_middleware::ClientWithMiddleware;
 use tokio::task::AbortHandle;
 use url::Url;
@@ -313,6 +313,20 @@ pub struct ClusterConfig {
 	/// token). For static `--cluster-connect` peers, prefer an inline `?jwt=`.
 	#[arg(id = "cluster-token", long = "cluster-token", env = "MOQ_CLUSTER_TOKEN")]
 	pub token: Option<PathBuf>,
+
+	/// Fallback drain time in seconds for an upstream peer that sends a GOAWAY
+	/// without its own timeout. After a successful reconnect the relay keeps the
+	/// old upstream alive this long so its in-flight groups finish, then
+	/// force-closes it. A timeout carried on the received GOAWAY takes
+	/// precedence over this value. Must be <= the publisher's failover resolve
+	/// timeout so the publisher keeps waiting while the drain completes.
+	/// Defaults to 10 seconds.
+	#[arg(
+		id = "cluster-drain-timeout",
+		long = "cluster-drain-timeout",
+		env = "MOQ_CLUSTER_DRAIN_TIMEOUT"
+	)]
+	pub drain_timeout: Option<u64>,
 
 	/// Removed; present only to emit a migration error. Use [`Self::connect`] instead.
 	#[arg(id = "cluster-root", long = "cluster-root", env = "MOQ_CLUSTER_ROOT", hide = true)]
@@ -864,6 +878,15 @@ impl Cluster {
 			.await
 			.context("failed to connect to cluster peer")?;
 
+		/// Fallback drain time when the upstream's GOAWAY carries no timeout.
+		/// Must be <= FAILOVER_RESOLVE_TIMEOUT in the publisher (moq-net
+		/// lite/publisher.rs and ietf/publisher.rs) so the publisher keeps
+		/// waiting while the drain completes. Overridable via
+		/// `--cluster-drain-timeout`.
+		const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
+		let drain_timeout =
+			std::time::Duration::from_secs(self.config.drain_timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS));
+
 		// Watch for upstream GOAWAY and transparently reconnect. The new session
 		// feeds the same shared OriginProducer, so downstream subscribers see
 		// re-announcements from the new upstream and keep receiving without any
@@ -881,20 +904,6 @@ impl Cluster {
 						goaway_uri = %goaway.uri,
 						"upstream GOAWAY received; reconnecting transparently"
 					);
-
-					// Seamless failover overlap (holding the old session alive so
-					// in-flight groups finish) only applies when the GOAWAY
-					// carries a non-empty URI pointing at a distinct sibling.
-					// An empty URI means "graceful shutdown, reconnect to the same
-					// endpoint" and should not stall the reconnect.
-					let is_sibling_failover = !goaway.uri.is_empty();
-
-					let failover_guard = if is_sibling_failover {
-						let guard = session.begin_failover();
-						Some(guard)
-					} else {
-						None
-					};
 
 					let origin = self.origin.clone();
 					let stats = self.stats.tier(Tier::Internal);
@@ -941,71 +950,17 @@ impl Cluster {
 						}
 					};
 
-					const MAX_RETRIES: u32 = 3;
-					/// How long to wait for the old upstream to drain in-flight groups
-					/// before force-closing the connection after a successful reconnect.
-					/// Must be <= FAILOVER_RESOLVE_TIMEOUT in the publisher (moq-net
-					/// lite/publisher.rs and ietf/publisher.rs) so the publisher keeps
-					/// waiting while the drain completes.
-					const DEFAULT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+					session
+						.reconnect(
+							connector,
+							moq_net::ReconnectOptions::new()
+								.with_drain_timeout(drain_timeout)
+								.with_max_retries(3),
+						)
+						.await
+						.map_err(|e| anyhow::anyhow!("{e}"))?;
 
-					let mut last_err = None;
-					for attempt in 0..=MAX_RETRIES {
-						if attempt > 0 {
-							let backoff = std::time::Duration::from_millis(100 * 2u64.pow(attempt - 1));
-							tracing::warn!(err = ?last_err, attempt, "upstream reconnect failed; retrying after {backoff:?}");
-							tokio::time::sleep(backoff).await;
-						}
-						match connector.connect(goaway.uri.as_ref()).await {
-							Ok(new_session) => {
-								tracing::info!("upstream reconnect successful; new session active");
-
-								let mut old_session = std::mem::replace(&mut session, new_session);
-
-								if let Some(failover_guard) = failover_guard {
-									// Sibling failover: keep the old session alive so
-									// its subscriber tasks finish relaying in-flight
-									// groups. The failover guard moves into the drain
-									// task so publishers keep re-resolving until the
-									// old source has fully drained.
-									let drain_timeout = goaway.timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT);
-
-									tokio::spawn(async move {
-										let drain_result = tokio::time::timeout(
-											drain_timeout,
-											old_session.closed(),
-										).await;
-
-										match drain_result {
-											Ok(_) => {
-												tracing::debug!("old upstream drained cleanly");
-											}
-											Err(_elapsed) => {
-												tracing::warn!(
-													timeout = ?drain_timeout,
-													"old upstream did not drain in time; force-closing"
-												);
-												old_session.close(moq_net::Error::GoawayTimeout);
-											}
-										}
-
-										drop(failover_guard);
-									});
-								}
-								// Empty-URI path: old session drops here, no drain delay.
-
-								last_err = None;
-								break;
-							}
-							Err(err) => {
-								last_err = Some(err);
-							}
-						}
-					}
-					if let Some(err) = last_err {
-						tracing::warn!(%err, "upstream reconnect failed after {MAX_RETRIES} retries");
-						return Err(err.into());
-					}
+					tracing::info!("upstream reconnect successful; new session active");
 				}
 			}
 		}

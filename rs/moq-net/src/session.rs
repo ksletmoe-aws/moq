@@ -266,7 +266,11 @@ pub struct Session {
 	goaway_received: GoawayReceivedConsumer,
 	going_away: GoingAwayFlag,
 	draining: Arc<AtomicBool>,
-	closed: bool,
+	// TODO: `closed` is per-clone (not shared). A live clone's Drop closes the
+	// shared Arc<dyn SessionInner> transport. Callers that clone a Session and
+	// discard the clone must set `closed = true` on it first. A future fix
+	// could make this Arc<AtomicBool> or ref-count-aware.
+	pub(crate) closed: bool,
 	// Shared set of broadcast paths this session's subscriber is currently
 	// sourcing into the origin. Used by `begin_failover()` to mark only the
 	// paths belonging to this upstream.
@@ -274,6 +278,8 @@ pub struct Session {
 	// The origin this session publishes to (subscriber side). Stored so
 	// `begin_failover()` can call `begin_failover(path)` on it.
 	origin: Option<crate::OriginProducer>,
+	// Per-session origin id assigned to the subscriber, exposed via origin_id().
+	session_origin: Option<crate::Origin>,
 }
 
 impl Session {
@@ -312,6 +318,7 @@ impl Session {
 			closed: false,
 			sourced_paths: sourced_paths_new(),
 			origin: None,
+			session_origin: None,
 		}
 	}
 
@@ -407,6 +414,19 @@ impl Session {
 		self.going_away.is_set()
 	}
 
+	/// The subscriber-side origin identity for this session.
+	///
+	/// Returns the per-session random id that the subscriber stamps onto every
+	/// broadcast it publishes into the origin. Used by failover logic to record
+	/// a directed successor: after reconnect, the new session's `origin_id()` is
+	/// stored as the successor so resolution can match by identity rather than
+	/// by arbitrary backup selection.
+	///
+	/// Returns `None` for publish-only sessions (no subscriber side).
+	pub fn origin_id(&self) -> Option<crate::Origin> {
+		self.session_origin
+	}
+
 	/// Begin a seamless failover for every broadcast path this session is sourcing.
 	///
 	/// While the returned [`crate::FailoverGuard`] is held, downstream publishers
@@ -432,9 +452,15 @@ impl Session {
 	///
 	/// Called by the lite/ietf session setup code after the subscriber is created.
 	/// Required for [`Self::begin_failover`] to know which paths this session sources.
-	pub(crate) fn attach_subscriber_state(&mut self, sourced_paths: SourcedPaths, origin: crate::OriginProducer) {
+	pub(crate) fn attach_subscriber_state(
+		&mut self,
+		sourced_paths: SourcedPaths,
+		origin: crate::OriginProducer,
+		session_origin: crate::Origin,
+	) {
 		self.sourced_paths = sourced_paths;
 		self.origin = Some(origin);
+		self.session_origin = Some(session_origin);
 	}
 
 	/// Establish a new session after receiving a GOAWAY, then close this one.
@@ -487,6 +513,21 @@ impl Session {
 	/// Non-blocking read of the received GOAWAY, if any.
 	pub(crate) fn goaway_received_snapshot(&self) -> Option<GoawayReceived> {
 		self.goaway_received.read().clone()
+	}
+
+	/// The origin this session publishes into (subscriber side), if attached.
+	pub(crate) fn origin(&self) -> Option<&crate::OriginProducer> {
+		self.origin.as_ref()
+	}
+
+	/// Snapshot the set of paths this session is currently sourcing.
+	pub(crate) fn sourced_paths_snapshot(&self) -> Vec<crate::PathOwned> {
+		self.sourced_paths
+			.lock()
+			.expect("sourced_paths poisoned")
+			.iter()
+			.cloned()
+			.collect()
 	}
 }
 

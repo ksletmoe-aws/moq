@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, VecDeque},
 	fmt,
 	sync::{
 		Arc, Mutex,
@@ -239,11 +239,22 @@ impl ConsumerId {
 	}
 }
 
+/// A broadcast paired with the identity of the session that published it.
+///
+/// Internal-only: used by the origin to track which session each route came from
+/// so failover can resolve by directed successor identity rather than arbitrary
+/// backup selection.
+#[derive(Clone)]
+struct TaggedBroadcast {
+	broadcast: BroadcastConsumer,
+	source: Option<Origin>,
+}
+
 // If there are multiple broadcasts with the same path, we keep the oldest active and queue the others.
 struct OriginBroadcast {
 	path: PathOwned,
-	active: BroadcastConsumer,
-	backup: VecDeque<BroadcastConsumer>,
+	active: TaggedBroadcast,
+	backup: VecDeque<TaggedBroadcast>,
 }
 
 /// Ordering key used to pick the active route among broadcasts at the same path.
@@ -456,14 +467,14 @@ impl OriginNode {
 		}
 	}
 
-	fn publish(&mut self, full: impl AsPath, broadcast: &BroadcastConsumer, relative: impl AsPath) {
+	fn publish(&mut self, full: impl AsPath, tagged: &TaggedBroadcast, relative: impl AsPath, failing_over: bool) {
 		let full = full.as_path();
 		let rest = relative.as_path();
 
 		// If the path has a directory component, then publish it to the nested node.
 		if let Some((dir, relative)) = rest.next_part() {
 			// Not using entry to avoid allocating a string most of the time.
-			self.entry(dir).lock().publish(&full, broadcast, &relative);
+			self.entry(dir).lock().publish(&full, tagged, &relative, failing_over);
 		} else if let Some(existing) = &mut self.broadcast {
 			// This node is a leaf with an existing broadcast. Prefer the route with the
 			// lower ordering key (shorter hop chain, deterministic hash on ties), so every
@@ -472,29 +483,39 @@ impl OriginNode {
 			// Drop duplicates (same underlying broadcast delivered via multiple links) so the
 			// backup queue can't accumulate clones of the active entry and trigger redundant
 			// reannouncements when a peer churns.
-			if existing.active.is_clone(broadcast) || existing.backup.iter().any(|b| b.is_clone(broadcast)) {
+			if existing.active.broadcast.is_clone(&tagged.broadcast)
+				|| existing.backup.iter().any(|b| b.broadcast.is_clone(&tagged.broadcast))
+			{
 				return;
 			}
 
-			if route_key(&full, &broadcast.hops) < route_key(&full, &existing.active.hops) {
+			if route_key(&full, &tagged.broadcast.hops) < route_key(&full, &existing.active.broadcast.hops) {
 				let old = existing.active.clone();
-				existing.active = broadcast.clone();
+				existing.active = tagged.clone();
 				existing.backup.push_back(old);
 
-				self.notify.lock().reannounce(full, broadcast);
+				// During a seamless failover, swap the active route silently: the path
+				// stays announced, so a downstream consumer never observes an
+				// unannounce and its subscription is not torn down. Publishers
+				// re-resolve the new active via `get_incoming_broadcast` at the next
+				// group boundary. This is the atomic form of the per-wire publisher
+				// suppression, decided here under the node lock so there is no window.
+				if !failing_over {
+					self.notify.lock().reannounce(full, &tagged.broadcast);
+				}
 			} else {
 				// Loses the ordering (longer path, or the tie-break): keep as a backup
 				// in case the active one drops.
-				existing.backup.push_back(broadcast.clone());
+				existing.backup.push_back(tagged.clone());
 			}
 		} else {
 			// This node is a leaf with no existing broadcast.
 			self.broadcast = Some(OriginBroadcast {
 				path: full.to_owned(),
-				active: broadcast.clone(),
+				active: tagged.clone(),
 				backup: VecDeque::new(),
 			});
-			self.notify.lock().announce(full, broadcast);
+			self.notify.lock().announce(full, &tagged.broadcast);
 		}
 	}
 
@@ -505,7 +526,7 @@ impl OriginNode {
 
 	fn consume_initial(&mut self, notify: &mut OriginConsumerNotify) {
 		if let Some(broadcast) = &self.broadcast {
-			notify.announce(&broadcast.path, broadcast.active.clone());
+			notify.announce(&broadcast.path, broadcast.active.broadcast.clone());
 		}
 
 		// Recursively subscribe to all nested nodes.
@@ -521,7 +542,7 @@ impl OriginNode {
 			let node = self.nested.get(dir)?.lock();
 			node.consume_broadcast(&rest)
 		} else {
-			self.broadcast.as_ref().map(|b| b.active.clone())
+			self.broadcast.as_ref().map(|b| b.active.broadcast.clone())
 		}
 	}
 
@@ -533,7 +554,33 @@ impl OriginNode {
 			node.consume_backup_broadcast(&rest)
 		} else {
 			let entry = self.broadcast.as_ref()?;
-			entry.backup.iter().find(|b| !b.is_closed()).cloned()
+			entry
+				.backup
+				.iter()
+				.find(|b| !b.broadcast.is_closed())
+				.map(|b| b.broadcast.clone())
+		}
+	}
+
+	/// Find a broadcast (active or backup) whose `source` matches the given origin
+	/// and is not closed. Used by failover resolution to match by directed successor.
+	fn find_broadcast_by_source(&self, rest: impl AsPath, source: Origin) -> Option<BroadcastConsumer> {
+		let rest = rest.as_path();
+
+		if let Some((dir, rest)) = rest.next_part() {
+			let node = self.nested.get(dir)?.lock();
+			node.find_broadcast_by_source(&rest, source)
+		} else {
+			let entry = self.broadcast.as_ref()?;
+			// Check active first, then backups.
+			if entry.active.source == Some(source) && !entry.active.broadcast.is_closed() {
+				return Some(entry.active.broadcast.clone());
+			}
+			entry
+				.backup
+				.iter()
+				.find(|b| b.source == Some(source) && !b.broadcast.is_closed())
+				.map(|b| b.broadcast.clone())
 		}
 	}
 
@@ -546,14 +593,14 @@ impl OriginNode {
 	}
 
 	// Returns true if the broadcast should be unannounced.
-	fn remove(&mut self, full: impl AsPath, broadcast: BroadcastConsumer, relative: impl AsPath) {
+	fn remove(&mut self, full: impl AsPath, broadcast: BroadcastConsumer, relative: impl AsPath, failing_over: bool) {
 		let full = full.as_path();
 		let relative = relative.as_path();
 
 		if let Some((dir, relative)) = relative.next_part() {
 			let nested = self.entry(dir);
 			let mut locked = nested.lock();
-			locked.remove(&full, broadcast, &relative);
+			locked.remove(&full, broadcast, &relative, failing_over);
 
 			if locked.is_empty() {
 				drop(locked);
@@ -566,7 +613,7 @@ impl OriginNode {
 			};
 
 			// See if we can remove the broadcast from the backup list.
-			let pos = entry.backup.iter().position(|b| b.is_clone(&broadcast));
+			let pos = entry.backup.iter().position(|b| b.broadcast.is_clone(&broadcast));
 			if let Some(pos) = pos {
 				entry.backup.remove(pos);
 				// Nothing else to do
@@ -574,7 +621,7 @@ impl OriginNode {
 			}
 
 			// Okay so it must be the active broadcast or else we fucked up.
-			assert!(entry.active.is_clone(&broadcast));
+			assert!(entry.active.broadcast.is_clone(&broadcast));
 
 			// Promote the backup with the lowest ordering key, the same rule used when
 			// publishing, so the route a node heals to still matches its peers.
@@ -582,16 +629,29 @@ impl OriginNode {
 				.backup
 				.iter()
 				.enumerate()
-				.min_by_key(|(_, b)| route_key(&full, &b.hops))
+				.min_by_key(|(_, b)| route_key(&full, &b.broadcast.hops))
 				.map(|(i, _)| i);
 			if let Some(idx) = best {
-				let active = entry.backup.remove(idx).expect("index in range");
-				entry.active = active;
-				self.notify.lock().reannounce(full, &entry.active);
+				let promoted = entry.backup.remove(idx).expect("index in range");
+				entry.active = promoted;
+				// During a seamless failover, promote the backup silently: the path
+				// stays announced across the source swap, so a downstream consumer's
+				// subscription is never torn down. Publishers re-resolve the promoted
+				// active at the next group boundary. Atomic (under the node lock), so
+				// there is no window in which the path appears unannounced.
+				if !failing_over {
+					self.notify.lock().reannounce(full, &entry.active.broadcast);
+				}
 			} else {
 				// No more backups, so remove the entry.
 				self.broadcast = None;
-				self.notify.lock().unannounce(full);
+				// During failover with no backup yet (e.g. the old source dropped
+				// before the replacement announced), suppress the unannounce so the
+				// downstream subscription survives while the publisher waits for the
+				// replacement to resolve. Outside failover this is a real unannounce.
+				if !failing_over {
+					self.notify.lock().unannounce(full);
+				}
 			}
 		}
 	}
@@ -695,7 +755,17 @@ pub type OriginAnnounce = (PathOwned, Option<BroadcastConsumer>);
 /// `OriginConsumer` handles derived from the same origin.
 #[derive(Default)]
 struct FailoverState {
-	paths: HashSet<PathOwned>,
+	entries: HashMap<PathOwned, FailoverEntry>,
+	next_generation: u64,
+}
+
+/// Per-path failover metadata.
+///
+/// Tracks the generation (supersede counter) and an optional successor identity
+/// so resolution can match by directed successor rather than arbitrary backup.
+struct FailoverEntry {
+	generation: u64,
+	successor: Option<Origin>,
 }
 
 type FailoverPaths = Arc<Mutex<FailoverState>>;
@@ -768,6 +838,22 @@ impl OriginProducer {
 	///
 	/// Returns false if the broadcast is not allowed to be published.
 	pub fn publish_broadcast(&self, path: impl AsPath, broadcast: BroadcastConsumer) -> bool {
+		self.publish_broadcast_from(path, broadcast, None)
+	}
+
+	/// Publish a broadcast tagged with the identity of the session that produced it.
+	///
+	/// Behaves identically to [`Self::publish_broadcast`] but additionally records
+	/// `source` on the internal entry so failover resolution can match by directed
+	/// successor identity rather than arbitrary backup selection.
+	///
+	/// Local publishers (not sourced from a remote session) pass `None`.
+	pub(crate) fn publish_broadcast_from(
+		&self,
+		path: impl AsPath,
+		broadcast: BroadcastConsumer,
+		source: Option<Origin>,
+	) -> bool {
 		let path = path.as_path();
 
 		// Loop detection: refuse broadcasts whose hop chain already contains our id.
@@ -782,12 +868,33 @@ impl OriginProducer {
 
 		let full = self.root.join(&path);
 
-		root.lock().publish(&full, &broadcast, &rest);
+		// Snapshot whether this path is failing over so publish/remove can swap the
+		// active route silently (no observable unannounce). Checked at publish time
+		// here; re-checked at drop time in the closure below since the failover state
+		// can change between publish and the eventual close.
+		let failover_paths = self.failover_paths.clone();
+		let failing_over = failover_paths
+			.lock()
+			.expect("failover_paths poisoned")
+			.entries
+			.contains_key(&full);
+
+		let tagged = TaggedBroadcast {
+			broadcast: broadcast.clone(),
+			source,
+		};
+
+		root.lock().publish(&full, &tagged, &rest, failing_over);
 		let root = root.clone();
 
 		web_async::spawn(async move {
 			broadcast.closed().await;
-			root.lock().remove(&full, broadcast, &rest);
+			let failing_over = failover_paths
+				.lock()
+				.expect("failover_paths poisoned")
+				.entries
+				.contains_key(&full);
+			root.lock().remove(&full, broadcast, &rest, failing_over);
 		});
 
 		true
@@ -897,14 +1004,36 @@ impl OriginProducer {
 	/// 5. Drop the guard once the new source is confirmed to be delivering.
 	pub fn begin_failover(&self, path: impl AsPath) -> FailoverGuard {
 		let absolute = self.root.join(path.as_path()).to_owned();
-		self.failover_paths
-			.lock()
-			.expect("failover_paths poisoned")
-			.paths
-			.insert(absolute.clone());
+		let mut state = self.failover_paths.lock().expect("failover_paths poisoned");
+		let generation = state.next_generation;
+		state.next_generation += 1;
+		state.entries.insert(
+			absolute.clone(),
+			FailoverEntry {
+				generation,
+				successor: None,
+			},
+		);
 		FailoverGuard {
-			kind: FailoverGuardKind::Path(absolute),
+			kind: FailoverGuardKind::Path {
+				path: absolute,
+				generation,
+			},
 			state: self.failover_paths.clone(),
+		}
+	}
+
+	/// Record the identity of the successor session for a failing-over path.
+	///
+	/// Called after the replacement session connects, so the failover resolve logic
+	/// can match by directed successor identity rather than picking an arbitrary
+	/// backup. Has no effect if the path is not currently failing over (the guard
+	/// was already dropped or a newer failover superseded it).
+	pub(crate) fn record_failover_successor(&self, path: impl AsPath, successor: Origin) {
+		let absolute = self.root.join(path.as_path()).to_owned();
+		let mut state = self.failover_paths.lock().expect("failover_paths poisoned");
+		if let Some(entry) = state.entries.get_mut(&absolute) {
+			entry.successor = Some(successor);
 		}
 	}
 }
@@ -924,7 +1053,10 @@ pub struct FailoverGuard {
 }
 
 enum FailoverGuardKind {
-	Path(PathOwned),
+	Path {
+		path: PathOwned,
+		generation: u64,
+	},
 	/// A combined guard that holds multiple individual path guards.
 	Combined(Vec<FailoverGuard>),
 }
@@ -945,9 +1077,16 @@ impl FailoverGuard {
 impl Drop for FailoverGuard {
 	fn drop(&mut self) {
 		match &mut self.kind {
-			FailoverGuardKind::Path(path) => {
+			FailoverGuardKind::Path { path, generation } => {
 				let mut state = self.state.lock().expect("failover_paths poisoned");
-				state.paths.remove(path);
+				// Only remove if the stored generation matches: a superseding
+				// begin_failover bumped the generation, so this stale guard's
+				// drop is a no-op.
+				if let Some(entry) = state.entries.get(path) {
+					if entry.generation == *generation {
+						state.entries.remove(path);
+					}
+				}
 			}
 			FailoverGuardKind::Combined(guards) => {
 				// Drop inner guards, each of which clears its own path.
@@ -1080,17 +1219,34 @@ impl OriginConsumer {
 	/// Get the incoming/backup broadcast for a path that is currently failing over.
 	///
 	/// During a seamless failover the new upstream publishes into the origin as a
-	/// backup while the old source is still active. This method returns that backup
-	/// broadcast (if present and not closed) so the downstream publisher can switch
-	/// to it at a group boundary without waiting for the old source to die and the
-	/// backup to be promoted.
+	/// backup while the old source is still active. If a successor identity has been
+	/// recorded (via [`OriginProducer::record_failover_successor`]), this returns the
+	/// broadcast (active or backup) whose source matches that successor. Otherwise
+	/// falls back to the first non-closed backup.
 	///
-	/// Returns `None` if no non-closed backup exists for this path.
+	/// Returns `None` if no matching non-closed broadcast exists for this path.
 	pub(crate) fn get_incoming_broadcast(&self, path: impl AsPath) -> Option<BroadcastConsumer> {
 		let path = path.as_path();
+		let absolute = self.root.join(&path).to_owned();
+
+		// Check if there's a recorded successor identity for this path.
+		let successor = self
+			.failover_paths
+			.lock()
+			.expect("failover_paths poisoned")
+			.entries
+			.get(&absolute)
+			.and_then(|e| e.successor);
+
 		let (root, rest) = self.nodes.get(&path)?;
 		let state = root.lock();
-		state.consume_backup_broadcast(&rest)
+
+		if let Some(successor_id) = successor {
+			state.find_broadcast_by_source(&rest, successor_id)
+		} else {
+			// No successor recorded yet: fall back to first non-closed backup.
+			state.consume_backup_broadcast(&rest)
+		}
 	}
 
 	/// Block until a broadcast with the given path is announced and return it.
@@ -1230,7 +1386,18 @@ impl OriginConsumer {
 	pub(crate) fn is_failing_over(&self, path: impl AsPath) -> bool {
 		let state = self.failover_paths.lock().expect("failover_paths poisoned");
 		let absolute = self.root.join(path.as_path()).to_owned();
-		state.paths.contains(&absolute)
+		state.entries.contains_key(&absolute)
+	}
+
+	/// Get the recorded successor identity for a failing-over path.
+	///
+	/// Returns `None` if the path is not failing over or no successor has been
+	/// recorded yet. Used by the async resolve loop to filter announced broadcasts
+	/// by the directed successor rather than accepting any non-closed broadcast.
+	pub(crate) fn failover_successor(&self, path: impl AsPath) -> Option<Origin> {
+		let state = self.failover_paths.lock().expect("failover_paths poisoned");
+		let absolute = self.root.join(path.as_path()).to_owned();
+		state.entries.get(&absolute).and_then(|e| e.successor)
 	}
 }
 

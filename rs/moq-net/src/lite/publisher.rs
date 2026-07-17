@@ -18,6 +18,12 @@ use crate::{
 
 use super::Version;
 
+/// Maximum time to wait for a replacement broadcast to announce during failover.
+/// Must be >= the relay's upstream drain timeout so the publisher does not give
+/// up before the old upstream finishes draining. Mirrors the IETF path
+/// (`ietf/publisher.rs`).
+const FAILOVER_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(super) struct PublisherConfig<S: web_transport_trait::Session> {
 	pub session: S,
 	/// The origin we read local broadcasts from. None gives this session a
@@ -392,9 +398,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let broadcasts = self.broadcasts.clone();
 
 		let session = self.session.clone();
+		let origin = self.origin.clone();
 		web_async::spawn(async move {
 			if let Err(err) = Self::run_subscribe(
 				session,
+				origin,
 				&mut stream,
 				&subscribe,
 				broadcast,
@@ -473,6 +481,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 	#[allow(clippy::too_many_arguments)]
 	async fn run_subscribe(
 		session: S,
+		origin: OriginConsumer,
 		stream: &mut Stream<S, Version>,
 		subscribe: &lite::Subscribe<'_>,
 		consumer: kio::Pending<BroadcastRequested>,
@@ -538,7 +547,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		// `Some(last_group)` means the track ended (and we owe a SUBSCRIBE_END); `None`
 		// means the subscriber tore down the stream first, so no end signal is owed.
 		let ended = tokio::select! {
-			res = Self::run_track(session, track, subscribe, priority, track_stats, track_priority_rx, version) => Some(res?),
+			res = Self::run_track(session, origin, absolute.clone(), track, subscribe, priority, track_stats, track_priority_rx, version) => Some(res?),
 			res = Self::run_subscribe_updates(&mut stream.reader, &track_priority_tx) => { res?; None }
 		};
 
@@ -567,8 +576,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	async fn run_track(
 		session: S,
+		origin: OriginConsumer,
+		broadcast_path: crate::PathOwned,
 		mut track: TrackConsumer,
 		subscribe: &lite::Subscribe<'_>,
 		priority: PriorityQueue,
@@ -576,10 +588,16 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		mut track_priority: tokio::sync::watch::Receiver<u8>,
 		version: Version,
 	) -> Result<Option<u64>, Error> {
+		use std::sync::atomic::{AtomicU64, Ordering};
+
 		let mut tasks = FuturesUnordered::new();
 
 		// Highest group sequence handed to a Group stream, reported in SUBSCRIBE_END (moq-lite-05+).
 		let mut last_sequence: Option<u64> = None;
+
+		// Highest group sequence fully forwarded and acknowledged downstream. Used
+		// as the resume point when the source dies mid-stream during failover.
+		let last_delivered = std::sync::Arc::new(AtomicU64::new(u64::MAX));
 
 		loop {
 			let recv_result = tokio::select! {
@@ -593,6 +611,30 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 			let group = match recv_result {
 				Ok(Some(g)) => g,
+				// Source ended or errored while failover is active: switch to the
+				// replacement upstream rather than ending the subscription. Resume
+				// from the last acknowledged group + 1. Mirrors the IETF path.
+				Ok(None) | Err(_) if origin.is_failing_over(&broadcast_path) => {
+					let delivered = last_delivered.load(Ordering::Acquire);
+					let start_at = if delivered == u64::MAX {
+						track.latest().map(|s| s + 1).unwrap_or(0)
+					} else {
+						delivered + 1
+					};
+					tracing::info!(
+						broadcast = %origin.absolute(&broadcast_path),
+						track = %track.name,
+						%start_at,
+						"failover: switching source (track ended)"
+					);
+					match Self::switch_to_failover_source(&origin, &broadcast_path, &track, start_at).await? {
+						Some(new_track) => {
+							track = new_track;
+							continue;
+						}
+						None => return Ok(last_sequence),
+					}
+				}
 				Ok(None) | Err(Error::Dropped) => return Ok(last_sequence),
 				Err(e) => return Err(e),
 			};
@@ -618,9 +660,114 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					track_stats.clone(),
 					track_priority.clone(),
 					version,
+					last_delivered.clone(),
 				)
 				.map(|_| ()),
 			);
+
+			// Primary seamless path: check failover at the group boundary. Group N
+			// was fully received and handed to serve_group, so the replacement must
+			// resume at N+1. Reading last_delivered here would race the in-flight task.
+			if origin.is_failing_over(&broadcast_path) {
+				let start_at = sequence + 1;
+				tracing::info!(
+					broadcast = %origin.absolute(&broadcast_path),
+					track = %track.name,
+					%start_at,
+					"failover: switching source at group boundary"
+				);
+				match Self::switch_to_failover_source(&origin, &broadcast_path, &track, start_at).await? {
+					Some(new_track) => track = new_track,
+					// No replacement available yet; continue with the current source.
+					None => {}
+				}
+			}
+		}
+	}
+
+	/// Resolve the failover broadcast and subscribe to the track at `resume_group`.
+	///
+	/// Returns the new track consumer, or `None` if no replacement resolves before
+	/// the timeout. The caller decides whether `None` ends the track (source-death
+	/// path) or continues on the current source (group-boundary path). Mirrors the
+	/// IETF path (`ietf/publisher.rs`).
+	async fn switch_to_failover_source(
+		origin: &OriginConsumer,
+		broadcast_path: &crate::PathOwned,
+		track: &TrackConsumer,
+		resume_group: u64,
+	) -> Result<Option<TrackConsumer>, Error> {
+		// Prefer an already-registered backup (synchronous, no await).
+		let new_broadcast = if let Some(bc) = origin.get_incoming_broadcast(broadcast_path) {
+			bc
+		} else {
+			match tokio::time::timeout(
+				FAILOVER_RESOLVE_TIMEOUT,
+				Self::resolve_failover_broadcast(origin, broadcast_path),
+			)
+			.await
+			{
+				Ok(Some(bc)) => bc,
+				Ok(None) | Err(_) => {
+					tracing::warn!(
+						broadcast = %origin.absolute(broadcast_path),
+						"failover resolve timed out or origin closed"
+					);
+					return Ok(None);
+				}
+			}
+		};
+
+		// Resume at an absolute group so the replacement upstream skips
+		// already-delivered groups. Lite has no object-level start on the wire;
+		// group granularity is what failover needs.
+		let mut new_track = new_broadcast.subscribe_track(&Track {
+			name: track.name.clone(),
+			priority: track.priority,
+			start: Some(crate::StartPosition::Absolute {
+				group: resume_group,
+				object: 0,
+			}),
+		})?;
+		new_track.start_at(resume_group);
+		Ok(Some(new_track))
+	}
+
+	/// Wait for a new broadcast to appear at the given path via announce,
+	/// skipping any that are already closed (the dying old source).
+	/// When a successor identity is recorded, matches only the broadcast
+	/// from that successor session.
+	/// During a seamless failover the silent-swap invariant suppresses announce
+	/// events, so this also polls `get_incoming_broadcast` on a short interval
+	/// to catch the successor broadcast once it appears.
+	async fn resolve_failover_broadcast(
+		origin: &OriginConsumer,
+		broadcast_path: &crate::PathOwned,
+	) -> Option<crate::BroadcastConsumer> {
+		let mut consumer = origin.scope(std::slice::from_ref(&broadcast_path.as_path()))?;
+		let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(10));
+		poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+		loop {
+			tokio::select! {
+				biased;
+				ann = consumer.announced() => {
+					let (path, broadcast) = ann?;
+					if path.as_path() == broadcast_path.as_path() && broadcast.is_some() {
+						if let Some(bc) = origin.get_incoming_broadcast(broadcast_path) {
+							return Some(bc);
+						}
+					}
+				}
+				_ = poll_interval.tick() => {
+					// Silent-swap during failover suppresses announce events.
+					// Poll the origin directly to catch the successor once it
+					// has been published.
+					if let Some(bc) = origin.get_incoming_broadcast(broadcast_path) {
+						return Some(bc);
+					}
+				}
+			}
 		}
 	}
 
@@ -632,6 +779,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		track_stats: std::sync::Arc<crate::PublisherTrack>,
 		mut track_priority: tokio::sync::watch::Receiver<u8>,
 		version: Version,
+		last_delivered: std::sync::Arc<std::sync::atomic::AtomicU64>,
 	) -> Result<(), Error> {
 		let stream = session.open_uni().await.map_err(Error::from_transport)?;
 
@@ -718,6 +866,9 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 		stream.finish()?;
 		stream.closed().await?;
+
+		// Group fully written and acknowledged: advance the failover resume floor.
+		last_delivered.fetch_max(msg.sequence, std::sync::atomic::Ordering::Release);
 
 		tracing::debug!(sequence = %msg.sequence, "finished group");
 

@@ -37,6 +37,8 @@ pub fn start<S: web_transport_trait::Session>(
 	// Shared set of paths the subscriber sources into the origin. The caller retains
 	// a clone so Session::begin_failover can read the same set.
 	sourced_paths: SourcedPaths,
+	// Per-session origin id shared with the Session for origin_id() exposure.
+	session_origin: crate::Origin,
 ) -> Result<Option<BandwidthConsumer>, Error> {
 	let recv_bw = BandwidthProducer::new();
 
@@ -76,6 +78,7 @@ pub fn start<S: web_transport_trait::Session>(
 		version,
 		going_away,
 		sourced_paths,
+		session_origin,
 	});
 
 	// moq-lite-05 reintroduced a Setup stream: each endpoint opens one and sends a

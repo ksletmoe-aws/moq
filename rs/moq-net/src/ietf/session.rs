@@ -30,6 +30,8 @@ pub fn start<S: web_transport_trait::Session>(
 	// Shared set of paths the subscriber sources into the origin. The caller retains
 	// a clone so Session::begin_failover can read the same set.
 	sourced_paths: SourcedPaths,
+	// Per-session origin id shared with the Session for origin_id() exposure.
+	session_origin: crate::Origin,
 ) -> Result<(), Error> {
 	web_async::spawn(async move {
 		let res = match version {
@@ -50,6 +52,7 @@ pub fn start<S: web_transport_trait::Session>(
 					version,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				);
 
 				// Spawn goaway send task for draft-14-16 (shared control stream).
@@ -114,6 +117,7 @@ pub fn start<S: web_transport_trait::Session>(
 					version,
 					going_away.clone(),
 					sourced_paths,
+					session_origin,
 				);
 
 				let sub_ns_session = session.clone();

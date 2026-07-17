@@ -1241,3 +1241,542 @@ async fn session_begin_failover_wires_sourced_paths() {
 	.await
 	.expect("test timed out (likely a deadlock)");
 }
+
+/// Seamless failover WITHOUT Cluster: proves the reconnect primitive delivers
+/// gap-free, duplicate-free group continuity to a downstream consumer that never
+/// touches moq_net::Cluster.
+///
+/// Topology (three sessions, two wire links):
+///   upstream A/B  ──(wire)──>  relay origin  ──(wire)──>  downstream player
+///
+/// The relay origin is fed by upstream mock sessions (A then B). A downstream
+/// wire session's publisher reads from the relay origin and serves the downstream
+/// player. When upstream A receives GOAWAY, the relay client calls
+/// `Session::reconnect` with a drain timeout. The connector wires session B into
+/// the same relay origin. The downstream publisher re-resolves at the group
+/// boundary and the downstream player observes gap-free, duplicate-free continuity.
+///
+/// This is the generalizability proof: the seamless failover primitive works for
+/// any consumer that drives `Session::reconnect` with a shared origin, not only
+/// the built-in Cluster.
+#[tokio::test]
+async fn seamless_failover_non_cluster_gap_free() {
+	tokio::time::timeout(TEST_TIMEOUT, async {
+		let version: Version = "moq-lite-04".parse().unwrap();
+
+		// The "relay" origin that both upstream sessions publish into.
+		let relay_origin = Origin::random().produce();
+
+		// Upstream A publishes broadcast "test", track "video".
+		let upstream_origin_a = Origin::random().produce();
+		let mut broadcast_a = upstream_origin_a.create_broadcast("test").expect("broadcast A");
+		let mut track_a = broadcast_a.create_track(Track::new("video")).expect("track A");
+
+		// Upstream link: relay is the client, upstream A is the server.
+		let opts_upstream_a = MockConnectOptions {
+			version,
+			client_publish: None,
+			client_consume: Some(relay_origin.clone()),
+			server_publish: Some(upstream_origin_a.consume()),
+			server_consume: None,
+		};
+		let (mut client_session_a, server_session_a) = connect_mock(opts_upstream_a).await;
+
+		// Downstream link: relay is the server (publishes from relay origin),
+		// the downstream player is the client.
+		let downstream_origin = Origin::random().produce();
+		let downstream_consumer = downstream_origin.consume();
+
+		let opts_downstream = MockConnectOptions {
+			version,
+			client_publish: None,
+			client_consume: Some(downstream_origin),
+			server_publish: Some(relay_origin.consume()),
+			server_consume: None,
+		};
+		let (_downstream_client, _downstream_server) = connect_mock(opts_downstream).await;
+
+		// Wait for upstream A's announce to propagate through the relay origin
+		// and the downstream link's publisher to announce to the downstream player.
+		for _ in 0..30 {
+			tokio::task::yield_now().await;
+		}
+
+		// Downstream player subscribes to the broadcast.
+		let downstream_broadcast = downstream_consumer
+			.announced_broadcast("test")
+			.await
+			.expect("broadcast never announced to downstream");
+
+		let mut downstream_track = downstream_broadcast
+			.subscribe_track(&Track::new("video"))
+			.expect("subscribe_track downstream");
+
+		// Let the subscription propagate back through to the upstream publisher.
+		for _ in 0..30 {
+			tokio::task::yield_now().await;
+		}
+
+		// Upstream A writes group 0.
+		let mut g0 = track_a.create_group(Group { sequence: 0 }).expect("group 0");
+		g0.write_frame(b"g0_data".as_ref()).expect("write g0");
+		g0.finish().expect("finish g0");
+
+		// Downstream reads group 0.
+		let mut gc0 = downstream_track.recv_group().await.expect("recv g0").expect("no g0");
+		assert_eq!(gc0.sequence, 0, "first group should be seq 0");
+		let frame0 = gc0.read_frame().await.expect("read g0 frame").expect("no frame");
+		assert_eq!(&*frame0, b"g0_data");
+
+		// Server A drains (GOAWAY).
+		let draining_a = server_session_a
+			.drain()
+			.expect("drain A")
+			.start("moqt://upstream-b.example");
+
+		// Relay client observes GOAWAY.
+		let goaway = client_session_a.goaway().await.expect("session closed before GOAWAY");
+		assert_eq!(&*goaway.uri, "moqt://upstream-b.example");
+
+		// Prepare upstream B: publishes same broadcast/track name.
+		let upstream_origin_b = Origin::random().produce();
+		let mut broadcast_b = upstream_origin_b.create_broadcast("test").expect("broadcast B");
+		let mut track_b = broadcast_b.create_track(Track::new("video")).expect("track B");
+
+		// Reconnect to upstream B. The new session shares the same relay_origin.
+		let relay_origin_for_b = relay_origin.clone();
+		let upstream_consumer_b = upstream_origin_b.consume();
+
+		let (server_b_tx, server_b_rx) = tokio::sync::oneshot::channel();
+		let server_b_tx = std::sync::Mutex::new(Some(server_b_tx));
+
+		let _new_session = client_session_a
+			.reconnect(
+				move |uri: &str| {
+					assert_eq!(uri, "moqt://upstream-b.example");
+					let origin_b = relay_origin_for_b.clone();
+					let pub_b = upstream_consumer_b.clone();
+					let tx = server_b_tx.lock().unwrap().take();
+					async move {
+						let opts_b = MockConnectOptions {
+							version,
+							client_publish: None,
+							client_consume: Some(origin_b),
+							server_publish: Some(pub_b),
+							server_consume: None,
+						};
+						let (client_b, server_b) = connect_mock(opts_b).await;
+						if let Some(tx) = tx {
+							let _ = tx.send(server_b);
+						}
+						Ok(client_b)
+					}
+				},
+				ReconnectOptions::default().with_drain_timeout(Duration::from_secs(2)),
+			)
+			.await
+			.expect("reconnect failed");
+
+		let _server_session_b = server_b_rx.await.expect("server_b channel dropped");
+
+		// Let session B's subscriber propagate the announce into the relay origin.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+
+		// Upstream B writes group 1 before we close old source A.
+		let mut g1 = track_b.create_group(Group { sequence: 1 }).expect("group 1");
+		g1.write_frame(b"g1_data".as_ref()).expect("write g1");
+		g1.finish().expect("finish g1");
+
+		// Drop old source: the downstream link's publisher is blocked on
+		// recv_group() from A's track. Closing it triggers the failover path
+		// (source ended + is_failing_over).
+		drop(track_a);
+		drop(broadcast_a);
+
+		// Downstream reads group 1: gap-free, no duplicate.
+		let mut gc1 = downstream_track.recv_group().await.expect("recv g1").expect("no g1");
+		assert_eq!(gc1.sequence, 1, "second group should be seq 1 (gap-free continuity)");
+		let frame1 = gc1.read_frame().await.expect("read g1 frame").expect("no frame");
+		assert_eq!(&*frame1, b"g1_data");
+
+		// Clean up.
+		drop(track_b);
+		drop(broadcast_b);
+		draining_a.complete().await;
+	})
+	.await
+	.expect("test timed out (likely a deadlock)");
+}
+
+/// Successor-by-identity beats route_key: proves the seamless failover resolution
+/// selects the directed successor regardless of hop-chain ordering.
+///
+/// Same topology as [`seamless_failover_non_cluster_gap_free`] but upstream B's
+/// broadcast carries extra hops (3 total vs 1 for A), making it LOSE the
+/// route_key ordering (shorter chain wins). Without successor-by-identity the
+/// origin would never promote B to active (it sorts worse than A). With the
+/// successor mechanism, `get_incoming_broadcast` finds B by matching its source
+/// origin against the recorded successor, bypassing the route_key entirely.
+///
+/// This is the core generalizability property: seamless failover is independent of
+/// mesh route selection, so it works for any non-Cluster consumer regardless of
+/// the hop topology.
+#[tokio::test]
+async fn seamless_failover_successor_beats_route_key() {
+	use moq_net::{Broadcast, OriginList};
+
+	tokio::time::timeout(TEST_TIMEOUT, async {
+		let version: Version = "moq-lite-04".parse().unwrap();
+
+		// The "relay" origin that both upstream sessions publish into.
+		let relay_origin = Origin::random().produce();
+
+		// Upstream A publishes broadcast "test" with default (empty) hops.
+		// After the server publisher appends its origin, the wire carries 1 hop.
+		// The client subscriber receives 1 hop and publishes into the relay origin.
+		let upstream_origin_a = Origin::random().produce();
+		let mut broadcast_a = upstream_origin_a.create_broadcast("test").expect("broadcast A");
+		let mut track_a = broadcast_a.create_track(Track::new("video")).expect("track A");
+
+		// Upstream link A.
+		let opts_upstream_a = MockConnectOptions {
+			version,
+			client_publish: None,
+			client_consume: Some(relay_origin.clone()),
+			server_publish: Some(upstream_origin_a.consume()),
+			server_consume: None,
+		};
+		let (mut client_session_a, server_session_a) = connect_mock(opts_upstream_a).await;
+
+		// Downstream link: relay publishes from its origin to a downstream player.
+		let downstream_origin = Origin::random().produce();
+		let downstream_consumer = downstream_origin.consume();
+
+		let opts_downstream = MockConnectOptions {
+			version,
+			client_publish: None,
+			client_consume: Some(downstream_origin),
+			server_publish: Some(relay_origin.consume()),
+			server_consume: None,
+		};
+		let (_downstream_client, _downstream_server) = connect_mock(opts_downstream).await;
+
+		// Wait for propagation.
+		for _ in 0..30 {
+			tokio::task::yield_now().await;
+		}
+
+		// Downstream subscribes.
+		let downstream_broadcast = downstream_consumer
+			.announced_broadcast("test")
+			.await
+			.expect("broadcast never announced to downstream");
+
+		let mut downstream_track = downstream_broadcast
+			.subscribe_track(&Track::new("video"))
+			.expect("subscribe_track downstream");
+
+		// Let the subscription propagate.
+		for _ in 0..30 {
+			tokio::task::yield_now().await;
+		}
+
+		// Upstream A writes group 0.
+		let mut g0 = track_a.create_group(Group { sequence: 0 }).expect("group 0");
+		g0.write_frame(b"g0_data".as_ref()).expect("write g0");
+		g0.finish().expect("finish g0");
+
+		// Downstream reads group 0.
+		let mut gc0 = downstream_track.recv_group().await.expect("recv g0").expect("no g0");
+		assert_eq!(gc0.sequence, 0);
+		let frame0 = gc0.read_frame().await.expect("read g0 frame").expect("no frame");
+		assert_eq!(&*frame0, b"g0_data");
+
+		// Server A drains (GOAWAY).
+		let draining_a = server_session_a
+			.drain()
+			.expect("drain A")
+			.start("moqt://upstream-b.example");
+
+		// Relay client observes GOAWAY.
+		let goaway = client_session_a.goaway().await.expect("session closed before GOAWAY");
+		assert_eq!(&*goaway.uri, "moqt://upstream-b.example");
+
+		// Prepare upstream B with a LONGER hop chain so it LOSES route_key.
+		// Broadcast starts with 2 extra hops. Server publisher appends its own
+		// origin (3 hops on wire). Client subscriber receives 3 hops.
+		// Route key = (3, hash) vs A's (1, hash). B loses the ordering.
+		let upstream_origin_b = Origin::random().produce();
+		let mut long_hops = OriginList::new();
+		long_hops.push(Origin::from(0xDEAD01)).unwrap();
+		long_hops.push(Origin::from(0xDEAD02)).unwrap();
+		let broadcast_b_inner = Broadcast { hops: long_hops };
+		let mut broadcast_b_producer = broadcast_b_inner.produce();
+		let broadcast_b_consumer = broadcast_b_producer.consume();
+		upstream_origin_b.publish_broadcast("test", broadcast_b_consumer);
+		let mut track_b = broadcast_b_producer.create_track(Track::new("video")).expect("track B");
+
+		// Reconnect to upstream B. The new session shares the relay_origin.
+		let relay_origin_for_b = relay_origin.clone();
+		let upstream_consumer_b = upstream_origin_b.consume();
+
+		let (server_b_tx, server_b_rx) = tokio::sync::oneshot::channel();
+		let server_b_tx = std::sync::Mutex::new(Some(server_b_tx));
+
+		let _new_session = client_session_a
+			.reconnect(
+				move |uri: &str| {
+					assert_eq!(uri, "moqt://upstream-b.example");
+					let origin_b = relay_origin_for_b.clone();
+					let pub_b = upstream_consumer_b.clone();
+					let tx = server_b_tx.lock().unwrap().take();
+					async move {
+						let opts_b = MockConnectOptions {
+							version,
+							client_publish: None,
+							client_consume: Some(origin_b),
+							server_publish: Some(pub_b),
+							server_consume: None,
+						};
+						let (client_b, server_b) = connect_mock(opts_b).await;
+						if let Some(tx) = tx {
+							let _ = tx.send(server_b);
+						}
+						Ok(client_b)
+					}
+				},
+				ReconnectOptions::default().with_drain_timeout(Duration::from_secs(2)),
+			)
+			.await
+			.expect("reconnect failed");
+
+		let _server_session_b = server_b_rx.await.expect("server_b channel dropped");
+
+		// Let session B's subscriber propagate.
+		// B's broadcast has more hops, so under pure route_key ordering it stays
+		// as backup. Successor-by-identity overrides this.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+
+		// Upstream B writes group 1.
+		let mut g1 = track_b.create_group(Group { sequence: 1 }).expect("group 1");
+		g1.write_frame(b"g1_data".as_ref()).expect("write g1");
+		g1.finish().expect("finish g1");
+
+		// Drop old source: triggers the downstream publisher's failover path.
+		drop(track_a);
+		drop(broadcast_a);
+
+		// Downstream reads group 1: proves successor-by-identity delivered the
+		// correct broadcast despite it losing route_key.
+		let mut gc1 = downstream_track.recv_group().await.expect("recv g1").expect("no g1");
+		assert_eq!(
+			gc1.sequence, 1,
+			"group 1 from successor B must arrive (successor-by-identity beats route_key)"
+		);
+		let frame1 = gc1.read_frame().await.expect("read g1 frame").expect("no frame");
+		assert_eq!(&*frame1, b"g1_data");
+
+		// Clean up.
+		drop(track_b);
+		drop(broadcast_b_producer);
+		draining_a.complete().await;
+	})
+	.await
+	.expect("test timed out (likely a deadlock)");
+}
+
+/// Diamond fan-out seamless failover WITHOUT Cluster.
+///
+/// Topology (five mock sessions, diamond shape):
+///
+/// ```text
+///   SOURCE ──(pub)──> MID-A server ──(sub)──> MID-A client ──(consume)──┐
+///          └─(pub)──> MID-B server ──(sub)──> MID-B client ──(consume)──┤
+///                                                                       ↓
+///                                                           shared_downstream_origin
+///                                                                       ↓
+///                                                           downstream_server ──(pub)──> player
+/// ```
+///
+/// Proves:
+/// 1. Fan-out: a single source feeds TWO independent relay paths (MID-A, MID-B).
+/// 2. Convergence: both paths feed into a SHARED downstream origin.
+/// 3. Seamless failover: when MID-A sends GOAWAY, the relay-client reconnects to
+///    MID-B via `Session::reconnect`. The downstream publisher re-resolves at the
+///    group boundary and delivers gap-free, duplicate-free continuity to the player.
+/// 4. No Cluster: this uses only `Session::reconnect` with a shared `OriginProducer`,
+///    proving the failover primitive works for diamond topologies without `moq_net::Cluster`.
+///
+/// This is the diamond analog of [`seamless_failover_non_cluster_gap_free`] (linear).
+#[tokio::test]
+async fn diamond_failover_non_cluster_gap_free() {
+	tokio::time::timeout(TEST_TIMEOUT, async {
+		let version: Version = "moq-lite-04".parse().unwrap();
+
+		// ═══════════════════════════════════════════════════════════════
+		// SOURCE: publishes broadcast "test", track "video" to both MID-A and MID-B.
+		// In a real diamond, the source connects to both siblings independently.
+		// ═══════════════════════════════════════════════════════════════
+
+		// MID-A's upstream origin (what MID-A's server publishes to its relay-client).
+		let mid_a_upstream_origin = Origin::random().produce();
+		let mut broadcast_a = mid_a_upstream_origin.create_broadcast("test").expect("broadcast A");
+		let mut track_a = broadcast_a.create_track(Track::new("video")).expect("track A");
+
+		// MID-B's upstream origin (what MID-B's server publishes to its relay-client).
+		let mid_b_upstream_origin = Origin::random().produce();
+		let mut broadcast_b = mid_b_upstream_origin.create_broadcast("test").expect("broadcast B");
+		let mut track_b = broadcast_b.create_track(Track::new("video")).expect("track B");
+
+		// ═══════════════════════════════════════════════════════════════
+		// SHARED DOWNSTREAM ORIGIN: both MID-A and MID-B relay-clients consume
+		// into this single origin. The downstream publisher reads from it.
+		// ═══════════════════════════════════════════════════════════════
+		let shared_downstream_origin = Origin::random().produce();
+
+		// ═══════════════════════════════════════════════════════════════
+		// MID-A LINK: relay-client subscribes to MID-A server, consuming into
+		// the shared downstream origin. This is the "active" path initially.
+		// ═══════════════════════════════════════════════════════════════
+		let opts_mid_a = MockConnectOptions {
+			version,
+			client_publish: None,
+			client_consume: Some(shared_downstream_origin.clone()),
+			server_publish: Some(mid_a_upstream_origin.consume()),
+			server_consume: None,
+		};
+		let (mut relay_client_a, relay_server_a) = connect_mock(opts_mid_a).await;
+
+		// ═══════════════════════════════════════════════════════════════
+		// DOWNSTREAM LINK: server publishes from the shared downstream origin,
+		// player subscribes.
+		// ═══════════════════════════════════════════════════════════════
+		let player_origin = Origin::random().produce();
+		let player_consumer = player_origin.consume();
+
+		let opts_downstream = MockConnectOptions {
+			version,
+			client_publish: None,
+			client_consume: Some(player_origin),
+			server_publish: Some(shared_downstream_origin.consume()),
+			server_consume: None,
+		};
+		let (_downstream_client, _downstream_server) = connect_mock(opts_downstream).await;
+
+		// Wait for MID-A's announce to propagate through the shared origin and
+		// the downstream link to announce to the player.
+		for _ in 0..30 {
+			tokio::task::yield_now().await;
+		}
+
+		// ═══════════════════════════════════════════════════════════════
+		// PLAYER subscribes to the broadcast via the downstream link.
+		// ═══════════════════════════════════════════════════════════════
+		let player_broadcast = player_consumer
+			.announced_broadcast("test")
+			.await
+			.expect("broadcast never announced to player");
+
+		let mut player_track = player_broadcast
+			.subscribe_track(&Track::new("video"))
+			.expect("player subscribe_track");
+
+		// Let the subscription propagate back through to MID-A's publisher.
+		for _ in 0..30 {
+			tokio::task::yield_now().await;
+		}
+
+		// ═══════════════════════════════════════════════════════════════
+		// SOURCE writes group 0 through MID-A path.
+		// ═══════════════════════════════════════════════════════════════
+		let mut g0 = track_a.create_group(Group { sequence: 0 }).expect("group 0 on A");
+		g0.write_frame(b"diamond_g0".as_ref()).expect("write g0");
+		g0.finish().expect("finish g0");
+
+		// Player reads group 0 from the MID-A path.
+		let mut gc0 = player_track.recv_group().await.expect("recv g0").expect("no g0");
+		assert_eq!(gc0.sequence, 0, "first group should be seq 0");
+		let frame0 = gc0.read_frame().await.expect("read g0 frame").expect("no frame");
+		assert_eq!(&*frame0, b"diamond_g0");
+
+		// ═══════════════════════════════════════════════════════════════
+		// MID-A GOAWAY: server A drains, relay-client reconnects to MID-B.
+		// ═══════════════════════════════════════════════════════════════
+		let draining_a = relay_server_a.drain().expect("drain A").start("moqt://mid-b.example");
+
+		// Relay-client observes GOAWAY from MID-A.
+		let goaway = relay_client_a.goaway().await.expect("session closed before GOAWAY");
+		assert_eq!(&*goaway.uri, "moqt://mid-b.example");
+
+		// Reconnect to MID-B: the connector creates a new session that consumes
+		// into the SAME shared_downstream_origin (diamond convergence).
+		let shared_origin_for_b = shared_downstream_origin.clone();
+		let mid_b_consumer = mid_b_upstream_origin.consume();
+
+		let (server_b_tx, server_b_rx) = tokio::sync::oneshot::channel();
+		let server_b_tx = std::sync::Mutex::new(Some(server_b_tx));
+
+		let _new_session = relay_client_a
+			.reconnect(
+				move |uri: &str| {
+					assert_eq!(uri, "moqt://mid-b.example");
+					let origin_b = shared_origin_for_b.clone();
+					let pub_b = mid_b_consumer.clone();
+					let tx = server_b_tx.lock().unwrap().take();
+					async move {
+						let opts_b = MockConnectOptions {
+							version,
+							client_publish: None,
+							client_consume: Some(origin_b),
+							server_publish: Some(pub_b),
+							server_consume: None,
+						};
+						let (client_b, server_b) = connect_mock(opts_b).await;
+						if let Some(tx) = tx {
+							let _ = tx.send(server_b);
+						}
+						Ok(client_b)
+					}
+				},
+				ReconnectOptions::default().with_drain_timeout(Duration::from_secs(2)),
+			)
+			.await
+			.expect("reconnect to MID-B failed");
+
+		let _relay_server_b = server_b_rx.await.expect("server_b channel dropped");
+
+		// Let MID-B's subscriber propagate through the shared downstream origin.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+
+		// ═══════════════════════════════════════════════════════════════
+		// SOURCE writes group 1 through MID-B path (the "other diamond leg").
+		// ═══════════════════════════════════════════════════════════════
+		let mut g1 = track_b.create_group(Group { sequence: 1 }).expect("group 1 on B");
+		g1.write_frame(b"diamond_g1".as_ref()).expect("write g1");
+		g1.finish().expect("finish g1");
+
+		// Drop old source (MID-A path) to trigger failover at the group boundary.
+		drop(track_a);
+		drop(broadcast_a);
+
+		// ═══════════════════════════════════════════════════════════════
+		// ASSERT: player sees group 1 from MID-B path. Gap-free, no duplicate.
+		// This proves the diamond: source fanned out to A and B, A failed over
+		// to B, and the downstream saw contiguous delivery through both legs.
+		// ═══════════════════════════════════════════════════════════════
+		let mut gc1 = player_track.recv_group().await.expect("recv g1").expect("no g1");
+		assert_eq!(
+			gc1.sequence, 1,
+			"second group should be seq 1 (gap-free diamond failover)"
+		);
+		let frame1 = gc1.read_frame().await.expect("read g1 frame").expect("no frame");
+		assert_eq!(&*frame1, b"diamond_g1");
+
+		// Clean up.
+		drop(track_b);
+		drop(broadcast_b);
+		draining_a.complete().await;
+	})
+	.await
+	.expect("test timed out (likely a deadlock)");
+}

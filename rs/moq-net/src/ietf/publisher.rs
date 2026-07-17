@@ -18,9 +18,10 @@ use super::{Message, Version};
 /// waiting before the old upstream finishes draining.
 const FAILOVER_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-// Seamless GOAWAY failover is implemented on the IETF path only. The default
-// ALPN order prefers moq-lite-04, so a session must negotiate IETF
-// (e.g. moq-transport-19) for seamless failover to engage.
+// Seamless GOAWAY failover is implemented on both the IETF and moq-lite paths
+// (see lite/publisher.rs for the lite port). Both resume the replacement upstream
+// at an absolute group boundary; lite has no wire-level NextGroup filter, so it
+// relies on the absolute-group resume rather than a server-side next-group hint.
 
 #[derive(Clone)]
 pub(super) struct Publisher<S: web_transport_trait::Session> {
@@ -453,16 +454,36 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 	/// Wait for a new broadcast to appear at the given path via announce,
 	/// skipping any that are already closed (the dying old source).
+	/// When a successor identity is recorded, matches only the broadcast
+	/// from that successor session.
+	///
+	/// During a seamless failover the silent-swap invariant suppresses announce
+	/// events, so this also polls `get_incoming_broadcast` on a short interval
+	/// to catch the successor broadcast once it appears.
 	async fn resolve_failover_broadcast(
 		origin: &OriginConsumer,
 		broadcast_path: &crate::PathOwned,
 	) -> Option<crate::BroadcastConsumer> {
 		let mut consumer = origin.scope(std::slice::from_ref(&broadcast_path.as_path()))?;
+		let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(10));
+		poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
 		loop {
-			let (path, broadcast) = consumer.announced().await?;
-			if path.as_path() == broadcast_path.as_path() {
-				if let Some(bc) = broadcast {
-					if !bc.is_closed() {
+			tokio::select! {
+				biased;
+				ann = consumer.announced() => {
+					let (path, broadcast) = ann?;
+					if path.as_path() == broadcast_path.as_path() && broadcast.is_some() {
+						if let Some(bc) = origin.get_incoming_broadcast(broadcast_path) {
+							return Some(bc);
+						}
+					}
+				}
+				_ = poll_interval.tick() => {
+					// Silent-swap during failover suppresses announce events.
+					// Poll the origin directly to catch the successor once it
+					// has been published.
+					if let Some(bc) = origin.get_incoming_broadcast(broadcast_path) {
 						return Some(bc);
 					}
 				}
@@ -694,18 +715,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				tracing::debug!(broadcast = %self.origin.absolute(&path), "announce");
 				let absolute = self.origin.absolute(&path).to_owned();
 
-				// During failover the origin re-announces a path that is already
-				// active on the wire. Opening a second namespace stream would confuse
-				// the subscriber (duplicate namespace). Suppress; the existing stream
-				// and run_track re-resolve handle the source swap transparently.
-				if namespace_streams.contains_key(&suffix) && self.origin.is_failing_over(&path) {
-					tracing::debug!(
-						broadcast = %absolute,
-						"suppressing redundant announce during failover",
-					);
-					continue;
-				}
-
 				let request_id = self.control.next_request_id().await?;
 				let mut stream = Stream::open(&self.session, self.version).await?;
 
@@ -755,19 +764,6 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				}
 			} else {
 				let absolute = self.origin.absolute(&path).to_owned();
-
-				// During a seamless failover the origin emits an unannounce (old source
-				// dropped) immediately followed by an announce (backup promoted). If we
-				// close the namespace stream, the downstream subscriber tears down its
-				// broadcast before the new announce arrives. Suppress both: the existing
-				// namespace stream stays open and run_track re-resolves transparently.
-				if self.origin.is_failing_over(&path) {
-					tracing::debug!(
-						broadcast = %absolute,
-						"suppressing unannounce during failover",
-					);
-					continue;
-				}
 
 				tracing::debug!(broadcast = %absolute, "unannounce");
 				if let Some((request_id, mut stream, _stats)) = namespace_streams.remove(&suffix) {

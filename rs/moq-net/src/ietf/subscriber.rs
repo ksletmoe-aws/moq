@@ -79,6 +79,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 		version: Version,
 		going_away: crate::session::GoingAwayFlag,
 		sourced_paths: crate::session::SourcedPaths,
+		session_origin: crate::Origin,
 	) -> Self {
 		let broadcasts = stats.subscriber_broadcasts();
 		Self {
@@ -87,7 +88,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			control,
 			stats,
 			broadcasts,
-			session_origin: crate::Origin::random(),
+			session_origin,
 			state: Default::default(),
 			version,
 			going_away,
@@ -501,7 +502,7 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 				// note in lite::Subscriber).
 				let dynamic = broadcast.dynamic();
 
-				origin.publish_broadcast(path.clone(), broadcast.consume());
+				origin.publish_broadcast_from(path.clone(), broadcast.consume(), Some(self.session_origin));
 				entry.insert(BroadcastState {
 					producer: broadcast.clone(),
 					count: 1,

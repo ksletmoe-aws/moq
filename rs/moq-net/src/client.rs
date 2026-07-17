@@ -91,6 +91,7 @@ impl Client {
 				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 				let sourced_paths = sourced_paths_new();
+				let session_origin = crate::Origin::random();
 				// Draft-17+: SETUP is exchanged in the background by the session.
 				ietf::start(
 					session.clone(),
@@ -105,12 +106,13 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
 				let mut s = Session::new(session, v, None, trigger, goaway_recv_consumer, going_away);
 				if let Some(origin) = self.consume.clone() {
-					s.attach_subscriber_state(sourced_paths, origin);
+					s.attach_subscriber_state(sourced_paths, origin, session_origin);
 				}
 				return Ok(s);
 			}
@@ -124,6 +126,7 @@ impl Client {
 				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 				let sourced_paths = sourced_paths_new();
+				let session_origin = crate::Origin::random();
 				// Draft-17+: SETUP is exchanged in the background by the session.
 				ietf::start(
 					session.clone(),
@@ -138,12 +141,13 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
 				let mut s = Session::new(session, v, None, trigger, goaway_recv_consumer, going_away);
 				if let Some(origin) = self.consume.clone() {
-					s.attach_subscriber_state(sourced_paths, origin);
+					s.attach_subscriber_state(sourced_paths, origin, session_origin);
 				}
 				return Ok(s);
 			}
@@ -157,6 +161,7 @@ impl Client {
 				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 				let sourced_paths = sourced_paths_new();
+				let session_origin = crate::Origin::random();
 				// Draft-17+: SETUP is exchanged in the background by the session.
 				ietf::start(
 					session.clone(),
@@ -171,12 +176,13 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 
 				tracing::debug!(version = ?v, "connected");
 				let mut s = Session::new(session, v, None, trigger, goaway_recv_consumer, going_away);
 				if let Some(origin) = self.consume.clone() {
-					s.attach_subscriber_state(sourced_paths, origin);
+					s.attach_subscriber_state(sourced_paths, origin, session_origin);
 				}
 				return Ok(s);
 			}
@@ -210,6 +216,7 @@ impl Client {
 				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 				let sourced_paths = sourced_paths_new();
+				let session_origin = crate::Origin::random();
 				let setup = lite::Setup {
 					path: self.path.clone(),
 				};
@@ -225,6 +232,7 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 
 				let mut s = Session::new(
@@ -236,7 +244,7 @@ impl Client {
 					going_away,
 				);
 				if let Some(origin) = self.consume.clone() {
-					s.attach_subscriber_state(sourced_paths, origin);
+					s.attach_subscriber_state(sourced_paths, origin, session_origin);
 				}
 				return Ok(s);
 			}
@@ -249,6 +257,7 @@ impl Client {
 				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 				let sourced_paths = sourced_paths_new();
+				let session_origin = crate::Origin::random();
 				let recv_bw = lite::start(
 					session.clone(),
 					None,
@@ -261,6 +270,7 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 
 				let mut s = Session::new(
@@ -272,7 +282,7 @@ impl Client {
 					going_away,
 				);
 				if let Some(origin) = self.consume.clone() {
-					s.attach_subscriber_state(sourced_paths, origin);
+					s.attach_subscriber_state(sourced_paths, origin, session_origin);
 				}
 				return Ok(s);
 			}
@@ -285,6 +295,7 @@ impl Client {
 				let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 				let sourced_paths = sourced_paths_new();
+				let session_origin = crate::Origin::random();
 				// Starting with draft-03, there's no more SETUP control stream.
 				let recv_bw = lite::start(
 					session.clone(),
@@ -298,6 +309,7 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 
 				let mut s = Session::new(
@@ -309,7 +321,7 @@ impl Client {
 					going_away,
 				);
 				if let Some(origin) = self.consume.clone() {
-					s.attach_subscriber_state(sourced_paths, origin);
+					s.attach_subscriber_state(sourced_paths, origin, session_origin);
 				}
 				return Ok(s);
 			}
@@ -349,6 +361,7 @@ impl Client {
 		let (goaway_recv_signal, goaway_recv_consumer, going_away) = goaway_received_channel();
 
 		let sourced_paths = sourced_paths_new();
+		let session_origin = crate::Origin::random();
 		let recv_bw = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
@@ -365,6 +378,7 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?
 			}
 			Version::Ietf(v) => {
@@ -388,6 +402,7 @@ impl Client {
 					goaway_recv_signal,
 					going_away.clone(),
 					sourced_paths.clone(),
+					session_origin,
 				)?;
 				None
 			}
@@ -395,7 +410,7 @@ impl Client {
 
 		let mut s = Session::new(session, version, recv_bw, trigger, goaway_recv_consumer, going_away);
 		if let Some(origin) = self.consume.clone() {
-			s.attach_subscriber_state(sourced_paths, origin);
+			s.attach_subscriber_state(sourced_paths, origin, session_origin);
 		}
 		Ok(s)
 	}
