@@ -210,13 +210,23 @@ mod tests {
 		}
 	}
 
+	// Let the origin's spawned attach task run so a created broadcast is routable.
+	async fn settle() {
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+		}
+	}
+
 	// The whole fetch-on-demand path in process: a broadcast publishes media through the
 	// catalog (which records the timeline), the Broadcaster renders playlists from the
 	// timeline alone, and a segment request fetches and transmuxes exactly its groups.
 	#[tokio::test]
 	async fn serves_playlist_and_segments_from_the_timeline() {
 		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let mut broadcast = origin
+			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
+			.expect("publish allowed");
+		settle().await;
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 		let reserved = catalog.reserve();
@@ -281,7 +291,10 @@ mod tests {
 	#[tokio::test]
 	async fn dropping_the_broadcaster_keeps_a_cursor_drainable() {
 		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let mut broadcast = origin
+			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
+			.expect("publish allowed");
+		settle().await;
 		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 		let reserved = catalog.reserve();
@@ -336,7 +349,9 @@ mod tests {
 	#[tokio::test]
 	async fn removing_a_rendition_ends_its_segment_cursor() {
 		let origin = moq_net::Origin::random().produce();
-		let broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let broadcast = origin
+			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
+			.expect("publish allowed");
 		let source = moq_mux::Source::new(origin.consume(), "live");
 
 		// Drive the producer directly so the catalog can be reconciled synchronously.
@@ -368,7 +383,10 @@ mod tests {
 	#[tokio::test]
 	async fn dropping_the_broadcaster_releases_its_renditions() {
 		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let mut broadcast = origin
+			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
+			.expect("publish allowed");
+		settle().await;
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 		let reserved = catalog.reserve();
@@ -421,7 +439,10 @@ mod tests {
 	#[tokio::test]
 	async fn record_cursors_yield_renditions_and_segments() {
 		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin.create_broadcast("live").expect("publish allowed");
+		let mut broadcast = origin
+			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
+			.expect("publish allowed");
+		settle().await;
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
 
 		let reserved = catalog.reserve();
@@ -469,11 +490,13 @@ mod tests {
 		assert_eq!(second.group, 1);
 		assert!(!second.discontinuity, "consecutive segments are continuous");
 
-		// Drop the publisher (an abrupt disconnect). The cursor drains the segments it already
-		// saw and ends; the still-open live-edge group is NOT finalized, since a reset can't
-		// vouch that its media is complete. (Clean-end finalization of the live edge is covered
-		// by segments::tests::next_after_walks_finalized_segments.)
-		drop((catalog, media, registration, broadcast));
+		// Tear down the publisher mid-group. The track ends abruptly (the cursor drains the
+		// segments it already saw and ends; the still-open live-edge group is NOT finalized,
+		// since a reset can't vouch that its media is complete), while finishing the broadcast
+		// ends it promptly instead of lingering for a reconnect. (Clean-end finalization of the
+		// live edge is covered by segments::tests::next_after_walks_finalized_segments.)
+		drop((catalog, media, registration));
+		broadcast.finish();
 
 		let end = tokio::time::timeout(Duration::from_secs(5), segments.next())
 			.await

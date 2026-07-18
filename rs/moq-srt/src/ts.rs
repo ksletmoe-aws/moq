@@ -20,29 +20,29 @@ use crate::Result;
 /// Each chunk is handed straight to the TS importer, which consumes whole
 /// transport packets and retains any partial trailing packet internally for the
 /// next call (the same pattern `moq-cli import ... stdin ts` uses against stdin).
-/// Dropping the publisher ends the broadcast: the held [`origin::Publish`] guard
-/// unannounces it from the origin.
+/// A deliberate [`Self::finish`] ends the broadcast and unannounces the path
+/// immediately; dropping the publisher instead lets the origin linger briefly
+/// so a reconnecting sender can resume.
 pub struct Publisher {
-	/// Held to keep the broadcast announced for the publisher's lifetime; the
-	/// importer owns its own clone of the broadcast for writing frames.
-	_publish: origin::Publish,
 	importer: ts::Import,
+	// A clone of the importer's producer, so a deliberate end can finish() the
+	// broadcast (prompt unannounce) even though the importer owns it.
+	broadcast: moq_net::broadcast::Producer,
 }
 
 impl Publisher {
-	/// Create the broadcast, wire up the TS importer + catalog, and announce it
-	/// into `origin` at `path`.
+	/// Create the broadcast on `origin` at `path` and wire up the TS importer +
+	/// catalog.
 	pub fn new(origin: &origin::Producer, path: &str) -> Result<Self> {
-		let mut broadcast = broadcast::Info::new().produce();
+		let mut broadcast = origin.create_broadcast(path, broadcast::Route::new().with_announce(true))?;
 		let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
-		let importer = ts::Import::new(broadcast.clone(), catalog.reserve());
-
-		let publish = origin.publish_broadcast(path, broadcast.consume())?;
+		let handle = broadcast.clone();
+		let importer = ts::Import::new(broadcast, catalog.reserve());
 		tracing::info!(%path, "publishing ingest broadcast");
 
 		Ok(Self {
-			_publish: publish,
 			importer,
+			broadcast: handle,
 		})
 	}
 
@@ -54,9 +54,12 @@ impl Publisher {
 		Ok(self.importer.decode(&data)?)
 	}
 
-	/// Flush any buffered media and close out the broadcast's open groups.
+	/// Flush any buffered media, close out the broadcast's open groups, and end
+	/// the broadcast so the origin unannounces it immediately.
 	pub fn finish(&mut self) -> Result<()> {
-		Ok(self.importer.finish()?)
+		self.importer.finish()?;
+		self.broadcast.clone().finish();
+		Ok(())
 	}
 
 	/// Abort the published tracks with `err` so subscribers see the real cause

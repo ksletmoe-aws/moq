@@ -154,10 +154,10 @@ pub async fn accept(
 			server: server.clone(),
 			resource_id,
 			session: Some(session),
-			publish: None,
 			registration: Some(registration),
 			cancel: Some(cancel),
 			role: "whep server",
+			broadcast: None,
 		},
 	})
 }
