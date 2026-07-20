@@ -19,6 +19,13 @@ pub struct Import<E: CatalogExt = ()> {
 
 	// The resolved config, used to detect resolution changes.
 	config: Option<hang::catalog::VideoConfig>,
+
+	// Overlaid onto every config we publish, so a hinted field counts as supplied and is never
+	// overwritten by the rendition's detector.
+	hint: crate::catalog::VideoHint,
+	/// This rendition's timeline section, advertised on every config we publish (the generic
+	/// set() no longer does). Snapshotted at construction; the timeline track is 1:1 by name.
+	timeline: hang::catalog::Timeline,
 }
 
 impl<E: CatalogExt> Import<E> {
@@ -32,17 +39,19 @@ impl<E: CatalogExt> Import<E> {
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> Self {
-		let rendition = reserved.video_with_hint(track.name(), hint.clone());
+		let rendition = reserved.video(track.name());
+		let timeline = reserved.producer().timeline(track.name()).section();
 		let mut import = Self {
 			track: reserved
 				.producer()
 				.media_producer(track, crate::catalog::hang::Container::Legacy),
 			rendition,
 			config: None,
+			hint,
+			timeline,
 		};
-		if let Some(config) = hint.to_config() {
-			import.rendition.set(config.clone());
-			import.config = Some(config);
+		if let Some(config) = import.hint.to_config() {
+			import.apply_config(config);
 		}
 		import
 	}
@@ -66,15 +75,23 @@ impl<E: CatalogExt> Import<E> {
 		config.coded_height = Some(height as u32);
 		config.container = hang::catalog::Container::Legacy;
 
-		if self.config.as_ref() == Some(&config) {
-			return Ok(());
-		}
+		self.apply_config(config);
+		Ok(())
+	}
 
+	/// Apply a resolved config, updating the catalog rendition in place.
+	///
+	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
+	/// reconfiguration.
+	fn apply_config(&mut self, mut config: hang::catalog::VideoConfig) {
+		self.hint.apply(&mut config);
+		config.timeline = Some(self.timeline.clone());
+		if self.config.as_ref() == Some(&config) {
+			return;
+		}
 		tracing::debug!(name = ?self.track.name(), ?config, "starting track");
 		self.rendition.set(config.clone());
 		self.config = Some(config);
-
-		Ok(())
 	}
 
 	/// Decode a single VP8 frame.
