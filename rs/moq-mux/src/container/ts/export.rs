@@ -1136,6 +1136,10 @@ fn ensure_raw(container: &Container, kind: &str, name: &str) -> anyhow::Result<(
 		// TS carries raw codec payloads, like the Legacy varint and LOC formats.
 		Container::Legacy | Container::Loc => Ok(()),
 		Container::Cmaf { .. } => anyhow::bail!("TS export does not support CMAF {kind} track '{name}'"),
+		Container::Unknown(unknown) => anyhow::bail!(
+			"TS export does not support container '{}' on {kind} track '{name}'",
+			unknown.kind().unwrap_or("<missing>")
+		),
 	}
 }
 
