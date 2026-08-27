@@ -24,6 +24,10 @@ struct ConnectTest<'a> {
 	path: &'a str,
 	/// The request path the server must observe, when the test cares.
 	expect_path: Option<&'a str>,
+	/// The authority the server must observe via [`moq_native::Request::authority`], when the
+	/// test cares. `None` skips the check; `Some(None)` asserts no authority (a bare-IP dial that
+	/// sends no SNI); `Some(Some(host))` asserts that host.
+	expect_authority: Option<Option<&'a str>>,
 	backend: moq_native::QuicBackend,
 	/// Capture qlog traces from both ends into this directory.
 	qlog: Option<&'a std::path::Path>,
@@ -43,6 +47,7 @@ async fn backend_test(scheme: &str, backend: moq_native::QuicBackend) {
 		authority: "localhost",
 		path: "",
 		expect_path: Some(""),
+		expect_authority: Some(Some("localhost")),
 		backend,
 		qlog: None,
 	})
@@ -63,6 +68,7 @@ async fn path_test(scheme: &str, backend: moq_native::QuicBackend) {
 		authority: "localhost",
 		path: "/room?jwt=abc",
 		expect_path: Some("/room"),
+		expect_authority: Some(Some("localhost")),
 		backend,
 		qlog: None,
 	})
@@ -82,6 +88,7 @@ async fn no_sni_test(scheme: &str, backend: moq_native::QuicBackend) {
 		authority: "127.0.0.1",
 		path: "",
 		expect_path: Some(""),
+		expect_authority: Some(None),
 		backend,
 		qlog: None,
 	})
@@ -99,6 +106,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 		authority,
 		path,
 		expect_path,
+		expect_authority,
 		backend,
 		qlog,
 	} = config;
@@ -143,6 +151,7 @@ async fn connect_test(config: ConnectTest<'_>) {
 
 	// ── run server and client concurrently ──────────────────────────
 	let expect_path = expect_path.map(str::to_string);
+	let expect_authority = expect_authority.map(|a| a.map(str::to_string));
 	let server_handle = tokio::spawn(async move {
 		let request = server.accept().await.expect("no incoming connection");
 		// The client wired only a subscriber, so its advertised role reaches the server
@@ -153,6 +162,11 @@ async fn connect_test(config: ConnectTest<'_>) {
 			assert_eq!(request.path(), expect_path);
 		}
 		assert_eq!(request.query(), expect_query.as_deref());
+		// The dialed authority is readable at accept, before the session is accepted: the TLS
+		// SNI on raw QUIC, the CONNECT authority on WebTransport.
+		if let Some(expect_authority) = expect_authority {
+			assert_eq!(request.authority(), expect_authority.as_deref());
+		}
 		let session = request.with_publisher(&pub_origin).ok().await?;
 
 		let _broadcast = broadcast;
@@ -425,6 +439,7 @@ async fn quiche_dual_stack_ipv4() {
 		authority: "127.0.0.1",
 		path: "",
 		expect_path: None,
+		expect_authority: Some(None),
 		backend: moq_native::QuicBackend::Quiche,
 		qlog: None,
 	})
@@ -644,6 +659,7 @@ async fn qlog_test(scheme: &str, backend: moq_native::QuicBackend) -> Vec<std::p
 		authority: "localhost",
 		path: "",
 		expect_path: None,
+		expect_authority: None,
 		backend,
 		qlog: Some(dir.path()),
 	})

@@ -538,9 +538,9 @@ impl Server {
 							// Accept the transport (capturing url + mTLS identity) and exchange the
 							// MoQ SETUP up front, so path/role are known before the caller authorizes
 							// (like the stream bindings).
-							let (session, url, identity) = super::noq::accept(_conn, alpns).await?;
+							let Accepted { session, url, identity, authority } = super::noq::accept(_conn, alpns).await?;
 							let request = server.accept_request(session).await?;
-							Ok(Request { transport: Transport::Quic, url, identity, kind: RequestKind::Noq(Box::new(request)) })
+							Ok(Request { transport: Transport::Quic, url, identity, authority, kind: RequestKind::Noq(Box::new(request)) })
 						}.boxed());
 					}
 				}
@@ -549,9 +549,9 @@ impl Server {
 					{
 						let alpns = versions.alpns();
 						self.accept.push(async move {
-							let (session, url, identity) = super::quinn::accept(_conn, alpns).await?;
+							let Accepted { session, url, identity, authority } = super::quinn::accept(_conn, alpns).await?;
 							let request = server.accept_request(session).await?;
-							Ok(Request { transport: Transport::Quic, url, identity, kind: RequestKind::Quinn(Box::new(request)) })
+							Ok(Request { transport: Transport::Quic, url, identity, authority, kind: RequestKind::Quinn(Box::new(request)) })
 						}.boxed());
 					}
 				}
@@ -560,18 +560,18 @@ impl Server {
 					{
 						let alpns = versions.alpns();
 						self.accept.push(async move {
-							let (session, url, identity) = super::quiche::accept(_conn, alpns).await?;
+							let Accepted { session, url, identity, authority } = super::quiche::accept(_conn, alpns).await?;
 							let request = server.accept_request(session).await?;
-							Ok(Request { transport: Transport::Quic, url, identity, kind: RequestKind::Quiche(Box::new(request)) })
+							Ok(Request { transport: Transport::Quic, url, identity, authority, kind: RequestKind::Quiche(Box::new(request)) })
 						}.boxed());
 					}
 				}
 				Some(_conn) = iroh_accept => {
 					#[cfg(feature = "iroh")]
 					self.accept.push(async move {
-						let (session, url, identity) = super::iroh::accept(_conn).await?;
+						let Accepted { session, url, identity, authority } = super::iroh::accept(_conn).await?;
 						let request = server.accept_request(session).await?;
-						Ok(Request { transport: Transport::Iroh, url, identity, kind: RequestKind::Iroh(Box::new(request)) })
+						Ok(Request { transport: Transport::Iroh, url, identity, authority, kind: RequestKind::Iroh(Box::new(request)) })
 					}.boxed());
 				}
 				Some(_res) = ws_accept => {
@@ -582,7 +582,8 @@ impl Server {
 							// slow peer doesn't stall the accept loop (spawned like the others).
 							self.accept.push(async move {
 								let request = server.accept_request(session).await?;
-								Ok(Request { transport: Transport::WebSocket, url: Some(url), identity: None, kind: RequestKind::Qmux(Box::new(request)) })
+								let authority = url.host_str().filter(|h| !h.is_empty()).map(str::to_owned);
+								Ok(Request { transport: Transport::WebSocket, url: Some(url), authority, identity: None, kind: RequestKind::Qmux(Box::new(request)) })
 							}.boxed());
 						}
 						// One connection's upgrade, not the listener's: a failed
@@ -926,6 +927,7 @@ fn spawn_stream_request(
 				let request = Request {
 					transport,
 					url: None,
+					authority: None,
 					identity: None,
 					kind: RequestKind::Qmux(Box::new(request)),
 				};
@@ -953,6 +955,17 @@ pub(crate) enum RequestKind {
 	Iroh(Box<moq_net::Request<web_transport_iroh::Session>>),
 	#[cfg(any(feature = "tcp", all(feature = "uds", unix), feature = "websocket"))]
 	Qmux(Box<moq_net::Request<qmux::Session>>),
+}
+
+/// The transport-level facts a backend captures while accepting a connection, before the
+/// MoQ SETUP. Grouped so the shared accept loop builds a [`Request`] from named fields
+/// rather than a wide tuple.
+#[cfg(any(feature = "noq", feature = "quinn", feature = "quiche", feature = "iroh"))]
+pub(crate) struct Accepted<S> {
+	pub session: S,
+	pub url: Option<Url>,
+	pub identity: Option<crate::tls::PeerIdentity>,
+	pub authority: Option<String>,
 }
 
 /// The network transport carrying an incoming MoQ session.
@@ -1003,6 +1016,9 @@ pub struct Request {
 	/// The request URL, for transports that carry one (QUIC/WebTransport/WebSocket). `None` for the
 	/// URL-less stream bindings, whose request path rides the SETUP instead.
 	url: Option<Url>,
+	/// The authority the client dialed, when it offered one: the TLS SNI on raw QUIC, the CONNECT
+	/// authority on WebTransport. `None` on the URL-less stream bindings and on iroh.
+	authority: Option<String>,
 	/// The peer's validated mTLS identity, captured at the transport handshake (before
 	/// the MoQ SETUP), when the backend supports it.
 	identity: Option<crate::tls::PeerIdentity>,
@@ -1081,6 +1097,7 @@ impl Request {
 		let Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		} = self;
@@ -1088,6 +1105,7 @@ impl Request {
 		Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		}
@@ -1098,6 +1116,7 @@ impl Request {
 		let Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		} = self;
@@ -1105,6 +1124,7 @@ impl Request {
 		Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		}
@@ -1117,6 +1137,7 @@ impl Request {
 		let Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		} = self;
@@ -1124,6 +1145,7 @@ impl Request {
 		Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		}
@@ -1134,6 +1156,7 @@ impl Request {
 		let Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		} = self;
@@ -1141,6 +1164,7 @@ impl Request {
 		Request {
 			transport,
 			url,
+			authority,
 			identity,
 			kind,
 		}
@@ -1163,6 +1187,15 @@ impl Request {
 	/// in-band request path.
 	pub fn url(&self) -> Option<&Url> {
 		self.url.as_ref()
+	}
+
+	/// The host authority the client dialed, or `None` when the client offered none or the
+	/// transport carries no host (iroh, stream bindings).
+	///
+	/// Not the moq-net IETF SETUP `Authority` parameter. Client-asserted and not authenticated,
+	/// so authorize on the token or [`Self::peer_identity`] rather than on this value.
+	pub fn authority(&self) -> Option<&str> {
+		self.authority.as_deref()
 	}
 
 	/// The request path the client advertised, uniform across transports.

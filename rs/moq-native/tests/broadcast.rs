@@ -1754,6 +1754,8 @@ async fn broadcast_websocket() {
 		let request = server.accept().await.expect("no incoming connection");
 		assert_eq!(request.transport(), moq_native::Transport::WebSocket);
 		assert_eq!(request.path(), "");
+		// The dialed host reaches the server as the authority, like the QUIC transports.
+		assert_eq!(request.authority(), Some("localhost"));
 		let session = request.with_publisher(&pub_origin).ok().await?;
 
 		let _broadcast = broadcast;
