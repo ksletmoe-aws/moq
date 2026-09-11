@@ -76,7 +76,8 @@ pub enum Error {
 	#[error("protocol violation")]
 	ProtocolViolation,
 
-	/// The peer's token does not grant the requested path or operation.
+	/// The requested path or operation is not granted, either by the peer's token
+	/// or by the scope of the handle it was requested through.
 	#[error("unauthorized")]
 	Unauthorized,
 

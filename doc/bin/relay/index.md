@@ -61,4 +61,4 @@ working configs for development, production, and a cluster.
 - **Address already in use**: something else holds the UDP or TCP port.
 - **Certificate errors**: the hostname must match the certificate. Local browsers need the fingerprint served over `[web.http]`.
 - **Connection timeout**: UDP isn't reaching the relay, or the client URL names the wrong port.
-- **Unauthorized / forbidden**: the token's paths don't cover the connection path. See [path matching](/bin/relay/auth#path-matching).
+- **Unauthorized / forbidden**: the token's paths don't cover the connection path, or the broadcast a session asked for. See [path matching](/bin/relay/auth#path-matching).

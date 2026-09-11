@@ -643,17 +643,21 @@ impl Drop for ExclusionGuard {
 
 /// How a path resolves against the announce tree for one consumer.
 ///
-/// `Excluded` is deliberately not folded into `Missing`: they mean opposite
-/// things to a caller holding a dynamic handler. Missing is "nobody here, go
-/// ask"; excluded is "here, but not for you", and asking a handler to route it
-/// anyway is how a split-horizon violation gets in through the back door.
+/// Neither `Excluded` nor `OutOfScope` is folded into `Missing`. Missing is
+/// "nobody here, go ask"; both of the others are "not for you", and asking a
+/// handler to route one anyway is how a split-horizon violation, or a scope
+/// bypass, gets in through the back door.
 enum Resolved {
 	/// A broadcast this consumer may read: the shared front, or a single source
 	/// pinned because the front holds a route back through the requester.
 	Found(broadcast::Consumer),
 	/// The path is live, but every route to it flows through the requester.
 	Excluded,
-	/// Nothing is published at the path, or it is outside the consumer's scope.
+	/// The path is outside the consumer's scope, whether or not anything is
+	/// published there. Distinct from `Missing` because the difference is about
+	/// the asker rather than the tree: see [`Consumer::request_broadcast`].
+	OutOfScope,
+	/// Nothing is published at the path.
 	Missing,
 }
 
@@ -2923,8 +2927,8 @@ impl Consumer {
 	}
 
 	/// Internal synchronous lookup: how the broadcast at `path` resolves for this
-	/// consumer, telling "announced but every route loops back through you" apart
-	/// from "nothing here".
+	/// consumer, telling "announced but every route loops back through you" and
+	/// "outside your scope" apart from "nothing here".
 	///
 	/// Races announcement gossip (a freshly-connected consumer sees `Missing` even when
 	/// the broadcast is about to arrive), so it is not public. [`Self::request_broadcast`]
@@ -2933,7 +2937,7 @@ impl Consumer {
 	fn resolve(&self, path: impl AsPath) -> Resolved {
 		let path = path.as_path();
 		let Some(rest) = self.nodes.get(&path) else {
-			return Resolved::Missing;
+			return Resolved::OutOfScope;
 		};
 		let state = self.nodes.tree.lock();
 		state.resolve_broadcast(&rest, self.exclude)
@@ -2944,7 +2948,7 @@ impl Consumer {
 	pub(crate) fn get_broadcast(&self, path: impl AsPath) -> Option<broadcast::Consumer> {
 		match self.resolve(path) {
 			Resolved::Found(broadcast) => Some(broadcast),
-			Resolved::Excluded | Resolved::Missing => None,
+			Resolved::Excluded | Resolved::OutOfScope | Resolved::Missing => None,
 		}
 	}
 
@@ -3023,8 +3027,9 @@ impl Consumer {
 	///
 	/// The returned future resolves to [`Error::Unroutable`] when no broadcast is reachable and no
 	/// dynamic handler exists. A request that is registered while a handler is live but then loses
-	/// every handler before being served also resolves to [`Error::Unroutable`]. Unlike an announced
-	/// broadcast, a dynamically served one is never visible to [`Self::announced`].
+	/// every handler before being served also resolves to [`Error::Unroutable`]. A path outside this
+	/// consumer's scope resolves to [`Error::Unauthorized`]. Unlike an announced broadcast, a
+	/// dynamically served one is never visible to [`Self::announced`].
 	pub fn request_broadcast(&self, path: impl AsPath) -> kio::Pending<Requesting> {
 		let path = path.as_path();
 
@@ -3039,9 +3044,19 @@ impl Consumer {
 		// serve this requester is unroutable, not missing: a handler resolves paths
 		// with no route chain to check, so falling through would let it route around
 		// the split horizon and rebuild the loop.
+		//
+		// A path outside the consumer's scope falls to the same rule for the same
+		// reason, and to the same error [`Producer::create_broadcast`] already
+		// returns for a scope miss on the write side. The handler has no scope to
+		// check either. A `Request` carries only a path, and a handler obtained
+		// from any view drains one shared queue, so a consumer that may not read a
+		// path must not be able to ask for it to be created. Otherwise the
+		// consumer's scope holds on the announced path and not on this one, and the
+		// gap widens with every handler an application installs.
 		match self.resolve(&path) {
 			Resolved::Found(broadcast) => return kio::Pending::new(Requesting::ready(broadcast).with_stats(scope)),
 			Resolved::Excluded => return kio::Pending::new(Requesting::failed(Error::Unroutable)),
+			Resolved::OutOfScope => return kio::Pending::new(Requesting::failed(Error::Unauthorized)),
 			Resolved::Missing => {}
 		}
 
@@ -6288,6 +6303,109 @@ mod tests {
 			dynamic.requested_broadcast().now_or_never().is_some(),
 			"a genuinely missing path must still fall back"
 		);
+	}
+
+	/// A path outside the consumer's scope never reaches the dynamic handler.
+	///
+	/// `scope` is a read filter over the announce tree, so an out-of-scope path
+	/// resolves to nothing there, and "nothing here" is exactly what sends a
+	/// request to the handler. A `Request` carries only a path, so the handler
+	/// cannot tell who asked and would create the broadcast on the requester's
+	/// behalf, which is `scope` holding on one path and not the other.
+	#[tokio::test]
+	async fn test_out_of_scope_path_never_reaches_the_dynamic_handler() {
+		let origin = Origin::random().produce();
+		let mut dynamic = origin.dynamic();
+
+		let scoped = origin.consume().scope(&["tenant-a".into()]).unwrap();
+
+		// `tenant-a-other` shares a character prefix but not a segment, so this
+		// also pins that the check is segment-aware rather than textual.
+		for path in ["tenant-b/live", "tenant-a-other/live"] {
+			// now_or_never rather than await: the refusal is synchronous, and a
+			// request that instead reached the queue would stay pending forever
+			// waiting on a handler that never accepts it.
+			let refused = scoped
+				.request_broadcast(path)
+				.now_or_never()
+				.expect("an out-of-scope request must be refused synchronously, not queued");
+			assert!(matches!(refused, Err(Error::Unauthorized)));
+			assert!(
+				dynamic.requested_broadcast().now_or_never().is_none(),
+				"the dynamic handler was asked to create a broadcast the requester may not read"
+			);
+		}
+	}
+
+	/// Out of scope is refused with no handler live too, where the old code
+	/// answered `Unroutable` after falling through to an empty queue.
+	#[tokio::test]
+	async fn test_out_of_scope_path_is_unauthorized_without_a_handler() {
+		let origin = Origin::random().produce();
+		let scoped = origin.consume().scope(&["tenant-a".into()]).unwrap();
+
+		let refused = scoped
+			.request_broadcast("tenant-b/live")
+			.now_or_never()
+			.expect("an out-of-scope request must be refused synchronously, not queued");
+		assert!(matches!(refused, Err(Error::Unauthorized)));
+	}
+
+	/// The check refuses only what it should: an unannounced path *inside* the
+	/// scope still falls back to the handler and is served.
+	#[tokio::test]
+	async fn test_in_scope_path_still_reaches_the_dynamic_handler() {
+		let origin = Origin::random().produce();
+		let mut dynamic = origin.dynamic();
+
+		let scoped = origin.consume().scope(&["tenant-a".into()]).unwrap();
+		let requested = scoped.request_broadcast("tenant-a/live");
+
+		// Registration and `accept` are both synchronous, so `now_or_never`
+		// throughout: a regression that over-refuses fails here rather than
+		// hanging on a handler request that never arrives.
+		let served = broadcast::Info::new().produce();
+		let request = dynamic
+			.requested_broadcast()
+			.now_or_never()
+			.expect("an in-scope request must reach the handler")
+			.unwrap();
+		assert_eq!(request.path(), &Path::new("tenant-a/live"));
+		request.accept(&served);
+
+		let broadcast = requested.now_or_never().expect("served synchronously").unwrap();
+		assert!(broadcast.is_clone(&served.consume()));
+	}
+
+	/// An unscoped consumer is scoped to the whole tree, so every path is in
+	/// scope and the fallback is unchanged for it.
+	///
+	/// This is the case an application relying on a catch-all handler depends
+	/// on, and it holds structurally rather than by special case: the default
+	/// node is the empty prefix, and every path has the empty prefix.
+	#[tokio::test]
+	async fn test_whole_tree_scope_still_reaches_the_dynamic_handler() {
+		let origin = Origin::random().produce();
+		let mut dynamic = origin.dynamic();
+
+		for (consumer, path) in [
+			(origin.consume(), "tenant-a/live"),
+			(origin.consume().scope(&["".into()]).unwrap(), "tenant-b/live"),
+		] {
+			let requested = consumer.request_broadcast(path);
+
+			let served = broadcast::Info::new().produce();
+			let request = dynamic
+				.requested_broadcast()
+				.now_or_never()
+				.expect("a whole-tree request must reach the handler")
+				.unwrap();
+			assert_eq!(request.path(), &Path::new(path));
+			request.accept(&served);
+
+			let broadcast = requested.now_or_never().expect("served synchronously").unwrap();
+			assert!(broadcast.is_clone(&served.consume()));
+		}
 	}
 
 	/// When every route flows through the requester, the path is unroutable for
