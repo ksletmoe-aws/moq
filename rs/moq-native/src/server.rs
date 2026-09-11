@@ -1192,6 +1192,9 @@ impl Request {
 	/// The host authority the client dialed, or `None` when the client offered none or the
 	/// transport carries no host (iroh, stream bindings).
 	///
+	/// Reported as offered: rustls clients send no SNI for an IP-literal dial (RFC 6066), so
+	/// quinn/noq see `None`, while BoringSSL clients do send one, so quiche sees the IP.
+	///
 	/// Not the moq-net IETF SETUP `Authority` parameter. Client-asserted and not authenticated,
 	/// so authorize on the token or [`Self::peer_identity`] rather than on this value.
 	pub fn authority(&self) -> Option<&str> {

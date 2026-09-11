@@ -439,7 +439,8 @@ async fn quiche_dual_stack_ipv4() {
 		authority: "127.0.0.1",
 		path: "",
 		expect_path: None,
-		expect_authority: Some(None),
+		// BoringSSL sends an IP-literal SNI where rustls sends none, so the server sees it.
+		expect_authority: Some(Some("127.0.0.1")),
 		backend: moq_native::QuicBackend::Quiche,
 		qlog: None,
 	})
