@@ -1016,8 +1016,8 @@ impl<R: crate::runtime::Timers> RequestGrant<R> {
 		}
 	}
 
-	/// The grant in force right now, for the caller to check the request's path against.
-	// Used by the REQUEST_UPDATE reader (path re-check after renewal) in a following change.
+	/// The grant in force right now. Observed by the lifecycle tests; the reader checks a
+	/// renewal's coverage on the freshly awaited grant before it calls [`renew`](Self::renew).
 	#[cfg_attr(not(test), expect(dead_code))]
 	pub(crate) fn grant(&self) -> &Grant {
 		&self.grant
@@ -1026,9 +1026,6 @@ impl<R: crate::runtime::Timers> RequestGrant<R> {
 	/// Replace the grant after an accepted REQUEST_UPDATE: adopt the new verdict (dropping
 	/// the old, which ends the old token) and re-arm the deadline at the new expiry. A
 	/// refused renewal does NOT call this: the old grant stands until it lapses.
-	// Wired by the publisher's REQUEST_UPDATE reader in a following change; the marker comes
-	// off then.
-	#[cfg_attr(not(test), expect(dead_code))]
 	pub(crate) fn renew(&mut self, verdict: RequestVerdict, grant: Grant) {
 		self.verdict = verdict;
 		self.deadline.set(grant.expires);
