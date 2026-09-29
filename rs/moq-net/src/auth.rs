@@ -326,11 +326,10 @@ impl Handle {
 			return Err(Error::Duplicate);
 		}
 		let queue = kio::Queue::new();
-		// A version without AUTH never receives a token, so its requests end with
-		// the session like any other.
-		if !state.supported {
-			queue.close();
-		}
+		// A request-borne token rides the request message itself, not the AUTH stream, so the
+		// acceptor answers request tokens even on a session that never negotiated the MoQ Auth
+		// extension. The queue therefore stays live regardless of `supported`; only session
+		// token presentation ([`add`](Self::add)) stays [`Error::Unsupported`] without it.
 		state.acceptor = Acceptor::App(queue.clone());
 		Ok(Requests { queue })
 	}
@@ -548,9 +547,9 @@ impl Handle {
 		}
 		// Nothing will read a withdrawn slot again.
 		state.tokens.retain(|_, slot| !slot.withdrawn);
-		if let Acceptor::App(queue) = &state.acceptor {
-			queue.close();
-		}
+		// The request queue stays live: a request-borne token does not ride the AUTH stream, so
+		// the acceptor keeps answering request tokens without the extension. Only the session
+		// tokens above end as unsupported.
 	}
 
 	/// End the session: fail every pending token, end every watch, and close the
@@ -1363,8 +1362,28 @@ mod request_token_tests {
 		assert!(grant.publish.matches("room/alice"));
 	}
 
-	/// With no `requests()` consumer, a request token cannot be verified in band, so the
-	/// verdict is Unsupported and the caller refuses the request NOT_SUPPORTED.
+	/// A request-borne token is verified even without the MoQ Auth extension: it rides the
+	/// request message, not the AUTH stream, so `requests()` hands a live queue on a session
+	/// whose `supported` is false and the acceptor admits it. This is the shape a standard
+	/// moq-transport peer (an encoder or CDN) presents when it does not negotiate the moq-dev
+	/// AUTH extension.
+	#[tokio::test]
+	async fn a_request_token_is_verified_without_the_auth_extension() {
+		let handle = Handle::new(false);
+		let mut requests = handle.requests().expect("take the requests");
+		for kind in [RequestKind::Subscribe, RequestKind::PublishNamespace] {
+			let verdict = handle.verify_request(Bytes::from_static(b"jwt"), 0, subscribe_path(), kind);
+			let request = requests.next().await.expect("a request reaches the acceptor");
+			assert_eq!(request.kind(), Some(kind));
+			let _issued = request.accept(Grant::all());
+			assert!(
+				verdict.grant().await.expect("granted").publish.matches("room/alice"),
+				"{kind:?} admitted without the AUTH extension"
+			);
+		}
+	}
+
+	/// With no `requests()` consumer, a request token cannot be verified in band, so the	/// verdict is Unsupported and the caller refuses the request NOT_SUPPORTED.
 	#[tokio::test]
 	async fn no_consumer_refuses_a_request_token_as_unsupported() {
 		let handle = Handle::new(true);
