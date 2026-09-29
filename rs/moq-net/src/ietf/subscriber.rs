@@ -2077,6 +2077,7 @@ where
 				filter: join.filter,
 				fill: join.fill,
 				properties_wanted: true,
+				authorization_token: None,
 			})
 			.await?;
 		Ok(())

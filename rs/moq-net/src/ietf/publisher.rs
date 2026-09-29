@@ -499,18 +499,63 @@ where
 
 			// Serve only what our grant lets us publish (MoQ Auth), and stop once it no
 			// longer does. Checked before resolving, so a denied request never reaches the
-			// origin.
-			let mut gate = crate::auth::Gate::new(
-				self.auth.clone(),
-				msg.track_namespace.to_owned(),
-				crate::auth::Direction::Publish,
-			);
-			if !self
+			// origin. The session grant is checked first; a request it does not cover falls
+			// back to an AUTHORIZATION TOKEN carried on the SUBSCRIBE itself (MoQ
+			// request-token), verified by the app's acceptor and scoped to this one request.
+			// A union-authorized subscription is gated on the union so it ends if the union
+			// later narrows; a token-authorized one is not (the union never covered it), and
+			// its grant instead ends with the request when `_request_grant` drops.
+			let mut gate = None;
+			let mut _request_grant = None;
+			if self
 				.auth
 				.allows(crate::auth::Direction::Publish, msg.track_namespace.as_str())
 			{
-				let err = Error::Unauthorized;
-				return self.reject_subscribe(stream, request_id, &err, "not granted").await;
+				gate = Some(crate::auth::Gate::new(
+					self.auth.clone(),
+					msg.track_namespace.to_owned(),
+					crate::auth::Direction::Publish,
+				));
+			} else {
+				let Some(token) = &msg.authorization_token else {
+					let err = Error::Unauthorized;
+					return self.reject_subscribe(stream, request_id, &err, "not granted").await;
+				};
+				// A structurally malformed token is refused here rather than failing the
+				// session at decode, so one bad request never tears down the connection.
+				let structure = match crate::ietf::token::decode_value(token, self.version) {
+					Ok(structure) => structure,
+					Err(_) => {
+						let err = Error::Unauthorized;
+						return self
+							.reject_subscribe(stream, request_id, &err, "malformed authorization token")
+							.await;
+					}
+				};
+				let verdict = self.auth.verify_request(
+					bytes::Bytes::from(structure.value),
+					structure.kind,
+					msg.track_namespace.to_owned(),
+					crate::auth::RequestKind::Subscribe,
+				);
+				match verdict.grant().await {
+					// The token's grant must cover this exact request; it authorizes nothing
+					// else and never joins the session union.
+					Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
+						// Held for the subscription's life, so the grant ends with the request.
+						_request_grant = Some(verdict);
+					}
+					Ok(_) => {
+						let err = Error::Unauthorized;
+						return self
+							.reject_subscribe(stream, request_id, &err, "token does not cover this request")
+							.await;
+					}
+					// UNAUTHORIZED for a refusal, NOT_SUPPORTED when no consumer verifies tokens.
+					Err(err) => {
+						return self.reject_subscribe(stream, request_id, &err, &err.to_string()).await;
+					}
+				}
 			}
 
 			// Stats (subscriptions, viewer refcount, groups/frames/bytes) are counted in
@@ -650,7 +695,7 @@ where
 					if let Poll::Ready(served) = waiter.poll_future(serve.as_mut()) {
 						return Poll::Ready(Some(served));
 					}
-					if gate.poll_denied(waiter).is_ready() {
+					if gate.as_mut().is_some_and(|gate| gate.poll_denied(waiter).is_ready()) {
 						tracing::info!(broadcast = %absolute, track = %track_name, "subscription no longer authorized");
 						return Poll::Ready(Some((Err(Error::Unauthorized), false)));
 					}
@@ -2872,6 +2917,7 @@ mod serve_tests {
 			filter,
 			fill,
 			properties_wanted: true,
+			authorization_token: None,
 		}
 	}
 
@@ -5094,6 +5140,7 @@ mod tests {
 					filter: Filter::NextObject,
 					fill: None,
 					properties_wanted: true,
+					authorization_token: None,
 				},
 			)
 			.await
@@ -5447,6 +5494,7 @@ mod range_tests {
 			filter,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		}
 	}
 

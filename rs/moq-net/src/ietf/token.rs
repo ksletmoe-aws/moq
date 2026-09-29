@@ -36,8 +36,6 @@ pub fn from_setup(params: &Parameters, version: Version) -> Result<Option<Token>
 /// parameter value (section 8.9), the same structure the SETUP option carries. The
 /// message parameter's Length framing is stripped by the parameter decoder, so this sees
 /// the bare structure, exactly as [`from_setup`] hands one to [`decode`].
-// Wired by the request-message decoders in a following change; the marker comes off then.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn decode_value(value: &[u8], version: Version) -> Result<Token, Error> {
 	decode(value, version)
 }

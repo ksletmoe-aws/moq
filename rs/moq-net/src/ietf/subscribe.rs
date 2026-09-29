@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use crate::{
 	Path,
 	coding::*,
-	ietf::{Fill, Filter, GroupOrder, Location, Param, Parameters, Properties, RequestId},
+	ietf::{Fill, Filter, GroupOrder, Location, Param, ParameterBytes, Parameters, Properties, RequestId},
 };
 
 use super::Message;
@@ -53,6 +53,11 @@ pub struct Subscribe<'a> {
 	pub fill: Option<Fill>,
 	/// Whether the subscriber wants Track Properties on the response (draft-20).
 	pub properties_wanted: bool,
+	/// The `AUTHORIZATION TOKEN` (0x03) the subscriber presented on this request, if any.
+	/// A relay verifies it when the session grant does not already cover the namespace
+	/// (MoQ request-token); the value is the Token structure of section 8.9, decoded with
+	/// [`super::token::decode_value`].
+	pub authorization_token: Option<bytes::Bytes>,
 }
 
 impl Message for Subscribe<'_> {
@@ -78,7 +83,12 @@ impl Message for Subscribe<'_> {
 
 				let filter = Filter::decode(r, version)?;
 
-				let _params = Parameters::decode(r, version)?;
+				// The legacy trailing parameter block: read the AUTHORIZATION TOKEN out of it
+				// rather than dropping it, so a draft-14 subscriber can present a request token.
+				let params = Parameters::decode(r, version)?;
+				let authorization_token = params
+					.get_bytes(ParameterBytes::AuthorizationToken)
+					.map(bytes::Bytes::copy_from_slice);
 
 				Ok(Self {
 					request_id,
@@ -89,11 +99,13 @@ impl Message for Subscribe<'_> {
 					filter,
 					fill: None,
 					properties_wanted: true,
+					authorization_token,
 				})
 			}
 			_ => {
 				decode_params!(r, version,
 					0x02 => _object_delivery_timeout: Option<u64>,
+					0x03 => authorization_token: Option<bytes::Bytes>,
 					0x04 => rendezvous_timeout: Option<u64>,
 					0x06 => _subgroup_delivery_timeout: Option<u64>,
 					0x10 => forward: Option<bool>,
@@ -144,6 +156,7 @@ impl Message for Subscribe<'_> {
 					filter,
 					fill,
 					properties_wanted,
+					authorization_token,
 				})
 			}
 		}
@@ -164,7 +177,13 @@ impl Message for Subscribe<'_> {
 				true.encode(w, version)?; // forward
 
 				self.filter.encode(w, version)?;
-				0u8.encode(w, version)?; // no parameters
+				// The legacy trailing parameter block, carrying the AUTHORIZATION TOKEN when
+				// the subscriber presents one; otherwise an empty block (count 0), as before.
+				let mut params = Parameters::default();
+				if let Some(token) = &self.authorization_token {
+					params.set_bytes(ParameterBytes::AuthorizationToken, token.to_vec());
+				}
+				params.encode(w, version)?;
 			}
 			_ => {
 				// FILL_PARAMETERS arrived in draft-20. Sending it to an older peer would be an
@@ -179,6 +198,7 @@ impl Message for Subscribe<'_> {
 					(!self.properties_wanted && Filter::is_draft20(version)).then_some(IncludeProperties(false));
 
 				encode_params!(w, version,
+					0x03 => self.authorization_token.clone(),
 					0x10 => true,
 					0x20 => self.subscriber_priority,
 					0x21 => self.filter,
@@ -530,6 +550,7 @@ mod tests {
 			filter: Filter::NextObject,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft14);
@@ -539,6 +560,55 @@ mod tests {
 		assert_eq!(decoded.track_namespace.as_str(), "test");
 		assert_eq!(decoded.track_name, "video");
 		assert_eq!(decoded.subscriber_priority, 128);
+	}
+
+	/// A request-borne AUTHORIZATION TOKEN round-trips on a legacy draft (draft-14's
+	/// trailing parameter block) and a strict one (draft-18's message parameters), so a
+	/// non-moq-dev peer can present or refresh a credential the draft-17+ standard way.
+	#[test]
+	fn authorization_token_round_trips_legacy_and_strict() {
+		// A Token structure value that is not text, so no codec can assume UTF-8.
+		let token = bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xff]);
+		for version in [Version::Draft14, Version::Draft18] {
+			let msg = Subscribe {
+				request_id: RequestId(1),
+				track_namespace: Path::new("room/alice"),
+				track_name: "cam".into(),
+				subscriber_priority: 128,
+				group_order: GroupOrder::Descending,
+				filter: Filter::NextObject,
+				fill: None,
+				properties_wanted: true,
+				authorization_token: Some(token.clone()),
+			};
+			let encoded = encode_message(&msg, version);
+			let decoded: Subscribe = decode_message(&encoded, version).unwrap();
+			assert_eq!(decoded.authorization_token, Some(token.clone()), "{version:?}");
+			assert_eq!(decoded.track_namespace.as_str(), "room/alice", "{version:?}");
+			assert_eq!(decoded.track_name, "cam", "{version:?}");
+		}
+	}
+
+	/// No token stays no token: a SUBSCRIBE without one carries no phantom parameter, on
+	/// both families.
+	#[test]
+	fn absent_authorization_token_stays_none() {
+		for version in [Version::Draft14, Version::Draft18] {
+			let msg = Subscribe {
+				request_id: RequestId(2),
+				track_namespace: Path::new("room/bob"),
+				track_name: "cam".into(),
+				subscriber_priority: 128,
+				group_order: GroupOrder::Descending,
+				filter: Filter::NextObject,
+				fill: None,
+				properties_wanted: true,
+				authorization_token: None,
+			};
+			let encoded = encode_message(&msg, version);
+			let decoded: Subscribe = decode_message(&encoded, version).unwrap();
+			assert_eq!(decoded.authorization_token, None, "{version:?}");
+		}
 	}
 
 	#[test]
@@ -552,6 +622,7 @@ mod tests {
 			filter: Filter::NextObject,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft15);
@@ -642,6 +713,7 @@ mod tests {
 			filter: Filter::NextObject,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		};
 
 		for version in [Version::Draft17, Version::Draft18, Version::Draft19, Version::Draft20] {
@@ -671,6 +743,7 @@ mod tests {
 			filter: Filter::NextObject,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft14);
@@ -854,6 +927,7 @@ mod tests {
 				filter: Filter::NextObject,
 				fill: None,
 				properties_wanted: wanted,
+				authorization_token: None,
 			};
 
 			let encoded = encode_message(&msg, version);
@@ -976,6 +1050,7 @@ mod tests {
 			filter: Filter::NextObject,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft17);
@@ -1034,6 +1109,7 @@ mod tests {
 			filter: Filter::NextObject,
 			fill: None,
 			properties_wanted: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft18);
