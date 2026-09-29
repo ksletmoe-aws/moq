@@ -393,6 +393,10 @@ pub struct SubscribeUpdate {
 	pub end_group: u64,
 	pub subscriber_priority: u8,
 	pub forward: bool,
+	/// The `AUTHORIZATION TOKEN` (0x03) presented on this REQUEST_UPDATE, if any. A fresh
+	/// token refreshes the request's grant (MoQ request-token); the value is the Token
+	/// structure of section 8.9, decoded with [`super::token::decode_value`].
+	pub authorization_token: Option<bytes::Bytes>,
 }
 
 impl Message for SubscribeUpdate {
@@ -409,7 +413,13 @@ impl Message for SubscribeUpdate {
 				self.end_group.encode(w, version)?;
 				self.subscriber_priority.encode(w, version)?;
 				self.forward.encode(w, version)?;
-				0u8.encode(w, version)?; // no parameters
+				// The legacy trailing parameter block, carrying the AUTHORIZATION TOKEN when a
+				// renewal presents one; otherwise an empty block (count 0), as before.
+				let mut params = Parameters::default();
+				if let Some(token) = &self.authorization_token {
+					params.set_bytes(ParameterBytes::AuthorizationToken, token.to_vec());
+				}
+				params.encode(w, version)?;
 			}
 			Version::Draft15 | Version::Draft16 => {
 				self.request_id.encode(w, version)?;
@@ -417,6 +427,7 @@ impl Message for SubscribeUpdate {
 					.expect("subscription_request_id required for draft15-16")
 					.encode(w, version)?;
 				encode_params!(w, version,
+					0x03 => self.authorization_token.clone(),
 					0x10 => self.forward,
 					0x20 => self.subscriber_priority,
 					0x21 => Filter::NextObject,
@@ -433,6 +444,7 @@ impl Message for SubscribeUpdate {
 					0u64.encode(w, version)?; // required_request_id_delta = 0 (draft-17 only, removed in draft-18 per #1615)
 				}
 				encode_params!(w, version,
+					0x03 => self.authorization_token.clone(),
 					0x10 => self.forward,
 					0x20 => self.subscriber_priority,
 					0x21 => Filter::NextObject,
@@ -452,7 +464,10 @@ impl Message for SubscribeUpdate {
 				let end_group = u64::decode(r, version)?;
 				let subscriber_priority = u8::decode(r, version)?;
 				let forward = bool::decode(r, version)?;
-				let _parameters = Parameters::decode(r, version)?;
+				let params = Parameters::decode(r, version)?;
+				let authorization_token = params
+					.get_bytes(ParameterBytes::AuthorizationToken)
+					.map(bytes::Bytes::copy_from_slice);
 
 				Ok(Self {
 					request_id,
@@ -461,6 +476,7 @@ impl Message for SubscribeUpdate {
 					end_group,
 					subscriber_priority,
 					forward,
+					authorization_token,
 				})
 			}
 			Version::Draft15 | Version::Draft16 => {
@@ -468,6 +484,7 @@ impl Message for SubscribeUpdate {
 				let subscription_request_id = Some(RequestId::decode(r, version)?);
 				decode_params!(r, version,
 					0x02 => _object_delivery_timeout: Option<u64>,
+					0x03 => authorization_token: Option<bytes::Bytes>,
 					0x06 => _subgroup_delivery_timeout: Option<u64>,
 					0x10 => forward: Option<bool>,
 					0x20 => subscriber_priority: Option<u8>,
@@ -484,6 +501,7 @@ impl Message for SubscribeUpdate {
 					end_group: 0,
 					subscriber_priority,
 					forward,
+					authorization_token,
 				})
 			}
 			_ => {
@@ -494,6 +512,7 @@ impl Message for SubscribeUpdate {
 				}
 				decode_params!(r, version,
 					0x02 => _object_delivery_timeout: Option<u64>,
+					0x03 => authorization_token: Option<bytes::Bytes>,
 					0x06 => _subgroup_delivery_timeout: Option<u64>,
 					0x10 => forward: Option<bool>,
 					0x20 => subscriber_priority: Option<u8>,
@@ -517,6 +536,7 @@ impl Message for SubscribeUpdate {
 					end_group: 0,
 					subscriber_priority,
 					forward,
+					authorization_token,
 				})
 			}
 		}
@@ -608,6 +628,31 @@ mod tests {
 			let encoded = encode_message(&msg, version);
 			let decoded: Subscribe = decode_message(&encoded, version).unwrap();
 			assert_eq!(decoded.authorization_token, None, "{version:?}");
+		}
+	}
+
+	/// A REQUEST_UPDATE (SubscribeUpdate) carries the AUTHORIZATION TOKEN too, so a peer
+	/// can refresh its credential, on a legacy draft and a strict one.
+	#[test]
+	fn subscribe_update_authorization_token_round_trips_legacy_and_strict() {
+		let token = bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xff]);
+		for version in [Version::Draft14, Version::Draft18] {
+			let subscription_request_id = match version {
+				Version::Draft14 | Version::Draft15 | Version::Draft16 => Some(RequestId(3)),
+				_ => None,
+			};
+			let msg = SubscribeUpdate {
+				request_id: RequestId(1),
+				subscription_request_id,
+				start_location: Location { group: 0, object: 0 },
+				end_group: 0,
+				subscriber_priority: 128,
+				forward: true,
+				authorization_token: Some(token.clone()),
+			};
+			let encoded = encode_message(&msg, version);
+			let decoded: SubscribeUpdate = decode_message(&encoded, version).unwrap();
+			assert_eq!(decoded.authorization_token, Some(token.clone()), "{version:?}");
 		}
 	}
 
@@ -964,6 +1009,7 @@ mod tests {
 			end_group: 0,
 			subscriber_priority: 200,
 			forward: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft15);
@@ -984,6 +1030,7 @@ mod tests {
 			end_group: 100,
 			subscriber_priority: 200,
 			forward: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft14);
@@ -1087,6 +1134,7 @@ mod tests {
 			end_group: 0,
 			subscriber_priority: 200,
 			forward: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft17);
@@ -1288,6 +1336,7 @@ mod tests {
 			end_group: 0,
 			subscriber_priority: 200,
 			forward: true,
+			authorization_token: None,
 		};
 
 		let encoded = encode_message(&msg, Version::Draft18);
@@ -1311,6 +1360,7 @@ mod tests {
 			end_group: 0,
 			subscriber_priority: 200,
 			forward: true,
+			authorization_token: None,
 		};
 		let v18_msg = SubscribeUpdate { ..v17_msg.clone() };
 
