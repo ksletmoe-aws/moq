@@ -1048,9 +1048,16 @@ where
 		if let Some(token) = &msg.authorization_token
 			&& !self.auth.allows(crate::auth::Direction::Subscribe, path.as_str())
 		{
-			// A structurally malformed token is refused at the request level, never the session.
+			// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol violation
+			// and closes the session exactly as on the SETUP path; a merely-undecodable
+			// structure is refused per request without tearing down the connection.
 			let structure = match crate::ietf::token::decode_value(token, self.version) {
 				Ok(structure) => structure,
+				Err(err @ Error::ProtocolViolation) => {
+					self.session
+						.close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
+					return Err(err);
+				}
 				Err(_) => {
 					self.write_error(&mut stream, request_id, &Error::Unauthorized, "malformed authorization token")
 						.await?;
@@ -1156,7 +1163,50 @@ where
 		attached: &mut bool,
 		mut token_grant: Option<crate::auth::RequestGrant<crate::time::Clock>>,
 	) -> Result<(), Error> {
+		let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
 		loop {
+			// A renewal verify in flight is raced against the request grant's deadline (never
+			// a bare await), so the old deadline can still fire while a slow acceptor decides;
+			// the loop stops reading until the verdict resolves.
+			if let Some((verdict, rid)) = pending.as_mut() {
+				let rid = *rid;
+				enum Ren {
+					Renewal(Result<crate::auth::Grant, Error>),
+					Ended(Error),
+				}
+				let ren = kio::wait(|waiter| {
+					if let Some(rg) = token_grant.as_mut()
+						&& let Poll::Ready(err) = rg.poll_ended(waiter)
+					{
+						return Poll::Ready(Ren::Ended(err));
+					}
+					verdict.poll_grant(waiter).map(Ren::Renewal)
+				})
+				.await;
+				let res = match ren {
+					Ren::Ended(err) => return Err(err),
+					Ren::Renewal(res) => res,
+				};
+				let (verdict, _) = pending.take().expect("a pending renewal");
+				let Some(rg) = token_grant.as_mut() else {
+					continue;
+				};
+				match res {
+					// On accept the old grant is dropped and the deadline re-armed (REQUEST_OK).
+					Ok(grant) if grant.subscribe.matches(path.as_str()) => {
+						rg.renew(verdict, grant);
+						self.write_ok(stream, rid).await?;
+					}
+					// A refused or uncovered renewal keeps the old grant until it lapses and
+					// answers UNAUTHORIZED without tearing down the announce.
+					_ => {
+						self.write_error(stream, rid, &Error::Unauthorized, "renewal not granted")
+							.await?;
+					}
+				}
+				continue;
+			}
+
 			// Read one control message, ending the announce (never the session) if the
 			// request grant lapses or is revoked meanwhile. The read future borrows only the
 			// reader, in an inner block, so that borrow is gone before a renewal answers on
@@ -1213,13 +1263,22 @@ where
 			}
 
 			// A REQUEST_UPDATE carrying a fresh token refreshes the announce's request grant
-			// (MoQ request-token), when the announce is token-authorized. On accept the old
-			// grant is dropped and the deadline re-armed (REQUEST_OK); a refused or uncovered
-			// renewal keeps the old grant (it stands until it lapses) and answers UNAUTHORIZED
-			// without tearing down the announce. A cluster reprice never carries a token.
-			if let (Some(token), Some(rg)) = (&msg.authorization_token, token_grant.as_mut()) {
+			// (MoQ request-token), when the announce is token-authorized. The verify is not
+			// awaited here: it becomes the pending renewal raced against the deadline above. A
+			// cluster reprice never carries a token.
+			if let Some(token) = &msg.authorization_token
+				&& token_grant.is_some()
+			{
+				// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol violation
+				// and closes the session, as on the SETUP path; a merely-undecodable structure
+				// is refused per request, leaving the old grant to stand until it lapses.
 				let structure = match crate::ietf::token::decode_value(token, self.version) {
 					Ok(structure) => structure,
+					Err(err @ Error::ProtocolViolation) => {
+						self.session
+							.close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
+						return Err(err);
+					}
 					Err(_) => {
 						self.write_error(stream, msg.request_id, &Error::Unauthorized, "malformed authorization token")
 							.await?;
@@ -1232,16 +1291,7 @@ where
 					path.clone(),
 					crate::auth::RequestKind::PublishNamespace,
 				);
-				match verdict.grant().await {
-					Ok(grant) if grant.subscribe.matches(path.as_str()) => {
-						rg.renew(verdict, grant);
-						self.write_ok(stream, msg.request_id).await?;
-					}
-					_ => {
-						self.write_error(stream, msg.request_id, &Error::Unauthorized, "renewal not granted")
-							.await?;
-					}
-				}
+				pending = Some((verdict, msg.request_id));
 				continue;
 			}
 
@@ -4938,6 +4988,30 @@ mod tests {
 		assert!(
 			routed_now(&consumer, "room/alice").is_some(),
 			"the renewed announce must still be attached"
+		);
+	}
+
+	/// An alias reference (DELETE/USE_ALIAS) on a PUBLISH_NAMESPACE token is a connection-level
+	/// protocol violation, closing the session as on the SETUP path, not a per-request refusal.
+	#[tokio::test]
+	async fn an_alias_token_on_a_request_is_a_protocol_violation() {
+		const VERSION: Version = Version::Draft18;
+		let (mut subscriber, _requests, _cred, _consumer, session) = auth_announce_harness(VERSION, Vec::new());
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		let mut msg = token_publish_namespace();
+		// USE_ALIAS (0x02): an alias reference cannot precede SETUP, so it is a PROTOCOL_VIOLATION.
+		msg.authorization_token = Some(bytes::Bytes::from_static(&[0x02, 0x07]));
+
+		let err = subscriber
+			.run_publish_namespace_stream(stream, msg, cluster::Peer::default(), None)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, Error::ProtocolViolation), "{err:?}");
+		assert_eq!(
+			session.log.closes().first().map(|c| c.0),
+			Some(crate::SessionError::ProtocolViolation.to_code()),
+			"the session must close with PROTOCOL_VIOLATION"
 		);
 	}
 

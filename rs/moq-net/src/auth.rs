@@ -935,22 +935,25 @@ impl RequestVerdict {
 	/// [`Error::Unsupported`]; an unanswered (dropped) request is
 	/// [`SessionError::Unauthorized`].
 	pub(crate) async fn grant(&self) -> Result<Grant> {
+		kio::wait(|waiter| self.poll_grant(waiter)).await
+	}
+
+	/// Poll for the acceptor's first answer, so the caller can race the verify against the
+	/// live grant's deadline and serving rather than blocking on a bare await.
+	pub(crate) fn poll_grant(&self, waiter: &kio::Waiter) -> Poll<Result<Grant>> {
 		let Some(issue) = &self.issue else {
-			return Err(Error::Unsupported);
+			return Poll::Ready(Err(Error::Unsupported));
 		};
-		kio::wait(|waiter| {
-			let mut guard = ready_or!(issue.poll(waiter, |issue| match issue.outbox.is_empty() && !issue.done {
-				true => Poll::Pending,
-				false => Poll::Ready(()),
-			}));
-			Poll::Ready(match guard.outbox.pop_front() {
-				Some(Reply::Grant(grant)) => Ok(grant),
-				Some(Reply::Refuse { code, .. }) => Err(Error::Session(code)),
-				// Done with nothing written: the acceptor dropped the request unanswered.
-				None => Err(Error::Session(SessionError::Unauthorized)),
-			})
+		let mut guard = ready_or!(issue.poll(waiter, |issue| match issue.outbox.is_empty() && !issue.done {
+			true => Poll::Pending,
+			false => Poll::Ready(()),
+		}));
+		Poll::Ready(match guard.outbox.pop_front() {
+			Some(Reply::Grant(grant)) => Ok(grant),
+			Some(Reply::Refuse { code, .. }) => Err(Error::Session(code)),
+			// Done with nothing written: the acceptor dropped the request unanswered.
+			None => Err(Error::Session(SessionError::Unauthorized)),
 		})
-		.await
 	}
 
 	/// After the first grant, poll for the acceptor's next action on this token: a

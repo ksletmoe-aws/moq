@@ -536,10 +536,15 @@ where
 					let err = Error::Unauthorized;
 					return self.reject_subscribe(stream, request_id, &err, "not granted").await;
 				};
-				// A structurally malformed token is refused here rather than failing the
-				// session at decode, so one bad request never tears down the connection.
+				// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol violation
+				// and closes the session exactly as on the SETUP path; a merely-undecodable
+				// structure is refused per request without tearing down the connection.
 				let structure = match crate::ietf::token::decode_value(token, self.version) {
 					Ok(structure) => structure,
+					Err(err @ Error::ProtocolViolation) => {
+						self.session.clone().close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
+						return Err(err);
+					}
 					Err(_) => {
 						let err = Error::Unauthorized;
 						return self
@@ -718,15 +723,47 @@ where
 					Closed,
 					// A `[type][size][body]` control message off the subscribe stream.
 					Message(u64, bytes::Bytes),
+					// A pending renewal's verdict resolved, for the update with this request id.
+					Renewal(Result<crate::auth::Grant, Error>, RequestId),
 				}
 
 				// After SUBSCRIBE_OK the peer may send a REQUEST_UPDATE (SUBSCRIBE_UPDATE, 0x02)
-				// to refresh the request's token, so the loop reads one control message per turn
-				// while serving. The read future borrows only `stream.reader` and lives in an
-				// inner block, so that borrow is released before a renewal answers on
-				// `stream.writer`.
+				// to refresh the request's token. The loop reads one control message per turn
+				// while serving; a renewal's verify is raced against serving and the old grant's
+				// deadline (never a bare await), so media keeps flowing and the old deadline can
+				// still fire when the acceptor is slow. While a renewal is pending the loop stops
+				// reading until its verdict resolves. The read future borrows only
+				// `stream.reader` and lives in an inner block, so that borrow is released before a
+				// renewal answers on `stream.writer`.
+				let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
 				loop {
-					let step = {
+					let step = if let Some((verdict, rid)) = pending.as_mut() {
+						let rid = *rid;
+						kio::wait(|waiter| {
+							if let Poll::Ready(served) = waiter.poll_future(serve.as_mut()) {
+								return Poll::Ready(Step::Served(served));
+							}
+							if gate.as_mut().is_some_and(|gate| gate.poll_denied(waiter).is_ready()) {
+								tracing::info!(broadcast = %absolute, track = %track_name, "subscription no longer authorized");
+								return Poll::Ready(Step::Ended((Err(Error::Unauthorized), false)));
+							}
+							if let Some(rg) = request_grant.as_mut()
+								&& let Poll::Ready(err) = rg.poll_ended(waiter)
+							{
+								tracing::info!(broadcast = %absolute, track = %track_name, %err, "request token grant ended");
+								return Poll::Ready(Step::Ended((Err(err), false)));
+							}
+							if let Poll::Ready(res) = verdict.poll_grant(waiter) {
+								return Poll::Ready(Step::Renewal(res, rid));
+							}
+							let mut cx = std::task::Context::from_waker(waiter.waker());
+							if closed_session.poll_closed(&mut cx).is_ready() {
+								return Poll::Ready(Step::Closed);
+							}
+							Poll::Pending
+						})
+						.await
+					} else {
 						let mut read = std::pin::pin!(read_control(&mut stream.reader));
 						kio::wait(|waiter| {
 							if let Poll::Ready(served) = waiter.poll_future(serve.as_mut()) {
@@ -762,6 +799,34 @@ where
 					match step {
 						Step::Served(served) | Step::Ended(served) => break Some(served),
 						Step::Closed => break None,
+						Step::Renewal(res, rid) => {
+							// The pending verdict resolved: consume it and answer the update.
+							let (verdict, _) = pending.take().expect("a pending renewal");
+							let Some(rg) = request_grant.as_mut() else {
+								continue;
+							};
+							match res {
+								// The renewal's grant must still cover this request. On accept the
+								// old grant is dropped (ending the old token) and the deadline is
+								// re-armed at the new expiry.
+								Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
+									rg.renew(verdict, grant);
+									self.write_request_ok(&mut stream.writer, rid).await?;
+								}
+								// A refused or uncovered renewal keeps the old grant (per the quest,
+								// the request ends only when that lapses) and answers UNAUTHORIZED so
+								// the peer can retry before then.
+								_ => {
+									self.write_subscribe_error(
+										&mut stream.writer,
+										rid,
+										&Error::Unauthorized,
+										"renewal not granted",
+									)
+									.await?;
+								}
+							}
+						}
 						Step::Message(id, mut data) => {
 							// Only REQUEST_UPDATE carries a renewal; any other message is ignored,
 							// as it was when the loop only watched for the stream closing.
@@ -781,53 +846,39 @@ where
 							};
 							// Only a token-authorized subscription holds a request grant to renew;
 							// a union-authorized one is already covered by the session grant.
-							let Some(rg) = request_grant.as_mut() else {
+							if request_grant.is_none() {
 								continue;
-							};
-							// A structurally malformed token is refused at the request level,
-							// leaving the old grant to stand until it lapses.
+							}
+							// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol
+							// violation and closes the session, as on the SETUP path; a
+							// merely-undecodable structure is refused per request, leaving the old
+							// grant to stand until it lapses.
 							let structure = match crate::ietf::token::decode_value(token, self.version) {
 								Ok(structure) => structure,
+								Err(err @ Error::ProtocolViolation) => {
+									self.session.clone().close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
+									return Err(err);
+								}
 								Err(_) => {
-									let _ = self
-										.write_subscribe_error(
-											&mut stream.writer,
-											update.request_id,
-											&Error::Unauthorized,
-											"malformed authorization token",
-										)
-										.await;
+									self.write_subscribe_error(
+										&mut stream.writer,
+										update.request_id,
+										&Error::Unauthorized,
+										"malformed authorization token",
+									)
+									.await?;
 									continue;
 								}
 							};
+							// Verify the fresh token, but do not block the serve loop on it: the
+							// verdict is raced against serving and the old grant's deadline above.
 							let verdict = self.auth.verify_request(
 								bytes::Bytes::from(structure.value),
 								structure.kind,
 								msg.track_namespace.to_owned(),
 								crate::auth::RequestKind::Subscribe,
 							);
-							match verdict.grant().await {
-								// The renewal's grant must still cover this request. On accept the
-								// old grant is dropped (ending the old token) and the deadline is
-								// re-armed at the new expiry.
-								Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
-									rg.renew(verdict, grant);
-									let _ = self.write_request_ok(&mut stream.writer, update.request_id).await;
-								}
-								// A refused or uncovered renewal keeps the old grant (per the quest,
-								// the request ends only when that lapses) and answers UNAUTHORIZED so
-								// the peer can retry before then.
-								_ => {
-									let _ = self
-										.write_subscribe_error(
-											&mut stream.writer,
-											update.request_id,
-											&Error::Unauthorized,
-											"renewal not granted",
-										)
-										.await;
-								}
-							}
+							pending = Some((verdict, update.request_id));
 						}
 					}
 				}
@@ -3294,6 +3345,90 @@ mod serve_tests {
 			settle().await;
 		}
 		assert!(ended, "a refused renewal must let the old grant lapse the subscription");
+	}
+
+	/// An alias reference (DELETE/USE_ALIAS) on a request token is a connection-level protocol
+	/// violation, closing the session exactly as on the SETUP path, not a per-request refusal.
+	#[tokio::test]
+	async fn an_alias_token_on_a_request_is_a_protocol_violation() {
+		const VERSION: Version = Version::Draft18;
+		let (auth, _requests, _cred) = auth_covering_other();
+		let h = serve_with_auth(VERSION, auth, Vec::new());
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let mut msg = subscribe(Filter::NextObject, None);
+		// USE_ALIAS (0x02): nothing can be registered before SETUP, so an alias reference is a
+		// PROTOCOL_VIOLATION rather than a token we could verify.
+		msg.authorization_token = Some(bytes::Bytes::from_static(&[0x02, 0x07]));
+
+		let err = h.publisher.clone().run_subscribe_stream(stream, msg).await.unwrap_err();
+		assert!(matches!(err, Error::ProtocolViolation), "{err:?}");
+		assert_eq!(
+			h.log.closes().first().map(|c| c.0),
+			Some(crate::SessionError::ProtocolViolation.to_code()),
+			"the session must close with PROTOCOL_VIOLATION"
+		);
+	}
+
+	/// A slow acceptor answering a renewal must not stall serving nor let the request outlive
+	/// its grant: the renewal verify is raced against the old deadline, which still fires.
+	#[tokio::test(start_paused = true)]
+	async fn a_slow_renewal_does_not_stall_serving() {
+		const VERSION: Version = Version::Draft18;
+		let (auth, mut requests, _cred) = auth_covering_other();
+		let h = serve_with_auth(VERSION, auth, subscribe_update_with_token(VERSION).await);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let popped = std::sync::Arc::new(AtomicU64::new(0));
+		let acceptor = {
+			let popped = popped.clone();
+			async move {
+				let mut held = Vec::new();
+				// The first grant lapses in 60s.
+				let first = requests.next().await.expect("a request");
+				held.push(first.accept(grant_all_expiring(&rt, Some(60))));
+				popped.fetch_add(1, Ordering::Relaxed);
+				// The renewal is popped but never answered: a slow or hung acceptor.
+				let _slow = requests.next().await.expect("a renewal");
+				popped.fetch_add(1, Ordering::Relaxed);
+				std::future::pending::<()>().await
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		// Let the loop read the REQUEST_UPDATE and the acceptor pop both requests.
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending(), "the subscription ended during setup");
+			if popped.load(Ordering::Relaxed) >= 2 {
+				break;
+			}
+			settle().await;
+		}
+		assert_eq!(popped.load(Ordering::Relaxed), 2, "the acceptor never saw the renewal");
+
+		// The acceptor is stuck. Past the old 60s expiry the deadline must still fire and end
+		// the request UNAUTHORIZED, rather than the pending renewal stalling serving.
+		tokio::time::advance(Duration::from_secs(120)).await;
+		let mut ended = None;
+		for _ in 0..50 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if let Poll::Ready(res) = futures::poll!(serving.as_mut()) {
+				ended = Some(res);
+				break;
+			}
+			settle().await;
+		}
+		let res = ended.expect("serving must end at the old deadline, not stall on the slow renewal");
+		assert!(matches!(res, Err(Error::Unauthorized)), "{res:?}");
 	}
 
 	/// A distinctive request id, so `[FetchHeader::TYPE, REQUEST_ID]` is a usable needle.
