@@ -565,6 +565,7 @@ where
 				peer_setup_stream: Some(peer_setup.stream),
 				peer_declared: Some(peer_setup.declared),
 				auth: auth.clone(),
+				request_token: None,
 			})?;
 			tracing::debug!(?version, "connected");
 			Ok(Session::new(
@@ -683,6 +684,7 @@ where
 						peer_setup_stream: None,
 						peer_declared: Some(peer_declared),
 						auth: auth.clone(),
+						request_token: None,
 					})?;
 					(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 				}

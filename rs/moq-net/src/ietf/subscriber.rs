@@ -440,6 +440,9 @@ pub(super) struct Subscriber<S: crate::transport::poll::Session> {
 	going_away: crate::goaway::GoingAway,
 	// Our grant (MoQ Auth): a subscription it stops covering is cancelled.
 	auth: crate::auth::Handle,
+	// The AUTHORIZATION TOKEN this side presents on its SUBSCRIBE requests (MoQ
+	// request-token), or `None` to send none. A client credential.
+	request_token: Option<bytes::Bytes>,
 }
 
 /// Resolve the subscription a data stream belongs to.
@@ -507,6 +510,7 @@ where
 			version,
 			going_away,
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		}
 	}
 
@@ -567,6 +571,14 @@ where
 			// which is what makes run_route exit, as does a limit holding it back.
 			this.run_route(path, generation).await;
 		});
+	}
+
+	/// Present this request token (the AUTHORIZATION TOKEN parameter value) on the SUBSCRIBE
+	/// requests this side sends, so a client authorizes its subscribes the standard draft-17+
+	/// way (MoQ request-token).
+	pub fn with_request_token(mut self, token: Option<bytes::Bytes>) -> Self {
+		self.request_token = token;
+		self
 	}
 
 	/// End every active subscription with the error that ended the session.
@@ -2236,7 +2248,7 @@ where
 				filter: join.filter,
 				fill: join.fill,
 				properties_wanted: true,
-				authorization_token: None,
+				authorization_token: self.request_token.clone(),
 			})
 			.await?;
 		Ok(())

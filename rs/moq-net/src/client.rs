@@ -20,6 +20,7 @@ pub struct Client {
 	setup_authority: Option<String>,
 	cost: Option<u64>,
 	peer_hop: Option<crate::Hop>,
+	request_token: Option<bytes::Bytes>,
 }
 
 impl Client {
@@ -129,6 +130,18 @@ impl Client {
 	/// An identity the peer does declare wins over this one.
 	pub fn with_peer_hop(mut self, hop: crate::Hop) -> Self {
 		self.peer_hop = Some(hop);
+		self
+	}
+
+	/// Present an `AUTHORIZATION TOKEN` on this client's own requests (SUBSCRIBE,
+	/// PUBLISH_NAMESPACE, and their REQUEST_UPDATEs), so a request the session grant does not
+	/// cover is authorized the standard draft-17+ way (MoQ request-token) rather than needing
+	/// the moq-dev AUTH-stream extension. The value is the section 8.9 Token structure the
+	/// peer's verifier reads; a relay that takes [`Session::auth`](crate::Session::auth)'s
+	/// requests answers it. Rides draft-17+ message parameters and draft-14's trailing block;
+	/// omit to send none.
+	pub fn with_request_token(mut self, token: impl Into<bytes::Bytes>) -> Self {
+		self.request_token = Some(token.into());
 		self
 	}
 
@@ -282,6 +295,7 @@ impl Client {
 					peer_setup_stream: None,
 					peer_declared: None,
 					auth: auth.clone(),
+					request_token: self.request_token.clone(),
 				})?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -438,6 +452,7 @@ impl Client {
 					peer_setup_stream: None,
 					peer_declared: Some(peer_declared),
 					auth: auth.clone(),
+					request_token: self.request_token.clone(),
 				})?;
 				(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 			}

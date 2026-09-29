@@ -70,6 +70,10 @@ pub struct Config<S: crate::transport::poll::Session> {
 	/// peer's token requests during its handshake. Supports AUTH exactly when the
 	/// version can negotiate it; the peer's SETUP decides whether it does.
 	pub auth: crate::auth::Handle,
+
+	/// The AUTHORIZATION TOKEN a client presents on its own SUBSCRIBE / PUBLISH_NAMESPACE
+	/// requests (MoQ request-token). `None` for a server, or a client that presents none.
+	pub request_token: Option<bytes::Bytes>,
 }
 
 pub fn start<S>(config: Config<S>) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
@@ -92,6 +96,7 @@ where
 		peer_setup_stream,
 		peer_declared,
 		auth,
+		request_token,
 	} = config;
 
 	// GOAWAY wiring: the public Session holds one half (drain trigger, received
@@ -168,7 +173,8 @@ where
 					peer_setup.clone(),
 					version,
 				)
-				.with_auth(auth.clone());
+				.with_auth(auth.clone())
+				.with_request_token(request_token.clone());
 				let (tasks, mut task_set) = TaskSet::new();
 				let subscriber = Subscriber::new(
 					runtime.clone(),
@@ -183,7 +189,8 @@ where
 					tasks.clone(),
 					goaway.going_away.clone(),
 				)
-				.with_auth(auth.clone());
+				.with_auth(auth.clone())
+				.with_request_token(request_token.clone());
 
 				// GOAWAY send task: draft-14-16 carry GOAWAY on the shared control
 				// stream. Parked on the drain trigger; races the transport close so
@@ -343,7 +350,8 @@ where
 					peer_setup.clone(),
 					version,
 				)
-				.with_auth(auth.clone());
+				.with_auth(auth.clone())
+				.with_request_token(request_token.clone());
 				let (tasks, mut task_set) = TaskSet::new();
 				let subscriber = Subscriber::new(
 					runtime.clone(),
@@ -358,7 +366,8 @@ where
 					tasks,
 					goaway.going_away.clone(),
 				)
-				.with_auth(auth.clone());
+				.with_auth(auth.clone())
+				.with_request_token(request_token.clone());
 
 				// Our tokens, one Auth request each, once the peer's SETUP negotiates it.
 				let present = auth::run_present(
@@ -1128,6 +1137,7 @@ mod tests {
 				..Default::default()
 			}),
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		})
 		.expect("start the session");
 
@@ -1181,6 +1191,7 @@ mod tests {
 			// The requests wait on the peer's SETUP (MoQ Hidden).
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -1233,6 +1244,7 @@ mod tests {
 			peer_setup_stream: None,
 			peer_declared,
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -1334,6 +1346,7 @@ mod tests {
 				..Default::default()
 			}),
 			auth: handle.clone(),
+			request_token: None,
 		})
 		.expect("start the session");
 		AuthSession {
@@ -1447,6 +1460,7 @@ mod tests {
 			// carry and the dispatch loop actually runs.
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		})
 		.expect("start the session");
 
@@ -1684,6 +1698,7 @@ mod tests {
 			peer_setup_stream: None,
 			peer_declared: None,
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		})
 		.expect("start the session");
 		let driver = tokio::spawn(driver);

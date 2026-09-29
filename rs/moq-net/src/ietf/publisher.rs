@@ -277,6 +277,9 @@ pub(super) struct Publisher<S: crate::transport::poll::Session> {
 	// Our grant (MoQ Auth): only what it lets us publish is advertised and served, and a
 	// shrink withdraws what it no longer covers.
 	auth: crate::auth::Handle,
+	// The AUTHORIZATION TOKEN this side presents on its PUBLISH_NAMESPACE requests and their
+	// REQUEST_UPDATEs (MoQ request-token), or `None` to send none. A client credential.
+	request_token: Option<bytes::Bytes>,
 }
 
 /// The snapshot a joining FETCH inherits from its subscription.
@@ -333,12 +336,21 @@ where
 			joins: Default::default(),
 			version,
 			auth: crate::auth::Handle::new(false),
+			request_token: None,
 		}
 	}
 
 	/// Bound what we publish by the grant this session's tokens earn (MoQ Auth).
 	pub fn with_auth(mut self, auth: crate::auth::Handle) -> Self {
 		self.auth = auth;
+		self
+	}
+
+	/// Present this request token (the AUTHORIZATION TOKEN parameter value) on the
+	/// PUBLISH_NAMESPACE requests this side sends, and on their REQUEST_UPDATEs, so a client
+	/// authorizes its announces the standard draft-17+ way (MoQ request-token).
+	pub fn with_request_token(mut self, token: Option<bytes::Bytes>) -> Self {
+		self.request_token = token;
 		self
 	}
 
@@ -1783,7 +1795,7 @@ where
 				request_id,
 				track_namespace: path.as_path(),
 				cluster,
-				authorization_token: None,
+				authorization_token: self.request_token.clone(),
 			})
 			.await?;
 
@@ -1860,7 +1872,9 @@ where
 			return Ok(Refused::No);
 		};
 		let request_id = self.control.next_request_id(&self.runtime).await?;
-		let update = ietf::PublishNamespaceUpdate::between(request_id, &held, &next);
+		let mut update = ietf::PublishNamespaceUpdate::between(request_id, &held, &next);
+		// The credential rides the update too, so a reprice also refreshes the request token.
+		update.authorization_token = self.request_token.clone();
 
 		request.stream.writer.encode(&ietf::PublishNamespaceUpdate::ID).await?;
 		request.stream.writer.encode(&update).await?;
@@ -4841,6 +4855,48 @@ mod tests {
 			"PUBLISH_NAMESPACE without a SUBSCRIBE_NAMESPACE"
 		);
 		assert_eq!(log.bi_opens(), 1, "one request stream");
+	}
+
+	/// A client configured with a request token puts it on the PUBLISH_NAMESPACE it sends, on
+	/// a legacy draft (draft-14 trailing block) and a strict one (draft-18 message
+	/// parameters). Without `with_request_token` the token bytes never reach the wire.
+	#[tokio::test]
+	async fn a_configured_request_token_rides_the_publish_namespace() {
+		let token = bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xfe, 0xed]);
+		for version in [Version::Draft14, Version::Draft18] {
+			let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+			let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
+			settle().await;
+
+			let session =
+				crate::lite::test_transport::ScriptedSession::per_stream(vec![publish_namespace_ok(version).await]);
+			let log = session.log.clone();
+			let peer_setup = peer::PeerSetup::default();
+			peer_setup.set(peer::Peer::default());
+
+			let publisher = Publisher::new(
+				crate::time::Clock::tokio(),
+				session,
+				origin.consume(),
+				Control::new(None, false),
+				None,
+				peer_setup,
+				version,
+			)
+			.with_request_token(Some(token.clone()));
+
+			let mut run = std::pin::pin!(publisher.run_publish_namespaces());
+			let mut sent = false;
+			for _ in 0..100 {
+				assert!(futures::poll!(run.as_mut()).is_pending());
+				if occurrences(&log, &token) >= 1 {
+					sent = true;
+					break;
+				}
+				settle().await;
+			}
+			assert!(sent, "{version}: the request token must ride the PUBLISH_NAMESPACE");
+		}
 	}
 
 	/// Drive both announce loops at once against a peer that declared `solicit`,
