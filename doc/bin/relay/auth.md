@@ -177,12 +177,13 @@ long-lived request (an ingest PUBLISH_NAMESPACE, a subscription) renews its
 credential in place without reconnecting; a refused renewal leaves the old
 grant standing until it lapses.
 
-Verifying a request token needs an application acceptor on the session, the
-same seam that answers session tokens ([`admissions()`](#in-process) for an
-embedded relay). A relay with no acceptor for it decodes the token and refuses
-a request the session grant does not otherwise cover, `NOT_SUPPORTED` when
-nothing can verify a token at all. Wiring a per-request lease into the
-`--auth-url` server is a follow-up.
+Verifying a request token is a moq-net library capability: an application takes
+`auth::Handle::requests()` before running the session and answers each token
+tagged with the request's path and kind (`auth::Request::path()`, `::kind()`).
+moq-relay does not yet opt in on the request path, so as of this release it
+refuses a request token with `NOT_SUPPORTED`; wiring a per-request lease into
+the `--auth-url` server and the in-process [`admissions()`](#in-process) API is
+a follow-up.
 
 ### Claims
 
