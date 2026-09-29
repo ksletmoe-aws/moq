@@ -506,7 +506,7 @@ where
 			// later narrows; a token-authorized one is not (the union never covered it), and
 			// its grant instead ends with the request when `_request_grant` drops.
 			let mut gate = None;
-			let mut _request_grant = None;
+			let mut request_grant = None;
 			if self
 				.auth
 				.allows(crate::auth::Direction::Publish, msg.track_namespace.as_str())
@@ -542,8 +542,9 @@ where
 					// The token's grant must cover this exact request; it authorizes nothing
 					// else and never joins the session union.
 					Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
-						// Held for the subscription's life, so the grant ends with the request.
-						_request_grant = Some(verdict);
+						// Held for the subscription's life: the request ends when this grant
+						// lapses or is revoked (RequestGrant::poll_ended below), never the session.
+						request_grant = Some(crate::auth::RequestGrant::new(&self.runtime, verdict, grant));
 					}
 					Ok(_) => {
 						let err = Error::Unauthorized;
@@ -699,6 +700,14 @@ where
 						tracing::info!(broadcast = %absolute, track = %track_name, "subscription no longer authorized");
 						return Poll::Ready(Some((Err(Error::Unauthorized), false)));
 					}
+					// A request-token subscription ends when its grant lapses or the acceptor
+					// revokes it; the session is untouched.
+					if let Some(rg) = request_grant.as_mut()
+						&& let Poll::Ready(err) = rg.poll_ended(waiter)
+					{
+						tracing::info!(broadcast = %absolute, track = %track_name, %err, "request token grant ended");
+						return Poll::Ready(Some((Err(err), false)));
+					}
 					let mut cx = std::task::Context::from_waker(waiter.waker());
 					if stream.reader.poll_closed(&mut cx).is_ready() || closed_session.poll_closed(&mut cx).is_ready() {
 						return Poll::Ready(None);
@@ -745,7 +754,9 @@ where
 			// Send PublishDone
 			let (status, reason) = match &res {
 				Ok(()) => (ietf::PublishDoneStatus::TrackEnded, "track ended"),
-				Err(Error::Unauthorized) => (ietf::PublishDoneStatus::Unauthorized, "not granted"),
+				Err(Error::Unauthorized) | Err(Error::Session(crate::SessionError::Unauthorized)) => {
+					(ietf::PublishDoneStatus::Unauthorized, "not granted")
+				}
 				Err(_) => (ietf::PublishDoneStatus::InternalError, "internal error"),
 			};
 			let _ = stream.writer.encode(&ietf::PublishDone::ID).await;
