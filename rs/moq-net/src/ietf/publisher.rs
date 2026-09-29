@@ -40,8 +40,9 @@ fn serving_subscription(subscriber_priority: u8) -> Subscription {
 
 /// Read one `[type][size][body]` control message off a request stream, or `None` once
 /// the peer finishes it. Mirrors [`super::auth`]'s reader, but borrows only the reader so
-/// a renewal can answer on the writer once the read yields a message.
-async fn read_control<R: crate::transport::poll::RecvStream>(
+/// a renewal can answer on the writer once the read yields a message. Shared with the
+/// subscriber's announce loop.
+pub(super) async fn read_control<R: crate::transport::poll::RecvStream>(
 	reader: &mut Reader<R, Version>,
 ) -> Result<Option<(u64, bytes::Bytes)>, Error> {
 	let Some(id) = reader.decode_maybe::<u64>().await? else {
@@ -1731,6 +1732,7 @@ where
 				request_id,
 				track_namespace: path.as_path(),
 				cluster,
+				authorization_token: None,
 			})
 			.await?;
 
@@ -5150,6 +5152,7 @@ mod tests {
 				request_id: RequestId(3),
 				hops: None,
 				cost: Some(0),
+				authorization_token: None,
 			},
 		)
 		.await;
@@ -5224,6 +5227,7 @@ mod tests {
 					crate::Hops::try_from(vec![crate::Hop::new(8).unwrap(), crate::Hop::new(1).unwrap()]).unwrap(),
 				)),
 				cost: Some(0),
+				authorization_token: None,
 			},
 		)
 		.await;
@@ -5302,6 +5306,7 @@ mod tests {
 				request_id: RequestId(3),
 				hops: None,
 				cost: Some(0),
+				authorization_token: None,
 			},
 		)
 		.await;

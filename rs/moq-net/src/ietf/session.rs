@@ -1612,6 +1612,7 @@ mod tests {
 				request_id: RequestId(1),
 				track_namespace: crate::Path::new("room/host"),
 				cluster: None,
+				authorization_token: None,
 			})
 			.await
 			.unwrap();
