@@ -9,6 +9,59 @@ use crate::{
 	ietf, lite, setup, stats,
 };
 
+/// A client's request-token credential: the `AUTHORIZATION TOKEN` it presents on its own
+/// SUBSCRIBE and PUBLISH_NAMESPACE requests (MoQ request-token), shared with the running
+/// session so it can be replaced without reconnecting.
+///
+/// Cloning shares the cell, so [`Client::set_request_token`] on any handle reaches every
+/// session started from that [`Client`]: the session reads the current value when it first
+/// sends a request, and re-presents a changed one on each live request as a REQUEST_UPDATE.
+/// The default presents no token, which is byte-identical to a client that never sets one.
+#[derive(Clone, Default)]
+pub(crate) struct RequestToken {
+	token: kio::Shared<Option<bytes::Bytes>>,
+}
+
+impl RequestToken {
+	/// A credential presenting `token` (or none) until replaced.
+	#[cfg(test)]
+	pub(crate) fn new(token: Option<bytes::Bytes>) -> Self {
+		Self {
+			token: kio::Shared::new(token),
+		}
+	}
+
+	/// Replace the token presented on this session's requests. A live request re-presents
+	/// it as a REQUEST_UPDATE on its next turn; setting the same value again is a no-op.
+	pub(crate) fn set(&self, token: Option<bytes::Bytes>) {
+		*self.token.lock() = token;
+	}
+
+	/// The token to present right now, read when a request is first sent.
+	pub(crate) fn peek(&self) -> Option<bytes::Bytes> {
+		self.token.read().clone()
+	}
+
+	/// Ready with the current token once it differs from `last`, registering `waiter`
+	/// otherwise. The send loops park here to re-present a replaced token on their live
+	/// requests; it reads without advancing `last`, so a poll that loses its turn to
+	/// another arm is re-offered the change rather than dropping it.
+	pub(crate) fn poll_changed(
+		&self,
+		last: &Option<bytes::Bytes>,
+		waiter: &kio::Waiter,
+	) -> std::task::Poll<Option<bytes::Bytes>> {
+		use std::task::Poll;
+		match self.token.poll(waiter, |cur| match **cur == *last {
+			true => Poll::Pending,
+			false => Poll::Ready(()),
+		}) {
+			Poll::Ready(guard) => Poll::Ready((*guard).clone()),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
 /// A MoQ client session builder.
 #[derive(Default, Clone)]
 pub struct Client {
@@ -20,7 +73,7 @@ pub struct Client {
 	setup_authority: Option<String>,
 	cost: Option<u64>,
 	peer_hop: Option<crate::Hop>,
-	request_token: Option<bytes::Bytes>,
+	request_token: RequestToken,
 }
 
 impl Client {
@@ -140,9 +193,21 @@ impl Client {
 	/// peer's verifier reads; a relay that takes [`Session::auth`](crate::Session::auth)'s
 	/// requests answers it. Rides draft-17+ message parameters and draft-14's trailing block;
 	/// omit to send none.
-	pub fn with_request_token(mut self, token: impl Into<bytes::Bytes>) -> Self {
-		self.request_token = Some(token.into());
+	pub fn with_request_token(self, token: impl Into<bytes::Bytes>) -> Self {
+		self.request_token.set(Some(token.into()));
 		self
+	}
+
+	/// Replace the `AUTHORIZATION TOKEN` this client presents, for a session already running.
+	///
+	/// The credential is shared with the session, so this re-presents the new token on every
+	/// live request as a REQUEST_UPDATE (a SUBSCRIBE renewal, or a PUBLISH_NAMESPACE renewal on
+	/// draft-17+, where that message exists), keeping a token-authorized request alive past its
+	/// old grant's expiry without reconnecting. Setting the same value again sends nothing.
+	/// A client that never presented a token (no [`with_request_token`](Self::with_request_token))
+	/// begins presenting one from its next request.
+	pub fn set_request_token(&self, token: impl Into<bytes::Bytes>) {
+		self.request_token.set(Some(token.into()));
 	}
 
 	/// The origin pair a session attaches, tagged and filtered.

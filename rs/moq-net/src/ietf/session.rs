@@ -72,8 +72,9 @@ pub struct Config<S: crate::transport::poll::Session> {
 	pub auth: crate::auth::Handle,
 
 	/// The AUTHORIZATION TOKEN a client presents on its own SUBSCRIBE / PUBLISH_NAMESPACE
-	/// requests (MoQ request-token). `None` for a server, or a client that presents none.
-	pub request_token: Option<bytes::Bytes>,
+	/// requests (MoQ request-token), a shared handle so it can be replaced while the session
+	/// runs. The default presents none, for a server or a client that presents none.
+	pub request_token: crate::RequestToken,
 }
 
 pub fn start<S>(config: Config<S>) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
@@ -1049,14 +1050,14 @@ async fn enforce_grant<S: crate::transport::poll::Session>(
 	auth: crate::auth::Handle,
 	origin: origin::Consumer,
 	mut session: S,
-	request_token: Option<bytes::Bytes>,
+	request_token: crate::RequestToken,
 ) -> Result<(), Error> {
 	// A client that presents a request token authorizes each of its own requests at the server
 	// per-request (the covers-gate plus the app's acceptor), so its connection grant does not
 	// bound them: the token is precisely how it publishes outside that grant. Enforcing the
 	// grant here would close the client for exactly the announce the token was meant to carry,
 	// before the server ever saw it. The server refuses a bad token per request instead.
-	if request_token.is_some() {
+	if request_token.peek().is_some() {
 		return Ok(());
 	}
 	let mut announced = origin.announced();
@@ -1147,7 +1148,7 @@ mod tests {
 				..Default::default()
 			}),
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		})
 		.expect("start the session");
 
@@ -1201,7 +1202,7 @@ mod tests {
 			// The requests wait on the peer's SETUP (MoQ Hidden).
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -1242,7 +1243,7 @@ mod tests {
 			auth,
 			origin.consume(),
 			session,
-			Some(bytes::Bytes::from_static(b"jwt")),
+			crate::RequestToken::new(Some(bytes::Bytes::from_static(b"jwt"))),
 		)
 		.await;
 
@@ -1283,7 +1284,7 @@ mod tests {
 			peer_setup_stream: None,
 			peer_declared,
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -1385,7 +1386,7 @@ mod tests {
 				..Default::default()
 			}),
 			auth: handle.clone(),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		})
 		.expect("start the session");
 		AuthSession {
@@ -1499,7 +1500,7 @@ mod tests {
 			// carry and the dispatch loop actually runs.
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		})
 		.expect("start the session");
 
@@ -1737,7 +1738,7 @@ mod tests {
 			peer_setup_stream: None,
 			peer_declared: None,
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		})
 		.expect("start the session");
 		let driver = tokio::spawn(driver);

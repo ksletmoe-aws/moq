@@ -232,6 +232,13 @@ impl Client {
 		self
 	}
 
+	/// Replace the `AUTHORIZATION TOKEN` this client presents, for a session already running,
+	/// so a refreshed credential is re-presented on every live request as a REQUEST_UPDATE
+	/// without reconnecting; see [`moq_net::Client::set_request_token`].
+	pub fn set_request_token(&self, token: impl Into<bytes::Bytes>) {
+		self.moq.set_request_token(token);
+	}
+
 	/// Override whether this client redials after a session drop.
 	///
 	/// Defaults to true, unless [`crate::connect::Config::once`] turned it off.

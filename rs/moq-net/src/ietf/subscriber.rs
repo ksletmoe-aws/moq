@@ -440,9 +440,10 @@ pub(super) struct Subscriber<S: crate::transport::poll::Session> {
 	going_away: crate::goaway::GoingAway,
 	// Our grant (MoQ Auth): a subscription it stops covering is cancelled.
 	auth: crate::auth::Handle,
-	// The AUTHORIZATION TOKEN this side presents on its SUBSCRIBE requests (MoQ
-	// request-token), or `None` to send none. A client credential.
-	request_token: Option<bytes::Bytes>,
+	// The AUTHORIZATION TOKEN this side presents on its SUBSCRIBE requests and their
+	// REQUEST_UPDATEs (MoQ request-token). A shared handle so a client can replace it while the
+	// session runs; the default presents none. A client credential.
+	request_token: crate::RequestToken,
 }
 
 /// Resolve the subscription a data stream belongs to.
@@ -510,7 +511,7 @@ where
 			version,
 			going_away,
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		}
 	}
 
@@ -575,8 +576,9 @@ where
 
 	/// Present this request token (the AUTHORIZATION TOKEN parameter value) on the SUBSCRIBE
 	/// requests this side sends, so a client authorizes its subscribes the standard draft-17+
-	/// way (MoQ request-token).
-	pub fn with_request_token(mut self, token: Option<bytes::Bytes>) -> Self {
+	/// way (MoQ request-token). A shared handle, so a replaced token is re-presented on each
+	/// live subscription as a REQUEST_UPDATE.
+	pub fn with_request_token(mut self, token: crate::RequestToken) -> Self {
 		self.request_token = token;
 		self
 	}
@@ -1828,6 +1830,10 @@ where
 		);
 
 		let subscription = request.subscription();
+		// The wire priority this subscription was opened at, re-sent unchanged on a
+		// request-token renewal so the update carries the token without disturbing anything.
+		let subscriber_priority =
+			super::priority::to_wire(subscription.as_ref().map(|s| s.priority).unwrap_or(0));
 		// A live join delivers nothing below the group SUBSCRIBE_OK names as Largest.
 		let live = subscription.as_ref().and_then(|s| s.start).is_none();
 		let join = match subscribe_join(
@@ -2062,10 +2068,14 @@ where
 		enum End {
 			Unused,
 			Revoked,
+			/// The client replaced its request token: re-present it on this live subscription.
+			Renew(Option<bytes::Bytes>),
 			Done(Result<u64, Error>),
 		}
 
 		let mut fetch_done = fetching.is_none();
+		// The request token last presented on this subscription (its initial value).
+		let mut last_token = self.request_token.peek();
 		let cancelled = {
 			let mut done = std::pin::pin!(Self::read_publish_done(&mut stream.reader, self.version));
 			loop {
@@ -2082,6 +2092,9 @@ where
 					if track.poll_unused(waiter).is_ready() {
 						return Poll::Ready(End::Unused);
 					}
+					if let Poll::Ready(token) = self.request_token.poll_changed(&last_token, waiter) {
+						return Poll::Ready(End::Renew(token));
+					}
 					waiter.poll_future(done.as_mut()).map(End::Done)
 				})
 				.await;
@@ -2094,6 +2107,21 @@ where
 						}
 						Err(used) => track = used,
 					},
+					// A replaced token is re-presented as a token-only REQUEST_UPDATE; the read
+					// future above consumes the answer. The subscribe stream's writer is a
+					// disjoint borrow from its reader, so writing here does not disturb the read.
+					End::Renew(token) => {
+						last_token = token.clone();
+						if let Some(token) = token
+							&& let Err(err) = self
+								.send_request_token_update(&mut stream.writer, request_id, subscriber_priority, token)
+								.await
+						{
+							// A failed send does not end the subscription: it continues on the old
+							// grant until that lapses, and the next change re-presents the token.
+							tracing::debug!(%err, "failed to re-present the request token");
+						}
+					}
 					End::Revoked => {
 						tracing::info!(broadcast = %self.origin.absolute(&broadcast_path), track = %track_name, "subscription no longer authorized");
 						let _ = track.abort(Error::Unauthorized);
@@ -2160,16 +2188,44 @@ where
 	///
 	/// The publisher must send it before its FIN (draft-19 section 3.3.2), so a FIN
 	/// without one is a failed request, not a clean end.
+	///
+	/// A request-token renewal we sent (SUBSCRIBE_UPDATE) is answered on this same stream
+	/// (REQUEST_OK / REQUEST_ERROR on draft-15+, SUBSCRIBE_ERROR on draft-14; draft-14 is
+	/// silent on an accepted renewal). Those are consumed here and the read continues: a
+	/// refused renewal leaves the old grant standing until it lapses, so the subscription
+	/// ends then, with its PUBLISH_DONE, not on the answer.
 	async fn read_publish_done(reader: &mut Reader<S::RecvStream, Version>, version: Version) -> Result<u64, Error> {
-		match reader.decode_maybe::<u64>().await? {
-			Some(ietf::PublishDone::ID) => {}
-			Some(_) => return Err(Error::UnexpectedMessage),
-			None => return Err(Error::ProtocolViolation),
+		loop {
+			match reader.decode_maybe::<u64>().await? {
+				Some(ietf::PublishDone::ID) => {
+					let msg: ietf::PublishDone = reader.decode().await?;
+					tracing::debug!(message = ?msg, "received publish done");
+					msg.end(version)?;
+					return Ok(msg.stream_count);
+				}
+				Some(ietf::RequestOk::ID) => {
+					let msg: ietf::RequestOk = reader.decode().await?;
+					tracing::debug!(message = ?msg, "request token renewal accepted");
+				}
+				Some(ietf::RequestError::ID) => {
+					// draft-17+ generalized SUBSCRIBE_ERROR into REQUEST_ERROR at the same id;
+					// draft-14 still frames it as SUBSCRIBE_ERROR. Either way it refuses the
+					// renewal, and the old grant stands until it lapses.
+					match version {
+						Version::Draft14 => {
+							let msg: ietf::SubscribeError = reader.decode().await?;
+							tracing::warn!(message = ?msg, "request token renewal refused");
+						}
+						_ => {
+							let msg: ietf::RequestError = reader.decode().await?;
+							tracing::warn!(message = ?msg, "request token renewal refused");
+						}
+					}
+				}
+				Some(_) => return Err(Error::UnexpectedMessage),
+				None => return Err(Error::ProtocolViolation),
+			}
 		}
-		let msg: ietf::PublishDone = reader.decode().await?;
-		tracing::debug!(message = ?msg, "received publish done");
-		msg.end(version)?;
-		Ok(msg.stream_count)
 	}
 
 	/// Tell the publisher to stop serving a subscription we are walking away from.
@@ -2225,6 +2281,42 @@ where
 		Ok(())
 	}
 
+	/// Re-present the client's request token on a live subscription as a token-only
+	/// REQUEST_UPDATE (SUBSCRIBE_UPDATE), so a refreshed credential reaches the publisher
+	/// before the old grant lapses (MoQ request-token renewal).
+	///
+	/// Token-only: the range, priority and forward flag are the subscription's own, so a
+	/// receiver that acts on them (ours does not, for a token update) sees no change. The
+	/// answer, if the version sends one, is read on the subscription stream by
+	/// [`read_publish_done`](Self::read_publish_done).
+	async fn send_request_token_update(
+		&self,
+		writer: &mut crate::coding::Writer<S::SendStream, Version>,
+		subscription_id: RequestId,
+		subscriber_priority: u8,
+		token: bytes::Bytes,
+	) -> Result<(), Error> {
+		let request_id = self.control.next_request_id(&self.runtime).await?;
+		// Draft-14/15/16 name the subscription being updated; draft-17+ identifies it by stream.
+		let subscription_request_id = match self.version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => Some(subscription_id),
+			_ => None,
+		};
+		writer.encode(&ietf::SubscribeUpdate::ID).await?;
+		writer
+			.encode(&ietf::SubscribeUpdate {
+				request_id,
+				subscription_request_id,
+				start_location: ietf::Location { group: 0, object: 0 },
+				end_group: 0,
+				subscriber_priority,
+				forward: true,
+				authorization_token: Some(token),
+			})
+			.await?;
+		Ok(())
+	}
+
 	async fn write_subscribe(
 		&self,
 		stream: &mut Stream<S, Version>,
@@ -2248,7 +2340,7 @@ where
 				filter: join.filter,
 				fill: join.fill,
 				properties_wanted: true,
-				authorization_token: self.request_token.clone(),
+				authorization_token: self.request_token.peek(),
 			})
 			.await?;
 		Ok(())
@@ -4081,6 +4173,102 @@ mod tests {
 	///
 	/// Decoding the framing rather than scanning for a byte: a type id is one varint among
 	/// many, and a substring match would happily find one inside a length or a payload.
+	/// A SUBSCRIBE_OK for the subscribe stream, framed as the peer sends it, with a Largest so
+	/// the subscription reaches Established. The scripted session parks after it, keeping the
+	/// subscription live so the steady-state loop runs.
+	async fn subscribe_ok_bytes(version: Version) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		writer.encode(&ietf::SubscribeOk::ID).await.unwrap();
+		writer
+			.encode(&ietf::SubscribeOk {
+				request_id: match version {
+					Version::Draft14 | Version::Draft15 | Version::Draft16 => Some(RequestId(1)),
+					_ => None,
+				},
+				track_alias: 7,
+				largest: Some(ietf::Location { group: 0, object: 0 }),
+				properties: Default::default(),
+			})
+			.await
+			.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
+	/// Replacing the client's request token re-presents it on a live subscription as a token-only
+	/// SUBSCRIBE_UPDATE (MoQ request-token renewal), on a legacy draft (draft-14 trailing block)
+	/// and a strict one (draft-18 message parameters). SUBSCRIBE_UPDATE carries the token from
+	/// draft-14 on, unlike PUBLISH_NAMESPACE_UPDATE (draft-17+ only).
+	#[tokio::test(start_paused = true)]
+	async fn setting_a_new_request_token_re_presents_it_on_a_live_subscription() {
+		for version in [Version::Draft14, Version::Draft18] {
+			let first = bytes::Bytes::from_static(&[0x03, 0x00, b'a', b'a']);
+			let second = bytes::Bytes::from_static(&[0x03, 0x00, b'b', b'b']);
+
+			let session = crate::lite::test_transport::ScriptedSession::new(subscribe_ok_bytes(version).await);
+			let log = session.log.clone();
+			let (tasks, _task_set) = crate::util::TaskSet::new();
+			let token = crate::RequestToken::new(Some(first.clone()));
+			let mut subscriber = Subscriber::new(
+				crate::time::Clock::tokio(),
+				session,
+				crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
+				Control::new(None, false),
+				None,
+				peer::PeerSetup::default(),
+				crate::Hop::new(1).unwrap(),
+				None,
+				version,
+				tasks,
+				Default::default(),
+			)
+			.with_request_token(token.clone());
+
+			let producer = crate::broadcast::Info::default().produce();
+			let mut dynamic = producer.dynamic();
+			let consumer = producer.consume();
+			let track = consumer.track("video").unwrap();
+			// Held for the test so the track never reads as unused (which would cancel it).
+			let subscription = track.subscribe(None);
+			let request = dynamic.requested_track().await.expect("no track requested");
+
+			let serving = tokio::spawn(async move {
+				subscriber.run_subscribe(Path::new("broadcast"), dynamic, request).await;
+			});
+
+			// The initial token rides the SUBSCRIBE.
+			let mut initial = false;
+			for _ in 0..200 {
+				if occurrences(&log, &first) >= 1 {
+					initial = true;
+					break;
+				}
+				settle().await;
+			}
+			assert!(initial, "{version}: the initial token must ride the SUBSCRIBE");
+
+			// Replacing it re-presents the new token on the live subscription as a SUBSCRIBE_UPDATE.
+			token.set(Some(second.clone()));
+			let mut renewed = false;
+			for _ in 0..200 {
+				if occurrences(&log, &second) >= 1 {
+					renewed = true;
+					break;
+				}
+				settle().await;
+			}
+			assert!(
+				renewed,
+				"{version}: a replaced token must be re-presented on the live subscription"
+			);
+
+			drop(subscription);
+			drop(track);
+			drop(consumer);
+			serving.abort();
+		}
+	}
+
 	fn control_message_types(log: &crate::lite::test_transport::Log, version: Version) -> Vec<u64> {
 		use crate::coding::Decode;
 

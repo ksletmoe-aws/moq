@@ -250,6 +250,8 @@ enum NamespaceEvent {
 	Retry,
 	/// Our grant (MoQ Auth) or the ceiling changed: re-check every namespace against it.
 	Regrant(crate::auth::Permit),
+	/// The client replaced its request token: re-present it on every live announce.
+	TokenRefresh(Option<bytes::Bytes>),
 }
 
 #[derive(Clone)]
@@ -278,8 +280,9 @@ pub(super) struct Publisher<S: crate::transport::poll::Session> {
 	// shrink withdraws what it no longer covers.
 	auth: crate::auth::Handle,
 	// The AUTHORIZATION TOKEN this side presents on its PUBLISH_NAMESPACE requests and their
-	// REQUEST_UPDATEs (MoQ request-token), or `None` to send none. A client credential.
-	request_token: Option<bytes::Bytes>,
+	// REQUEST_UPDATEs (MoQ request-token). A shared handle so a client can replace it while the
+	// session runs; the default presents none. A client credential.
+	request_token: crate::RequestToken,
 }
 
 /// The snapshot a joining FETCH inherits from its subscription.
@@ -336,7 +339,7 @@ where
 			joins: Default::default(),
 			version,
 			auth: crate::auth::Handle::new(false),
-			request_token: None,
+			request_token: crate::RequestToken::default(),
 		}
 	}
 
@@ -348,8 +351,9 @@ where
 
 	/// Present this request token (the AUTHORIZATION TOKEN parameter value) on the
 	/// PUBLISH_NAMESPACE requests this side sends, and on their REQUEST_UPDATEs, so a client
-	/// authorizes its announces the standard draft-17+ way (MoQ request-token).
-	pub fn with_request_token(mut self, token: Option<bytes::Bytes>) -> Self {
+	/// authorizes its announces the standard draft-17+ way (MoQ request-token). A shared handle,
+	/// so a replaced token is re-presented on each live announce (draft-17+).
+	pub fn with_request_token(mut self, token: crate::RequestToken) -> Self {
 		self.request_token = token;
 		self
 	}
@@ -1803,7 +1807,7 @@ where
 				request_id,
 				track_namespace: path.as_path(),
 				cluster,
-				authorization_token: self.request_token.clone(),
+				authorization_token: self.request_token.peek(),
 			})
 			.await?;
 
@@ -1882,7 +1886,7 @@ where
 		let request_id = self.control.next_request_id(&self.runtime).await?;
 		let mut update = ietf::PublishNamespaceUpdate::between(request_id, &held, &next);
 		// The credential rides the update too, so a reprice also refreshes the request token.
-		update.authorization_token = self.request_token.clone();
+		update.authorization_token = self.request_token.peek();
 
 		request.stream.writer.encode(&ietf::PublishNamespaceUpdate::ID).await?;
 		request.stream.writer.encode(&update).await?;
@@ -2017,6 +2021,66 @@ where
 						suffix: suffix.as_path(),
 					})
 					.await?;
+			}
+		}
+		Ok(())
+	}
+
+	/// Re-present the client's request token on every live announce as a token-only
+	/// REQUEST_UPDATE (MoQ request-token renewal), so a refreshed credential reaches the peer
+	/// before the old grant lapses.
+	///
+	/// Draft-17+ only: earlier drafts have no PUBLISH_NAMESPACE_UPDATE, so a token set on them
+	/// rides the initial advertisement and is not renewed in place. Clearing the token (`None`)
+	/// is not a renewal and sends nothing. A refusal keeps the announce, since the receiver
+	/// holds the old grant until it lapses; only a dead stream drops it.
+	async fn refresh_request_token(
+		&self,
+		requests: &mut HashMap<crate::PathOwned, NamespaceRequest<S>>,
+		token: Option<bytes::Bytes>,
+	) -> Result<(), Error> {
+		let Some(token) = token else {
+			return Ok(());
+		};
+		if matches!(self.version, Version::Draft14 | Version::Draft15 | Version::Draft16) {
+			return Ok(());
+		}
+
+		let suffixes: Vec<crate::PathOwned> = requests.keys().cloned().collect();
+		for suffix in suffixes {
+			let request_id = self.control.next_request_id(&self.runtime).await?;
+			let Some(request) = requests.get_mut(&suffix) else {
+				continue;
+			};
+			let update = ietf::PublishNamespaceUpdate {
+				request_id,
+				hops: None,
+				cost: None,
+				authorization_token: Some(token.clone()),
+			};
+			request.stream.writer.encode(&ietf::PublishNamespaceUpdate::ID).await?;
+			request.stream.writer.encode(&update).await?;
+
+			let absolute = self.origin.absolute(&request.path).to_owned();
+			let Some((type_id, mut data)) = self.read_response(&mut request.stream).await? else {
+				tracing::debug!(broadcast = %absolute, "no answer to the token refresh");
+				// The peer never answered: the stream is gone, so drop the advertisement.
+				requests.remove(&suffix);
+				continue;
+			};
+			match type_id {
+				ietf::RequestOk::ID => {
+					let _ = ietf::RequestOk::decode_msg(&mut data, self.version)?;
+					tracing::debug!(broadcast = %absolute, "request token refreshed");
+				}
+				ietf::RequestError::ID => {
+					let msg = ietf::RequestError::decode_msg(&mut data, self.version)?;
+					// The receiver refuses a renewal it cannot grant but keeps the announce on the
+					// old grant until it lapses, so the request stays; the announce ends later
+					// when that grant does and the stream closes.
+					tracing::warn!(broadcast = %absolute, message = ?msg, "request token refresh refused");
+				}
+				_ => return Err(Error::UnexpectedMessage),
 			}
 		}
 		Ok(())
@@ -2183,6 +2247,10 @@ where
 		let mut retry_at: Option<crate::runtime::Instant> = None;
 		let mut retry_delay = RETRY_BASE;
 
+		// The request token last presented on these announces (their initial value). A client
+		// replacing it wakes the loop, which re-presents the new one on each live announce.
+		let mut last_token = self.request_token.peek();
+
 		// Stream updates (origin route (un)announces), bailing if the peer closes
 		// its side first.
 		let res = loop {
@@ -2211,6 +2279,11 @@ where
 					}
 					if let Poll::Ready(update) = announced.poll_next(waiter) {
 						return Poll::Ready(NamespaceEvent::Update(update));
+					}
+					// A replaced request token is re-presented on each live announce, below the
+					// origin updates so a busy loop still makes progress on both.
+					if let Poll::Ready(token) = self.request_token.poll_changed(&last_token, waiter) {
+						return Poll::Ready(NamespaceEvent::TokenRefresh(token));
 					}
 					if retry.poll(waiter).is_ready() {
 						return Poll::Ready(NamespaceEvent::Retry);
@@ -2248,6 +2321,10 @@ where
 						let path = prefix.join(&suffix);
 						self.sync_namespace(&mut ns, &suffix, &path).await?;
 					}
+				}
+				NamespaceEvent::TokenRefresh(token) => {
+					last_token = token.clone();
+					self.refresh_request_token(&mut ns.requests, token).await?;
 				}
 				NamespaceEvent::Update(None) => {
 					// The origin is gone: withdraw everything, then finish the
@@ -4944,7 +5021,7 @@ mod tests {
 				peer_setup,
 				version,
 			)
-			.with_request_token(Some(token.clone()));
+			.with_request_token(crate::RequestToken::new(Some(token.clone())));
 
 			let mut run = std::pin::pin!(publisher.run_publish_namespaces());
 			let mut sent = false;
@@ -4958,6 +5035,120 @@ mod tests {
 			}
 			assert!(sent, "{version}: the request token must ride the PUBLISH_NAMESPACE");
 		}
+	}
+
+	/// Replacing the request token re-presents it on a live announce as a token-only
+	/// PUBLISH_NAMESPACE_UPDATE (MoQ request-token renewal), on the same stream, without a
+	/// reprice. Draft-17+, since earlier drafts have no PUBLISH_NAMESPACE_UPDATE.
+	#[tokio::test]
+	async fn setting_a_new_request_token_re_presents_it_on_a_live_announce() {
+		const VERSION: Version = Version::Draft18;
+		let first = bytes::Bytes::from_static(&[0x03, 0x00, b'a', b'a']);
+		let second = bytes::Bytes::from_static(&[0x03, 0x00, b'b', b'b']);
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
+		settle().await;
+
+		// One stream carries the announce: RequestOk answers the PUBLISH_NAMESPACE, then
+		// RequestOk answers the token-only REQUEST_UPDATE.
+		let mut script = publish_namespace_ok(VERSION).await;
+		script.extend(publish_namespace_ok(VERSION).await);
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![script]);
+		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
+
+		let token = crate::RequestToken::new(Some(first.clone()));
+		let publisher = Publisher::new(
+			crate::time::Clock::tokio(),
+			session,
+			origin.consume(),
+			Control::new(None, false),
+			None,
+			peer_setup,
+			VERSION,
+		)
+		.with_request_token(token.clone());
+
+		let mut run = std::pin::pin!(publisher.run_publish_namespaces());
+		// The initial token rides the PUBLISH_NAMESPACE.
+		let mut initial = false;
+		for _ in 0..100 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, &first) >= 1 {
+				initial = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(initial, "the initial token must ride the PUBLISH_NAMESPACE");
+
+		// Replacing it re-presents the new token on the live announce.
+		token.set(Some(second.clone()));
+		let mut renewed = false;
+		for _ in 0..100 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, &second) >= 1 {
+				renewed = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(renewed, "a replaced token must be re-presented on the live announce");
+	}
+
+	/// Setting the same token again is a no-op: no second REQUEST_UPDATE is sent, so the token
+	/// bytes appear once (the initial PUBLISH_NAMESPACE) and no more.
+	#[tokio::test]
+	async fn an_unchanged_token_is_not_re_presented() {
+		const VERSION: Version = Version::Draft18;
+		let token_bytes = bytes::Bytes::from_static(&[0x03, 0x00, b'a', b'a']);
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
+		settle().await;
+
+		let mut script = publish_namespace_ok(VERSION).await;
+		script.extend(publish_namespace_ok(VERSION).await);
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![script]);
+		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
+
+		let token = crate::RequestToken::new(Some(token_bytes.clone()));
+		let publisher = Publisher::new(
+			crate::time::Clock::tokio(),
+			session,
+			origin.consume(),
+			Control::new(None, false),
+			None,
+			peer_setup,
+			VERSION,
+		)
+		.with_request_token(token.clone());
+
+		let mut run = std::pin::pin!(publisher.run_publish_namespaces());
+		for _ in 0..100 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, &token_bytes) >= 1 {
+				break;
+			}
+			settle().await;
+		}
+		assert_eq!(occurrences(&log, &token_bytes), 1, "the initial token rode the announce once");
+
+		// Setting the same value again wakes the loop but changes nothing, so no REQUEST_UPDATE.
+		token.set(Some(token_bytes.clone()));
+		for _ in 0..50 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			settle().await;
+		}
+		assert_eq!(
+			occurrences(&log, &token_bytes),
+			1,
+			"an unchanged token must not be re-presented"
+		);
 	}
 
 	/// Drive both announce loops at once against a peer that declared `solicit`,
