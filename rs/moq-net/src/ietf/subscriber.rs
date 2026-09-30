@@ -1814,11 +1814,15 @@ where
 			return;
 		}
 
-		// Subscribe only to what our grant covers (MoQ Auth), and cancel once it no longer
-		// does, leaving the rest of the session alone.
-		if !self
-			.auth
-			.allows(crate::auth::Direction::Subscribe, broadcast_path.as_str())
+		// A token-bearing client does not self-censor on its connection grant: a request token
+		// authorizes a subscribe the connection grant does not cover (MoQ request-token, quest
+		// Goal), and the server's covers-gate is the authority. Without a token this is unchanged:
+		// the connection grant filters, and its shrink revokes, as before.
+		let token_authorized = self.request_token.peek().is_some();
+		if !token_authorized
+			&& !self
+				.auth
+				.allows(crate::auth::Direction::Subscribe, broadcast_path.as_str())
 		{
 			request.reject(Error::Unauthorized);
 			return;
@@ -2086,7 +2090,7 @@ where
 					{
 						fetch_done = true;
 					}
-					if gate.poll_denied(waiter).is_ready() {
+					if !token_authorized && gate.poll_denied(waiter).is_ready() {
 						return Poll::Ready(End::Revoked);
 					}
 					if track.poll_unused(waiter).is_ready() {
@@ -4267,6 +4271,117 @@ mod tests {
 			drop(consumer);
 			serving.abort();
 		}
+	}
+
+	/// A token-bearing client does not self-censor on its connection grant (B1b, quest Goal): the
+	/// subscriber sends a SUBSCRIBE for a path its connection grant does not cover, carrying the
+	/// token; a token-less client with the same grant rejects it locally, as before.
+	#[tokio::test(start_paused = true)]
+	async fn a_token_bearing_client_subscribes_outside_its_connection_grant() {
+		const VERSION: Version = Version::Draft18;
+		let token = bytes::Bytes::from_static(&[0x03, 0x00, b'o', b'k']);
+
+		// A connection grant of "other", which does not cover "room/x". Held for the run.
+		fn seed_auth() -> (crate::auth::Handle, crate::auth::Token) {
+			let auth = crate::auth::Handle::new(true);
+			let cred = auth.present(bytes::Bytes::from_static(b"cred"), true).unwrap();
+			auth.granted(
+				0,
+				crate::auth::Grant {
+					publish: crate::Patterns::new(),
+					subscribe: crate::Pattern::subtree("other").unwrap().into(),
+					expires: None,
+				},
+			);
+			(auth, cred)
+		}
+		assert!(
+			!seed_auth().0.allows(crate::auth::Direction::Subscribe, "room/x"),
+			"the connection grant must not cover the subscribed path"
+		);
+
+		// With a token, the SUBSCRIBE for room/x reaches the wire carrying the token.
+		let session = crate::lite::test_transport::ScriptedSession::new(subscribe_ok_bytes(VERSION).await);
+		let log = session.log.clone();
+		let (tasks, _task_set) = crate::util::TaskSet::new();
+		let (auth, _cred) = seed_auth();
+		let mut subscriber = Subscriber::new(
+			crate::time::Clock::tokio(),
+			session,
+			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
+			Control::new(None, false),
+			None,
+			peer::PeerSetup::default(),
+			crate::Hop::new(1).unwrap(),
+			None,
+			VERSION,
+			tasks,
+			Default::default(),
+		)
+		.with_auth(auth)
+		.with_request_token(crate::RequestToken::new(Some(token.clone())));
+		let producer = crate::broadcast::Info::default().produce();
+		let mut dynamic = producer.dynamic();
+		let consumer = producer.consume();
+		let track = consumer.track("video").unwrap();
+		let subscription = track.subscribe(None);
+		let request = dynamic.requested_track().await.expect("no track requested");
+		let serving = tokio::spawn(async move {
+			subscriber.run_subscribe(Path::new("room/x"), dynamic, request).await;
+		});
+		let mut sent = false;
+		for _ in 0..200 {
+			if occurrences(&log, &token) >= 1 {
+				sent = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(sent, "a token-bearing client must subscribe outside its connection grant");
+		drop(subscription);
+		drop(track);
+		drop(consumer);
+		serving.abort();
+
+		// Without a token, the same grant rejects the subscribe locally: no SUBSCRIBE is sent.
+		let session2 = crate::lite::test_transport::ScriptedSession::new(subscribe_ok_bytes(VERSION).await);
+		let log2 = session2.log.clone();
+		let (tasks2, _task_set2) = crate::util::TaskSet::new();
+		let (auth2, _cred2) = seed_auth();
+		let mut subscriber2 = Subscriber::new(
+			crate::time::Clock::tokio(),
+			session2,
+			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
+			Control::new(None, false),
+			None,
+			peer::PeerSetup::default(),
+			crate::Hop::new(1).unwrap(),
+			None,
+			VERSION,
+			tasks2,
+			Default::default(),
+		)
+		.with_auth(auth2);
+		let producer2 = crate::broadcast::Info::default().produce();
+		let mut dynamic2 = producer2.dynamic();
+		let consumer2 = producer2.consume();
+		let track2 = consumer2.track("video").unwrap();
+		let subscription2 = track2.subscribe(None);
+		let request2 = dynamic2.requested_track().await.expect("no track requested");
+		let serving2 = tokio::spawn(async move {
+			subscriber2.run_subscribe(Path::new("room/x"), dynamic2, request2).await;
+		});
+		for _ in 0..80 {
+			settle().await;
+		}
+		assert!(
+			!control_message_types(&log2, VERSION).contains(&ietf::Subscribe::ID),
+			"a token-less client rejects a subscribe outside its grant locally"
+		);
+		drop(subscription2);
+		drop(track2);
+		drop(consumer2);
+		serving2.abort();
 	}
 
 	fn control_message_types(log: &crate::lite::test_transport::Log, version: Version) -> Vec<u64> {

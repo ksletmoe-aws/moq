@@ -1665,7 +1665,11 @@ where
 		suffix: &crate::PathOwned,
 		path: &crate::PathOwned,
 	) -> Result<(), Error> {
-		let permitted = ns.permitted(path);
+		// A token-bearing client does not self-censor on its connection grant: a request token
+		// authorizes an announce the connection grant does not cover (MoQ request-token, quest
+		// Goal), and the server's covers-gate is the authority, refusing a bad token per request.
+		// Without a token this is unchanged: the connection grant filters as before.
+		let permitted = self.request_token.peek().is_some() || ns.permitted(path);
 		let Namespaces {
 			peer,
 			target,
@@ -3276,6 +3280,88 @@ mod serve_tests {
 		(auth, requests, cred)
 	}
 
+	/// A token-bearing client does not self-censor on its connection grant (B1a, quest Goal): the
+	/// publisher advertises a namespace its connection grant does not cover, carrying the token,
+	/// and the server's covers-gate is left to be the authority. A token-less client with the same
+	/// grant filters that announce, as before.
+	#[tokio::test]
+	async fn a_token_bearing_client_announces_outside_its_connection_grant() {
+		const VERSION: Version = Version::Draft18;
+		let token = bytes::Bytes::from_static(&[0x03, 0x00, b'o', b'k']);
+
+		// A connection grant of "other", which does not cover "cam". The presented credential and
+		// its grant are held for the run's lifetime, else the union reverts to permissive.
+		fn seed_auth() -> (crate::auth::Handle, crate::auth::Token) {
+			let auth = crate::auth::Handle::new(true);
+			let cred = auth.present(bytes::Bytes::from_static(b"cred"), true).unwrap();
+			auth.granted(
+				0,
+				crate::auth::Grant {
+					publish: crate::Pattern::subtree("other").unwrap().into(),
+					subscribe: crate::Patterns::new(),
+					expires: None,
+				},
+			);
+			(auth, cred)
+		}
+
+		// With a token, "cam" is advertised despite the grant not covering it (the token rides it).
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![Vec::new()]);
+		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
+		let (auth, _cred) = seed_auth();
+		let publisher = Publisher::new(
+			crate::time::Clock::tokio(),
+			session,
+			origin.consume(),
+			Control::new(None, false),
+			None,
+			peer_setup,
+			VERSION,
+		)
+		.with_auth(auth)
+		.with_request_token(crate::RequestToken::new(Some(token.clone())));
+		let mut run = std::pin::pin!(publisher.run_publish_namespaces());
+		let mut advertised = false;
+		for _ in 0..200 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, &token) >= 1 {
+				advertised = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(advertised, "a token-bearing client must announce outside its connection grant");
+
+		// Without a token, the same grant filters "cam": nothing is advertised.
+		let origin2 = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam2 = origin2.announce("cam", crate::origin::Route::default()).unwrap();
+		let session2 = crate::lite::test_transport::ScriptedSession::per_stream(vec![Vec::new()]);
+		let log2 = session2.log.clone();
+		let peer_setup2 = peer::PeerSetup::default();
+		peer_setup2.set(peer::Peer::default());
+		let (auth2, _cred2) = seed_auth();
+		let publisher2 = Publisher::new(
+			crate::time::Clock::tokio(),
+			session2,
+			origin2.consume(),
+			Control::new(None, false),
+			None,
+			peer_setup2,
+			VERSION,
+		)
+		.with_auth(auth2);
+		let mut run2 = std::pin::pin!(publisher2.run_publish_namespaces());
+		for _ in 0..80 {
+			assert!(futures::poll!(run2.as_mut()).is_pending());
+			settle().await;
+		}
+		assert_eq!(occurrences(&log2, b"cam"), 0, "a token-less client self-censors on its grant");
+	}
+
 	/// A Token structure value that decodes via `token::decode_value` (USE_VALUE, kind 300).
 	fn request_token() -> bytes::Bytes {
 		bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xff])
@@ -3369,6 +3455,70 @@ mod serve_tests {
 
 		// Past the original 60s expiry: the renewal re-armed the deadline, so the
 		// subscription lives on.
+		tokio::time::advance(Duration::from_secs(120)).await;
+		for _ in 0..50 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"the renewal did not extend the subscription past the old expiry"
+			);
+			settle().await;
+		}
+	}
+
+	/// The draft-14 mirror of the d18 renewal test (B2): a SUBSCRIBE_UPDATE carrying a fresh token
+	/// renews a token-authorized subscription past the old grant's expiry at draft-14, where the
+	/// update rides the control-stream adapter. This exercises `run_subscribe_stream`'s d14 decode
+	/// and renew; the adapter's follow-up routing to the subscription's stream is proven by
+	/// `super::super::adapter::tests::test_classify_subscribe_update_followup`.
+	#[tokio::test(start_paused = true)]
+	async fn a_subscribe_update_renews_at_draft_14() {
+		const VERSION: Version = Version::Draft14;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		let h = serve_with_auth(VERSION, auth, subscribe_update_with_token(VERSION).await);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let answered = std::sync::Arc::new(AtomicU64::new(0));
+		let acceptor = {
+			let answered = answered.clone();
+			async move {
+				let mut held = Vec::new();
+				let first = requests.next().await.unwrap();
+				held.push(first.accept(grant_all_expiring(&rt, Some(60))));
+				answered.fetch_add(1, Ordering::Relaxed);
+				let renewal = requests.next().await.unwrap();
+				held.push(renewal.accept(grant_all_expiring(&rt, None)));
+				answered.fetch_add(1, Ordering::Relaxed);
+				std::future::pending::<()>().await
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending(), "subscription ended during setup");
+			if answered.load(Ordering::Relaxed) >= 2 {
+				break;
+			}
+			settle().await;
+		}
+		assert_eq!(answered.load(Ordering::Relaxed), 2, "acceptor never answered both tokens");
+
+		for _ in 0..20 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending());
+			settle().await;
+		}
+
 		tokio::time::advance(Duration::from_secs(120)).await;
 		for _ in 0..50 {
 			let _ = futures::poll!(acceptor.as_mut());

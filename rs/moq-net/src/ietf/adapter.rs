@@ -981,9 +981,10 @@ fn classify(type_id: u64, body: &Bytes, version: Version, namespaces: &Namespace
 			_ => Err(Error::UnexpectedMessage),
 		},
 
-		// Follow-up messages: route to existing stream
+		// Follow-up messages: route to existing stream. A SUBSCRIBE_UPDATE targets the
+		// subscription by its Subscribe Request ID (the second field), not the update's own.
 		ietf::SubscribeUpdate::ID => {
-			let id = decode_request_id(body, version)?;
+			let id = decode_subscribe_update_request_id(body, version)?;
 			Ok(Route::FollowUp(id))
 		}
 
@@ -1188,6 +1189,19 @@ fn decode_response_request_id(body: &Bytes, version: Version) -> Result<RequestI
 	decode_request_id(body, version)
 }
 
+/// The subscription a SUBSCRIBE_UPDATE targets, for follow-up routing.
+///
+/// At draft-14/15/16 a SUBSCRIBE_UPDATE carries its own Request ID first and the subscription's
+/// Request ID (Subscribe Request ID) second, so the follow-up must route to the subscription's
+/// stream by the second id, not the update's own first id, or a renewal (a fresh token on
+/// REQUEST_UPDATE) never reaches the subscription it renews.
+fn decode_subscribe_update_request_id(body: &Bytes, version: Version) -> Result<RequestId, Error> {
+	let mut cursor = std::io::Cursor::new(body);
+	let _update_request_id = RequestId::decode(&mut cursor, version)?;
+	let subscription_request_id = RequestId::decode(&mut cursor, version)?;
+	Ok(subscription_request_id)
+}
+
 /// Decode the namespace from a PublishNamespace message body (after the request_id).
 fn decode_publish_namespace_body(body: &Bytes, version: Version) -> Result<PathOwned, Error> {
 	let mut cursor = std::io::Cursor::new(body);
@@ -1275,7 +1289,13 @@ mod tests {
 
 	#[test]
 	fn test_classify_subscribe_update_followup() {
-		let body = make_body_with_request_id(10, Version::Draft15);
+		use crate::coding::Encode;
+		// A SUBSCRIBE_UPDATE carries its own Request ID (7) first and the subscription's
+		// Request ID (10) second; the follow-up must route to the subscription (10).
+		let mut buf = BytesMut::new();
+		RequestId(7).encode(&mut buf, Version::Draft15).unwrap();
+		RequestId(10).encode(&mut buf, Version::Draft15).unwrap();
+		let body = buf.freeze();
 		let route = classify_msg(Version::Draft15, ietf::SubscribeUpdate::ID, &body).unwrap();
 		assert!(matches!(route, Route::FollowUp(RequestId(10))));
 	}
