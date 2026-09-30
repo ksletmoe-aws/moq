@@ -534,20 +534,16 @@ where
 			// its grant instead ends with the request when `_request_grant` drops.
 			let mut gate = None;
 			let mut request_grant = None;
-			if self
-				.auth
-				.allows(crate::auth::Direction::Publish, msg.track_namespace.as_str())
+			// A request presenting a token is authorized by it whenever the session union does
+			// not positively cover the path. `covers` treats a `None` union (no answer yet, or a
+			// session without the AUTH extension) as NOT covering, so a standard peer's token is
+			// verified rather than admitted by the permissive default. A token-less request keeps
+			// the permissive `allows` default unchanged.
+			if let Some(token) = &msg.authorization_token
+				&& !self
+					.auth
+					.covers(crate::auth::Direction::Publish, msg.track_namespace.as_str())
 			{
-				gate = Some(crate::auth::Gate::new(
-					self.auth.clone(),
-					msg.track_namespace.to_owned(),
-					crate::auth::Direction::Publish,
-				));
-			} else {
-				let Some(token) = &msg.authorization_token else {
-					let err = Error::Unauthorized;
-					return self.reject_subscribe(stream, request_id, &err, "not granted").await;
-				};
 				// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol violation
 				// and closes the session exactly as on the SETUP path; a merely-undecodable
 				// structure is refused per request without tearing down the connection.
@@ -589,6 +585,18 @@ where
 						return self.reject_subscribe(stream, request_id, &err, &err.to_string()).await;
 					}
 				}
+			} else if self
+				.auth
+				.allows(crate::auth::Direction::Publish, msg.track_namespace.as_str())
+			{
+				gate = Some(crate::auth::Gate::new(
+					self.auth.clone(),
+					msg.track_namespace.to_owned(),
+					crate::auth::Direction::Publish,
+				));
+			} else {
+				let err = Error::Unauthorized;
+				return self.reject_subscribe(stream, request_id, &err, "not granted").await;
 			}
 
 			// Stats (subscriptions, viewer refcount, groups/frames/bytes) are counted in
@@ -3443,6 +3451,53 @@ mod serve_tests {
 		}
 		let res = ended.expect("serving must end at the old deadline, not stall on the slow renewal");
 		assert!(matches!(res, Err(Error::Unauthorized)), "{res:?}");
+	}
+
+	/// Publisher / SUBSCRIBE side: on a session without the AUTH extension the union is
+	/// `None` forever, so `allows` is permissive; a token-bearing SUBSCRIBE must still be
+	/// verified via `covers`, not admitted by that default. The acceptor is consulted; with the
+	/// bug the token path was bypassed and the token silently ignored.
+	#[tokio::test]
+	async fn a_request_token_on_a_no_auth_session_is_verified() {
+		const VERSION: Version = Version::Draft18;
+		let auth = crate::auth::Handle::new(false);
+		let mut requests = auth.requests().unwrap();
+		assert!(auth.allows(crate::auth::Direction::Publish, "room"), "None union is permissive");
+		assert!(!auth.covers(crate::auth::Direction::Publish, "room"), "None union does not cover");
+
+		let h = serve_with_auth(VERSION, auth, Vec::new());
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+		let consulted = std::sync::Arc::new(AtomicU64::new(0));
+		let acceptor = {
+			let consulted = consulted.clone();
+			async move {
+				let mut held = Vec::new();
+				loop {
+					let request = requests.next().await.expect("a request");
+					consulted.fetch_add(1, Ordering::Relaxed);
+					held.push(request.accept(crate::auth::Grant::all()));
+				}
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending(), "the subscription ended early");
+			if consulted.load(Ordering::Relaxed) >= 1 {
+				break;
+			}
+			settle().await;
+		}
+		assert!(
+			consulted.load(Ordering::Relaxed) >= 1,
+			"the token must be verified by the acceptor, not admitted by the permissive default"
+		);
 	}
 
 	/// A distinctive request id, so `[FetchHeader::TYPE, REQUEST_ID]` is a usable needle.

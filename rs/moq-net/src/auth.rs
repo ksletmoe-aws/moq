@@ -535,6 +535,18 @@ impl Handle {
 		limit.is_none_or(|limit| limit.matches(path))
 	}
 
+	/// Whether the union positively covers `path` right now. Unlike [`allows`](Self::allows), a
+	/// union that is still `None` (no answer yet, or a version without AUTH) does NOT cover: a
+	/// request presenting a token is verified by it rather than admitted by the permissive
+	/// default. Only the token-bearing path uses this; the token-less path keeps `allows`.
+	pub(crate) fn covers(&self, direction: Direction, path: &str) -> bool {
+		let state = self.state.read();
+		state
+			.union
+			.as_ref()
+			.is_some_and(|union| union.patterns(direction).matches(path))
+	}
+
 	/// The peer turned out not to negotiate AUTH: fail every token as unsupported and
 	/// close the requests, leaving the union unknown.
 	pub(crate) fn unsupported(&self) {

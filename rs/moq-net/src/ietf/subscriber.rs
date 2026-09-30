@@ -1058,7 +1058,7 @@ where
 		// did before.
 		let mut token_grant = None;
 		if let Some(token) = &msg.authorization_token
-			&& !self.auth.allows(crate::auth::Direction::Subscribe, path.as_str())
+			&& !self.auth.covers(crate::auth::Direction::Subscribe, path.as_str())
 		{
 			// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol violation
 			// and closes the session exactly as on the SETUP path; a merely-undecodable
@@ -5025,6 +5025,165 @@ mod tests {
 			Some(crate::SessionError::ProtocolViolation.to_code()),
 			"the session must close with PROTOCOL_VIOLATION"
 		);
+	}
+
+	/// Like [`auth_announce_harness`] but the session never negotiated the MoQ Auth extension,
+	/// so its union is `None` forever: `allows` is permissive, `covers` is not. No credential
+	/// is presented; the acceptor answers request tokens regardless.
+	fn auth_announce_harness_no_ext(
+		version: Version,
+	) -> (
+		Subscriber<crate::lite::test_transport::ScriptedSession>,
+		crate::auth::Requests,
+		origin::Consumer,
+		crate::lite::test_transport::ScriptedSession,
+	) {
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let consumer = origin.consume();
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![Vec::new()]);
+		let (tasks, task_set) = crate::util::TaskSet::new();
+		std::mem::forget(task_set);
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
+
+		let auth = crate::auth::Handle::new(false);
+		let requests = auth.requests().unwrap();
+		assert!(
+			auth.allows(crate::auth::Direction::Subscribe, "room/alice"),
+			"a None union is permissive for allows"
+		);
+		assert!(
+			!auth.covers(crate::auth::Direction::Subscribe, "room/alice"),
+			"a None union does not cover"
+		);
+
+		let subscriber = Subscriber::new(
+			crate::time::Clock::tokio(),
+			session.clone(),
+			origin,
+			Control::new(None, false),
+			None,
+			peer_setup,
+			crate::Hop::new(1).unwrap(),
+			None,
+			version,
+			tasks,
+			Default::default(),
+		)
+		.with_auth(auth);
+
+		(subscriber, requests, consumer, session)
+	}
+
+	/// On a session without the AUTH extension the union is `None` forever, so `allows` is
+	/// permissive; a token-bearing PUBLISH_NAMESPACE must still be verified (`covers`), not
+	/// admitted by that default. Admitted on a covering grant; refused UNAUTHORIZED (not
+	/// admitted) on refusal. This is the standard moq-transport peer shape the quest targets.
+	#[tokio::test]
+	async fn a_request_token_on_a_no_auth_session_is_verified() {
+		const VERSION: Version = Version::Draft18;
+
+		// Accepted: the acceptor is consulted (proving the token path, not the permissive
+		// default, which the origin model would also route) and its grant admits the announce.
+		{
+			let (mut subscriber, mut requests, consumer, session) = auth_announce_harness_no_ext(VERSION);
+			let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+			let consulted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+			let acceptor = {
+				let consulted = consulted.clone();
+				async move {
+					let mut held = Vec::new();
+					loop {
+						let request = requests.next().await.expect("a request reaches the acceptor");
+						consulted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+						held.push(request.accept(crate::auth::Grant::all()));
+					}
+				}
+			};
+			let mut acceptor = std::pin::pin!(acceptor);
+			let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+				stream,
+				token_publish_namespace(),
+				cluster::Peer::default(),
+				None,
+			));
+			let mut routed = false;
+			for _ in 0..500 {
+				let _ = futures::poll!(acceptor.as_mut());
+				assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended during setup");
+				if routed_now(&consumer, "room/alice").is_some() {
+					routed = true;
+					break;
+				}
+				settle().await;
+			}
+			assert!(routed, "a token on a no-auth session must be verified and admitted, not ignored");
+			assert!(
+				consulted.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+				"the token must reach the acceptor, not be admitted by the permissive default"
+			);
+		}
+
+		// Refused: not admitted by the permissive default.
+		{
+			let (mut subscriber, mut requests, consumer, session) = auth_announce_harness_no_ext(VERSION);
+			let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+			let acceptor = async move {
+				let request = requests.next().await.expect("a request reaches the acceptor");
+				request.reject(crate::SessionError::Unauthorized, "no");
+				std::future::pending::<()>().await
+			};
+			let mut acceptor = std::pin::pin!(acceptor);
+			let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+				stream,
+				token_publish_namespace(),
+				cluster::Peer::default(),
+				None,
+			));
+			let mut ended = false;
+			for _ in 0..500 {
+				let _ = futures::poll!(acceptor.as_mut());
+				if futures::poll!(run.as_mut()).is_ready() {
+					ended = true;
+					break;
+				}
+				settle().await;
+			}
+			assert!(ended, "a refused token ends the announce");
+			assert!(
+				routed_now(&consumer, "room/alice").is_none(),
+				"a refused token must not be admitted by the permissive default"
+			);
+		}
+	}
+
+	/// The additive constraint: a token-LESS PUBLISH_NAMESPACE on a no-auth session (None union)
+	/// is admitted by the origin model exactly as before; the token path is never entered.
+	#[tokio::test]
+	async fn a_token_less_request_on_a_no_auth_session_is_unchanged() {
+		const VERSION: Version = Version::Draft18;
+		let (mut subscriber, _requests, consumer, session) = auth_announce_harness_no_ext(VERSION);
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		let mut msg = token_publish_namespace();
+		msg.authorization_token = None;
+
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+			stream,
+			msg,
+			cluster::Peer::default(),
+			None,
+		));
+		let mut routed = false;
+		for _ in 0..500 {
+			assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended early");
+			if routed_now(&consumer, "room/alice").is_some() {
+				routed = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(routed, "a token-less announce is admitted by the origin model as before");
 	}
 
 	/// NAMESPACE has no REQUEST_UPDATE, so a peer reprices one by re-sending it on the
