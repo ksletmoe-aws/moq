@@ -164,6 +164,8 @@ struct Options {
 	server_subscribe: Option<origin::Producer>,
 	/// Take the server's AUTH requests before its driver runs.
 	server_requests: bool,
+	/// A request token the client attaches to its outgoing PUBLISH_NAMESPACE / SUBSCRIBE.
+	client_request_token: Option<Vec<u8>>,
 	version: Option<&'static str>,
 }
 
@@ -187,6 +189,9 @@ async fn connect(opts: Options) -> Pair {
 	}
 	if let Some(subscribe) = opts.client_subscribe {
 		client = client.with_subscriber(subscribe);
+	}
+	if let Some(token) = opts.client_request_token {
+		client = client.with_request_token(token);
 	}
 
 	let mut server = Server::new().with_versions(version.into());
@@ -329,6 +334,55 @@ async fn an_out_of_scope_announce_aborts_with_the_path(version: &'static str) {
 		let (code, reason) = pair.client_transport.close_reason().expect("closed");
 		assert_eq!(code, SessionError::Unauthorized.to_code());
 		assert_eq!(reason, "unauthorized: foo/bar");
+	})
+	.await
+	.expect("timed out");
+}
+
+/// A request token on a PUBLISH_NAMESPACE authorizes the announce on a session that never
+/// negotiated the MoQ Auth extension (draft-14), the standard moq-transport peer shape, when the
+/// token reaches the acceptor THROUGH THE DRIVER rather than an inline `verify_request`.
+///
+/// This exercises `ietf::start`'s legacy (draft 14-16) branch. That branch built its
+/// Subscriber without `.with_auth(auth)`, so the driver's subscriber consulted a fresh
+/// default `Handle` instead of the session handle the `requests()` acceptor was installed on:
+/// `verify_request` found no `App` acceptor and refused the announce `NOT_SUPPORTED`, and the
+/// announce never reached the server origin. The modern (17+) branch already wired
+/// `.with_auth`, so only the legacy / no-extension path was affected, and the unit tests
+/// missed it by constructing the Subscriber with `.with_auth` by hand.
+#[tokio::test]
+async fn a_request_token_authorizes_a_legacy_announce_through_the_driver() {
+	within(async {
+		let publisher = produce_origin(2);
+		let relay = produce_origin(1);
+		let mut pair = connect(Options {
+			version: Some("moq-transport-14"),
+			client_publish: Some(publisher.clone()),
+			// USE_VALUE (0x03), token kind 0, value "ok": a decodable request token the
+			// acceptor answers unconditionally below.
+			client_request_token: Some(vec![0x03, 0x00, b'o', b'k']),
+			server_subscribe: Some(relay.scope("", &patterns(&["room/alice"])).unwrap()),
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+
+		// The server answers the request token from its acceptor with a grant covering the
+		// announced path. Held for the test by the returned receiver.
+		let requests = pair.requests.take().expect("server took its requests pre-ok");
+		let mut answered = serve(requests, |_token| Some(grant(&["room/alice"], &["room/alice"])));
+
+		// The client announces under the token. On the legacy path there is no session grant,
+		// so the token is the only authorization for the announce.
+		let bc = publisher.create_broadcast("room/alice").unwrap();
+		bc.announce(Default::default()).unwrap();
+
+		// Mechanism: the token reached the acceptor over the driver (not admitted by a
+		// permissive default, and not refused NOT_SUPPORTED by a disconnected handle).
+		let (_token, _issued) = answered.recv().await.expect("the token reached the acceptor");
+
+		// End to end: the verified announce reached the server's subscribe origin.
+		wait_announced(&relay.consume(), "room/alice", true).await;
 	})
 	.await
 	.expect("timed out");
@@ -697,6 +751,7 @@ async fn a_revoked_grant_cancels_its_subscriptions(version: &'static str) {
 			server_publish: Some(server_origin.clone()),
 			server_subscribe: Some(server_origin.clone()),
 			server_requests: true,
+			client_request_token: None,
 		})
 		.await;
 		let mut issued = serve(pair.requests.take().unwrap(), |token| {
