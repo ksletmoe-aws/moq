@@ -4918,7 +4918,13 @@ mod tests {
 	#[tokio::test]
 	async fn a_configured_request_token_rides_the_publish_namespace() {
 		let token = bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xfe, 0xed]);
-		for version in [Version::Draft14, Version::Draft18] {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
 			let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 			let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
 			settle().await;

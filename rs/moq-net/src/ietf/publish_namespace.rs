@@ -449,7 +449,13 @@ mod tests {
 	#[test]
 	fn authorization_token_round_trips_legacy_and_strict() {
 		let token = bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xff]);
-		for version in [Version::Draft14, Version::Draft18] {
+		for version in [
+			Version::Draft14,
+			Version::Draft15,
+			Version::Draft16,
+			Version::Draft17,
+			Version::Draft18,
+		] {
 			let msg = PublishNamespace {
 				request_id: RequestId(1),
 				track_namespace: Path::new("room/alice"),
