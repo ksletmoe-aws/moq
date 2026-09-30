@@ -223,6 +223,15 @@ impl Client {
 		self
 	}
 
+	/// Present an `AUTHORIZATION TOKEN` on this client's own requests (SUBSCRIBE /
+	/// PUBLISH_NAMESPACE and their REQUEST_UPDATEs), so a request the session grant does not
+	/// cover is authorized the standard draft-17+ way (MoQ request-token); see
+	/// [`moq_net::Client::with_request_token`].
+	pub fn with_request_token(mut self, token: impl Into<bytes::Bytes>) -> Self {
+		self.moq = self.moq.with_request_token(token);
+		self
+	}
+
 	/// Override whether this client redials after a session drop.
 	///
 	/// Defaults to true, unless [`crate::connect::Config::once`] turned it off.
@@ -669,6 +678,16 @@ async fn connect_session<S: moq_net::transport::poll::Boxable>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Compile-level check that the moq-tokio client exposes `with_request_token` and chains
+	/// (returns `Self`), delegating to `moq_net::Client`. The token's wire round-trip is proven
+	/// at the moq-net layer (`a_configured_request_token_rides_the_publish_namespace`); moq-tokio
+	/// has no in-process wire harness to re-run it here, and building a `Client` needs a
+	/// transport feature, so this is a builder-signature check rather than a live send.
+	#[allow(dead_code)]
+	fn with_request_token_chains(client: Client) -> Client {
+		client.with_request_token(bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xff]))
+	}
 
 	#[cfg(feature = "noq")]
 	#[tokio::test]
