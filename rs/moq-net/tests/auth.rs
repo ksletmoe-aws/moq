@@ -170,6 +170,8 @@ struct Options {
 	client_request_token: Option<Vec<u8>>,
 	/// The client declines the MoQ Auth extension (`Client::without_auth_extension`).
 	client_decline_auth: bool,
+	/// The server declines the MoQ Solicit extension (`Server::without_solicit`).
+	server_decline_solicit: bool,
 	version: Option<&'static str>,
 }
 
@@ -202,6 +204,9 @@ async fn connect(opts: Options) -> Pair {
 	}
 
 	let mut server = Server::new().with_versions(version.into());
+	if opts.server_decline_solicit {
+		server = server.without_solicit();
+	}
 	if let Some(publish) = &opts.server_publish {
 		server = server.with_publisher(publish);
 	}
@@ -465,6 +470,84 @@ async fn a_client_may_decline_the_auth_extension() {
 		bc.announce(Default::default()).unwrap();
 		wait_announced(&bare_relay.consume(), "room/bob", true).await;
 		assert_eq!(bare.client_transport.close_reason(), None);
+	})
+	.await
+	.expect("timed out");
+}
+
+/// A server may decline the MoQ Solicit extension, so a peer sends an unsolicited
+/// PUBLISH_NAMESPACE (the base moq-transport behavior) instead of answering our
+/// SUBSCRIBE_NAMESPACE inline. Only the unsolicited PUBLISH_NAMESPACE carries an
+/// `AUTHORIZATION TOKEN`; the inline `Namespace` entry has no parameter slot for one. So a
+/// request-borne token on an announce reaches the acceptor exactly when the server does not
+/// solicit, which is the shape a standard moq-transport peer (an encoder or CDN) always sends.
+///
+/// This runs at draft-18 (the deployed floor) in the launch shape: the client also declines
+/// the AUTH extension, so the session's union is `None`, the covers-gate does not short-circuit
+/// on a connection grant, and the request token is the authorizing artifact. The
+/// control half shows the default: with Solicit declared the client answers inline, no token
+/// reaches the acceptor, and the announce is admitted by the permissive default of the
+/// ungranted session.
+#[tokio::test]
+async fn a_server_that_declines_solicit_gets_a_token_bearing_unsolicited_announce() {
+	within(async {
+		// USE_VALUE (0x03), token kind 0, value "ok".
+		let request_token = vec![0x03, 0x00, b'o', b'k'];
+
+		// Server declines Solicit: the client sends an unsolicited PUBLISH_NAMESPACE carrying
+		// the token, which reaches the acceptor as a PublishNamespace request.
+		let publisher = produce_origin(1);
+		let relay = produce_origin(2);
+		let mut pair = connect(Options {
+			version: Some(MOQT_18),
+			client_publish: Some(publisher.clone()),
+			client_request_token: Some(request_token.clone()),
+			client_decline_auth: true,
+			server_subscribe: Some(relay.clone()),
+			server_decline_solicit: true,
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+		let bc = publisher.create_broadcast("room/alice").unwrap();
+		bc.announce(Default::default()).unwrap();
+
+		let requests = pair.requests.take().expect("server took its requests pre-ok");
+		let mut answered = serve(requests, |_token| Some(grant(&["room/alice"], &["room/alice"])));
+		// The announce is admitted once the token is granted.
+		wait_announced(&relay.consume(), "room/alice", true).await;
+		let (tok, _issued) = answered
+			.recv()
+			.await
+			.expect("the unsolicited PUBLISH_NAMESPACE carried the token to the acceptor");
+		assert_eq!(tok, b"ok", "the acceptor saw the request token's decoded value");
+
+		// Control: with Solicit declared (the default) the same client answers our
+		// SUBSCRIBE_NAMESPACE inline with a Namespace, which carries no token, so nothing
+		// reaches the acceptor. The announce is still admitted by the permissive default.
+		let publisher = produce_origin(3);
+		let relay = produce_origin(4);
+		let mut pair = connect(Options {
+			version: Some(MOQT_18),
+			client_publish: Some(publisher.clone()),
+			client_request_token: Some(request_token.clone()),
+			client_decline_auth: true,
+			server_subscribe: Some(relay.clone()),
+			// server_decline_solicit defaults false: the server declares Solicit.
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+		let bc = publisher.create_broadcast("room/carol").unwrap();
+		bc.announce(Default::default()).unwrap();
+
+		let requests = pair.requests.take().expect("server took its requests pre-ok");
+		let mut answered = serve(requests, |_token| Some(grant(&["room/carol"], &[])));
+		wait_announced(&relay.consume(), "room/carol", true).await;
+		assert!(
+			answered.try_recv().is_err(),
+			"a solicited (inline) announce carries no token, so the acceptor is never consulted"
+		);
 	})
 	.await
 	.expect("timed out");

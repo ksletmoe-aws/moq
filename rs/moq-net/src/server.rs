@@ -20,6 +20,7 @@ pub struct Server {
 	subscribe: Option<origin::Producer>,
 	stats: stats::Session,
 	versions: Versions,
+	decline_solicit: bool,
 }
 
 impl Server {
@@ -62,6 +63,21 @@ impl Server {
 	/// Defaults to every version this crate supports.
 	pub fn with_versions(mut self, versions: Versions) -> Self {
 		self.versions = versions;
+		self
+	}
+
+	/// Do not require solicited announcements: omit the MoQ Solicit Setup Option from this
+	/// server's SETUP.
+	///
+	/// By default a server declares MoQ Solicit, so a peer that speaks the extension answers
+	/// our SUBSCRIBE_NAMESPACE inline rather than sending an unsolicited PUBLISH_NAMESPACE.
+	/// Declining it makes such a peer fall back to the base moq-transport behavior and send an
+	/// unsolicited PUBLISH_NAMESPACE. Use for peers that do not speak the MoQ Solicit extension
+	/// (a standard moq-transport encoder or CDN), which never solicit and always announce
+	/// unasked; the server already accepts an unsolicited PUBLISH_NAMESPACE either way. Additive:
+	/// the default still declares the extension.
+	pub fn without_solicit(mut self) -> Self {
+		self.decline_solicit = true;
 		self
 	}
 
@@ -566,6 +582,8 @@ where
 				peer_declared: Some(peer_setup.declared),
 				auth: auth.clone(),
 				request_token: crate::RequestToken::default(),
+				// Declare MoQ Solicit unless the server declined it.
+				solicit: !server.decline_solicit,
 			})?;
 			tracing::debug!(?version, "connected");
 			Ok(Session::new(
@@ -628,7 +646,10 @@ where
 					let mut parameters = ietf::Parameters::default();
 					parameters.set_varint(ietf::ParameterVarInt::MaxRequestId, u32::MAX as u64);
 					parameters.set_bytes(ietf::ParameterBytes::Implementation, b"moq-lite-rs".to_vec());
-					ietf::solicit::into_setup(&mut parameters, v);
+					// Declare MoQ Solicit unless the server declined it.
+					if !server.decline_solicit {
+						ietf::solicit::into_setup(&mut parameters, v);
+					}
 					ietf::hidden::into_setup(&mut parameters, v);
 					parameters.encode_bytes(v)?
 				}
@@ -685,6 +706,9 @@ where
 						peer_declared: Some(peer_declared),
 						auth: auth.clone(),
 						request_token: crate::RequestToken::default(),
+						// The legacy server already declared Solicit (or not) in its SETUP above;
+						// this arm sends no further SETUP, so the flag is inert here.
+						solicit: !server.decline_solicit,
 					})?;
 					(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 				}

@@ -438,13 +438,24 @@ impl Server {
 	/// than the values it returns.
 	///
 	/// Empty when no TLS-bearing backend is configured (e.g. a stream-only server).
-	pub fn certificates(&self) -> crate::tls::Certificates {
-		#[cfg(feature = "noq")]
+	pub fn certificates(&self) -> crate::tls::Certificates {		#[cfg(feature = "noq")]
 		if let Some(noq) = self.noq.as_ref() {
 			return noq.certificates();
 		}
 		// No QUIC backend (e.g. a stream-only `--listen-tcp-bind`): no certificates.
 		crate::tls::Certificates::empty()
+	}
+
+	/// Do not require solicited announcements: omit the MoQ Solicit Setup Option from every
+	/// session this server accepts; see [`moq_net::Server::without_solicit`].
+	///
+	/// A peer that speaks the extension then sends an unsolicited PUBLISH_NAMESPACE (the base
+	/// moq-transport behavior) instead of answering our SUBSCRIBE_NAMESPACE inline. Use for
+	/// peers that do not speak MoQ Solicit (a standard moq-transport encoder or CDN). Additive:
+	/// the default still declares the extension.
+	pub fn without_solicit(mut self) -> Self {
+		self.moq = self.moq.without_solicit();
+		self
 	}
 
 	/// Clone this server's QUIC endpoint, keeping its socket in the reuseport

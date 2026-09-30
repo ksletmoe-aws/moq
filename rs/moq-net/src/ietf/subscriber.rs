@@ -444,6 +444,11 @@ pub(super) struct Subscriber<S: crate::transport::poll::Session> {
 	// REQUEST_UPDATEs (MoQ request-token). A shared handle so a client can replace it while the
 	// session runs; the default presents none. A client credential.
 	request_token: crate::RequestToken,
+	// Whether we declared MoQ Solicit in our SETUP (`solicit::into_setup`). True by default;
+	// a server built with `Server::without_solicit` sets it false. It gates whether an
+	// unsolicited PUBLISH_NAMESPACE from a solicit-aware peer is a violation: only a peer that
+	// disregarded a requirement we actually stated is at fault.
+	declared_solicit: bool,
 }
 
 /// Resolve the subscription a data stream belongs to.
@@ -512,6 +517,8 @@ where
 			going_away,
 			auth: crate::auth::Handle::new(false),
 			request_token: crate::RequestToken::default(),
+			// We declare MoQ Solicit by default; `with_solicit(false)` opts out.
+			declared_solicit: true,
 		}
 	}
 
@@ -572,6 +579,15 @@ where
 			// which is what makes run_route exit, as does a limit holding it back.
 			this.run_route(path, generation).await;
 		});
+	}
+
+	/// Whether we declared MoQ Solicit in our SETUP. A server built with
+	/// [`Server::without_solicit`](crate::Server::without_solicit) passes false, so an
+	/// unsolicited PUBLISH_NAMESPACE from a solicit-aware peer is expected rather than a
+	/// violation.
+	pub fn with_solicit(mut self, declared: bool) -> Self {
+		self.declared_solicit = declared;
+		self
 	}
 
 	/// Present this request token (the AUTHORIZATION TOKEN parameter value) on the SUBSCRIBE
@@ -1016,6 +1032,12 @@ where
 	/// request is also how a peer answers our SUBSCRIBE_NAMESPACE there, and the message
 	/// alone does not say which it is.
 	fn unsolicited_is_a_violation(&self, declared: Option<bool>) -> bool {
+		// We only hold a peer to a requirement we actually stated. A server that declined MoQ
+		// Solicit (`Server::without_solicit`) invited unsolicited advertisements, so one is
+		// expected even from a solicit-aware peer.
+		if !self.declared_solicit {
+			return false;
+		}
 		match self.version {
 			Version::Draft14 | Version::Draft15 => false,
 			_ => declared.is_some(),

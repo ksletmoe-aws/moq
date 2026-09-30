@@ -380,6 +380,8 @@ impl Client {
 					peer_declared: None,
 					auth: auth.clone(),
 					request_token: self.request_token.clone(),
+					// A client always declares MoQ Solicit; only a server declines it.
+					solicit: true,
 				})?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -537,6 +539,8 @@ impl Client {
 					peer_declared: Some(peer_declared),
 					auth: auth.clone(),
 					request_token: self.request_token.clone(),
+					// A client always declares MoQ Solicit; only a server declines it.
+					solicit: true,
 				})?;
 				(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 			}
