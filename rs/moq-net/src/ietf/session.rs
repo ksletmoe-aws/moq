@@ -334,9 +334,10 @@ where
 					let auth = auth.clone();
 					let origin = publish.clone();
 					let session = session.clone();
+					let request_token = request_token.clone();
 					async move {
 						match client {
-							true => enforce_grant(auth, origin, session).await,
+							true => enforce_grant(auth, origin, session, request_token).await,
 							false => std::future::pending().await,
 						}
 					}
@@ -1048,7 +1049,16 @@ async fn enforce_grant<S: crate::transport::poll::Session>(
 	auth: crate::auth::Handle,
 	origin: origin::Consumer,
 	mut session: S,
+	request_token: Option<bytes::Bytes>,
 ) -> Result<(), Error> {
+	// A client that presents a request token authorizes each of its own requests at the server
+	// per-request (the covers-gate plus the app's acceptor), so its connection grant does not
+	// bound them: the token is precisely how it publishes outside that grant. Enforcing the
+	// grant here would close the client for exactly the announce the token was meant to carry,
+	// before the server ever saw it. The server refuses a bad token per request instead.
+	if request_token.is_some() {
+		return Ok(());
+	}
 	let mut announced = origin.announced();
 	let mut check = crate::auth::Enforce::default();
 	let Some(path) = kio::wait(|waiter| check.poll(&auth, &mut announced, waiter)).await else {
@@ -1213,6 +1223,35 @@ mod tests {
 	/// paused in these tests, so each turn costs nothing and only runs the driver until it
 	/// parks again; a busy machine cannot turn a slow announce into a passing silence.
 	const ANNOUNCE_TURNS: usize = 100;
+
+	/// A client that presents a request token authorizes each of its own requests at the
+	/// server per-request (the covers-gate plus the app's acceptor), so its connection grant
+	/// does not bound them. Dialing-side grant enforcement must therefore stand down when a
+	/// request token is set: enforcing it would close the client for announcing outside the
+	/// connection grant the token was meant to extend, before the server ever saw the token.
+	/// The connection grant here is irrelevant precisely because the token short-circuits it.
+	#[tokio::test]
+	async fn a_client_may_send_a_token_bearing_request_its_connection_grant_does_not_cover() {
+		let auth = crate::auth::Handle::new(true);
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("room/alice", crate::origin::Route::default()).unwrap();
+		let session = crate::lite::test_transport::SinkSession::new(Default::default());
+		let log = session.log.clone();
+
+		let result = enforce_grant(
+			auth,
+			origin.consume(),
+			session,
+			Some(bytes::Bytes::from_static(b"jwt")),
+		)
+		.await;
+
+		assert!(result.is_ok(), "a token-bearing client must not be closed by grant enforcement");
+		assert!(
+			log.closes().is_empty(),
+			"the session must stay open for a token-bearing client"
+		);
+	}
 
 	/// Run a publish-only session against a peer that declared `peer_declared`, returning
 	/// how many times the namespace reached the wire.
