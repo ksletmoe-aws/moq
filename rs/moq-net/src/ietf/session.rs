@@ -317,9 +317,11 @@ where
 					let runtime = runtime.clone();
 					let session = session.clone();
 					let goaway = goaway.clone();
+					let declare_auth = auth.supported();
 					async move {
 						if let Err(err) =
-							run_setup(runtime, session, version, path, authority, self_origin, cost, goaway).await
+							run_setup(runtime, session, version, path, authority, self_origin, cost, declare_auth, goaway)
+								.await
 						{
 							tracing::warn!(%err, "setup send error");
 						}
@@ -624,7 +626,9 @@ fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer:
 /// `path` is the request path we advertise (clients on URL-less transports); a
 /// server passes `None`. `self_origin` and `cost` are the MoQ Cluster options, which
 /// declare our identity and (client-only) what this link costs to cross. The MoQ Solicit
-/// declaration is unconditional, so it takes no argument.
+/// declaration is unconditional, so it takes no argument. `declare_auth` offers the MoQ
+/// Auth Setup Option; a client that declined it (see `Client::without_auth_extension`)
+/// passes false to emulate a peer without the extension.
 #[allow(clippy::too_many_arguments)]
 async fn run_setup<S: crate::transport::poll::Session>(
 	runtime: crate::time::Clock,
@@ -634,6 +638,7 @@ async fn run_setup<S: crate::transport::poll::Session>(
 	authority: Option<String>,
 	self_origin: Hop,
 	cost: Option<u64>,
+	declare_auth: bool,
 	goaway: crate::goaway::Protocol,
 ) -> Result<(), Error> {
 	let outer_version = crate::Version::Ietf(version);
@@ -652,7 +657,9 @@ async fn run_setup<S: crate::transport::poll::Session>(
 	cluster::peer_into_setup(&mut parameters, self_origin, cost, version);
 	solicit::into_setup(&mut parameters, version);
 	hidden::into_setup(&mut parameters, version);
-	auth::into_setup(&mut parameters, version);
+	if declare_auth {
+		auth::into_setup(&mut parameters, version);
+	}
 	let parameters = parameters.encode_bytes(version)?;
 
 	writer.encode(&setup::Setup { parameters }).await?;

@@ -74,6 +74,7 @@ pub struct Client {
 	cost: Option<u64>,
 	peer_hop: Option<crate::Hop>,
 	request_token: RequestToken,
+	decline_auth_extension: bool,
 }
 
 impl Client {
@@ -210,6 +211,22 @@ impl Client {
 		self.request_token.set(Some(token.into()));
 	}
 
+	/// Do not declare the MoQ Auth extension in this client's SETUP, so it connects as a
+	/// peer without it (interop testing).
+	///
+	/// A standard moq-transport peer (for example a non-moq-dev encoder or CDN) never
+	/// negotiates the moq-dev AUTH Setup Option, so its session carries no connection
+	/// grant and a request-borne `AUTHORIZATION TOKEN` (see
+	/// [`with_request_token`](Self::with_request_token)) is the authorizing artifact. A
+	/// moq-dev client normally declares the extension, which fills the session grant and
+	/// short-circuits the request token; this lets one emulate the peer that does not, so
+	/// the request-token path can be exercised at draft-17+. Additive: the default still
+	/// declares the extension. No effect on versions that do not negotiate it.
+	pub fn without_auth_extension(mut self) -> Self {
+		self.decline_auth_extension = true;
+		self
+	}
+
 	/// The origin pair a session attaches, tagged and filtered.
 	///
 	/// Reads through the publish (egress) consumer and writes through the
@@ -342,8 +359,10 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				// The peer's SETUP decides whether AUTH is negotiated.
-				let auth = crate::auth::Handle::new(true);
+				// The peer's SETUP decides whether AUTH is negotiated. A client that
+				// declined the extension builds a handle that does not speak it, so its
+				// SETUP omits the option and no connection credential is presented.
+				let auth = crate::auth::Handle::new(!self.decline_auth_extension);
 				let (protocol, goaway) = ietf::start(ietf::Config {
 					runtime: runtime.clone(),
 					session: session.clone(),

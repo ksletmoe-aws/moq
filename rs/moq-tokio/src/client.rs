@@ -239,6 +239,13 @@ impl Client {
 		self.moq.set_request_token(token);
 	}
 
+	/// Do not declare the MoQ Auth extension in this client's SETUP, so it connects as a
+	/// peer without it (interop testing); see [`moq_net::Client::without_auth_extension`].
+	pub fn without_auth_extension(mut self) -> Self {
+		self.moq = self.moq.without_auth_extension();
+		self
+	}
+
 	/// Override whether this client redials after a session drop.
 	///
 	/// Defaults to true, unless [`crate::connect::Config::once`] turned it off.

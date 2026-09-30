@@ -20,6 +20,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LITE_06: &str = "moq-lite-06";
 /// The first draft that negotiates MoQ Auth, and the newest.
 const MOQT_17: &str = "moq-transport-17";
+/// A draft at the deployed floor, used for the request-token launch shape.
+const MOQT_18: &str = "moq-transport-18";
 const MOQT_22: &str = "moq-transport-22";
 
 /// Run each case on every version that exchanges AUTH.
@@ -166,6 +168,8 @@ struct Options {
 	server_requests: bool,
 	/// A request token the client attaches to its outgoing PUBLISH_NAMESPACE / SUBSCRIBE.
 	client_request_token: Option<Vec<u8>>,
+	/// The client declines the MoQ Auth extension (`Client::without_auth_extension`).
+	client_decline_auth: bool,
 	version: Option<&'static str>,
 }
 
@@ -192,6 +196,9 @@ async fn connect(opts: Options) -> Pair {
 	}
 	if let Some(token) = opts.client_request_token {
 		client = client.with_request_token(token);
+	}
+	if opts.client_decline_auth {
+		client = client.without_auth_extension();
 	}
 
 	let mut server = Server::new().with_versions(version.into());
@@ -383,6 +390,81 @@ async fn a_request_token_authorizes_a_legacy_announce_through_the_driver() {
 
 		// End to end: the verified announce reached the server's subscribe origin.
 		wait_announced(&relay.consume(), "room/alice", true).await;
+	})
+	.await
+	.expect("timed out");
+}
+
+/// A client may decline the MoQ Auth extension, connecting at draft-18 as a peer that
+/// does not negotiate it (a non-moq-dev encoder or CDN). Its SETUP omits the option, so
+/// the server sees `declared.auth == false` and the session carries no connection grant
+/// (`None` union). A request-borne `AUTHORIZATION TOKEN` is then the authorizing artifact
+/// and reaches the server's acceptor, where a normal draft-18 client's connection grant
+/// would cover the request and skip the token. A token-less request on such a
+/// session is admitted by the permissive default of the ungranted session.
+///
+/// The token is exercised on a SUBSCRIBE, which is always a request and carries the token
+/// on every draft. A request token on a PUBLISH_NAMESPACE does NOT reach a moq-net peer at
+/// draft-16+ regardless of this option: moq-net declares MoQ Solicit unconditionally, so
+/// the announce answers the peer's SUBSCRIBE_NAMESPACE inline via `ietf::Namespace`, which
+/// carries no token, and the token-bearing unsolicited PUBLISH_NAMESPACE loop is disabled.
+#[tokio::test]
+async fn a_client_may_decline_the_auth_extension() {
+	within(async {
+		let ts = |ms| moq_net::Timestamp::from_millis(ms).unwrap();
+		let prefs = || moq_net::track::Subscription::default().with_max_age(Duration::from_secs(10));
+		let server_origin = produce_origin(1);
+		let down = server_origin.create_broadcast("room/alice").unwrap();
+		let down_track = down.create_track("video", None).unwrap();
+		down.announce(Default::default()).unwrap();
+
+		let received = produce_origin(3);
+		let mut pair = connect(Options {
+			version: Some(MOQT_18),
+			client_subscribe: Some(received.clone()),
+			// USE_VALUE (0x03), token kind 0, value "ok".
+			client_request_token: Some(vec![0x03, 0x00, b'o', b'k']),
+			client_decline_auth: true,
+			server_publish: Some(server_origin.clone()),
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+
+		// declared.auth == false: the declining client speaks no AUTH, so it holds no
+		// session grant and cannot present a session token (unlike a normal draft-18 peer).
+		assert_eq!(pair.client.auth().grant().peek(), None);
+		assert!(matches!(pair.client.auth().add("x").await, Err(Error::Unsupported)));
+
+		// The client's token-bearing SUBSCRIBE reaches the acceptor: on the `None`-union
+		// session the covers-gate does not short-circuit, so the token is verified rather
+		// than admitted by a covering connection grant.
+		let requests = pair.requests.take().expect("server took its requests pre-ok");
+		let mut answered = serve(requests, |_token| Some(grant(&["room/alice"], &["room/alice"])));
+
+		let remote = received.consume().routed_broadcast("room/alice").await.unwrap();
+		let mut sub = remote.track("video").unwrap().subscribe(prefs()).await.unwrap();
+		let mut group = down_track.append_group().unwrap();
+		group.write_frame(ts(0), b"down".as_ref()).unwrap();
+
+		let (_token, _issued) = answered.recv().await.expect("the token reached the acceptor");
+		sub.recv_group().await.unwrap().unwrap();
+
+		// Token-less: a declining client with no token is admitted by the permissive default.
+		let bare_publisher = produce_origin(4);
+		let bare_relay = produce_origin(5);
+		let bare = connect(Options {
+			version: Some(MOQT_18),
+			client_publish: Some(bare_publisher.clone()),
+			client_decline_auth: true,
+			server_subscribe: Some(bare_relay.clone()),
+			..Default::default()
+		})
+		.await;
+		let bc = bare_publisher.create_broadcast("room/bob").unwrap();
+		bc.announce(Default::default()).unwrap();
+		wait_announced(&bare_relay.consume(), "room/bob", true).await;
+		assert_eq!(bare.client_transport.close_reason(), None);
 	})
 	.await
 	.expect("timed out");
@@ -752,6 +834,7 @@ async fn a_revoked_grant_cancels_its_subscriptions(version: &'static str) {
 			server_subscribe: Some(server_origin.clone()),
 			server_requests: true,
 			client_request_token: None,
+			..Default::default()
 		})
 		.await;
 		let mut issued = serve(pair.requests.take().unwrap(), |token| {

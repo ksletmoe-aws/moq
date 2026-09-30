@@ -257,6 +257,14 @@ impl Handle {
 		}
 	}
 
+	/// Whether this session speaks the AUTH extension. False on a version that cannot
+	/// negotiate it, and on a handle a caller built declined (see
+	/// `Client::without_auth_extension`), so the SETUP omits the option and no
+	/// connection credential is presented.
+	pub(crate) fn supported(&self) -> bool {
+		self.state.lock().supported
+	}
+
 	/// The union of every grant this side holds: `None` until the peer first
 	/// answers a token (with a grant or a refusal), and forever on a version
 	/// without AUTH.
