@@ -575,10 +575,17 @@ where
 				match verdict.grant().await {
 					// The token's grant must cover this exact request; it authorizes nothing
 					// else and never joins the session union.
-					Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
+					Ok(grant) if crate::auth::RequestKind::Subscribe.covers(&grant, msg.track_namespace.as_str()) => {
 						// Held for the subscription's life: the request ends when this grant
-						// lapses or is revoked (RequestGrant::poll_ended below), never the session.
-						request_grant = Some(crate::auth::RequestGrant::new(&self.runtime, verdict, grant));
+						// lapses, is revoked, or stops covering it (RequestGrant::poll_ended
+						// below), never the session.
+						request_grant = Some(crate::auth::RequestGrant::new(
+							&self.runtime,
+							verdict,
+							grant,
+							msg.track_namespace.to_owned(),
+							crate::auth::RequestKind::Subscribe,
+						));
 					}
 					Ok(_) => {
 						let err = Error::Unauthorized;
@@ -841,7 +848,7 @@ where
 								// The renewal's grant must still cover this request. On accept the
 								// old grant is dropped (ending the old token) and the deadline is
 								// re-armed at the new expiry.
-								Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
+								Ok(grant) if rg.covers(&grant) => {
 									rg.renew(verdict, grant);
 									if answer {
 										self.write_request_ok(&mut stream.writer).await?;
@@ -3239,11 +3246,11 @@ mod serve_tests {
 		}
 	}
 
-	/// A grant of everything, lapsing in `secs` (or never), on the publisher's clock.
+	/// A grant to subscribe to everything, lapsing in `secs` (or never), on the publisher's clock.
 	fn grant_all_expiring(runtime: &crate::time::Clock, secs: Option<u64>) -> crate::auth::Grant {
 		crate::auth::Grant {
-			publish: crate::Pattern::all().into(),
-			subscribe: crate::Patterns::new(),
+			publish: crate::Patterns::new(),
+			subscribe: crate::Pattern::all().into(),
 			expires: secs.map(|s| {
 				crate::runtime::Timers::now(runtime)
 					.checked_add(Duration::from_secs(s))
@@ -3844,6 +3851,76 @@ mod serve_tests {
 			consulted.load(Ordering::Relaxed) >= 1,
 			"the token must be verified by the acceptor, not admitted by the permissive default"
 		);
+	}
+
+	/// A token-bearing SUBSCRIBE being served on a no-AUTH session whose acceptor answers every
+	/// token with `grant`, after `limit` (if any) narrowed what the peer may do.
+	type Serving = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>>>>;
+
+	async fn serve_token_subscribe(
+		grant: crate::auth::Grant,
+		limit: Option<crate::auth::Grant>,
+	) -> (crate::auth::Handle, Serve, Serving) {
+		const VERSION: Version = Version::Draft18;
+		let auth = crate::auth::Handle::new(false);
+		let mut requests = auth.requests().unwrap();
+		if let Some(limit) = &limit {
+			auth.authorize(limit);
+		}
+		let h = serve_with_auth(VERSION, auth.clone(), Vec::new());
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+		let serving = h.publisher.clone().run_subscribe_stream(stream, token_subscribe());
+		let serving: Serving = Box::pin(async move {
+			let acceptor = async move {
+				let mut held = Vec::new();
+				while let Some(request) = requests.next().await {
+					held.push(request.accept(grant.clone()));
+				}
+				std::future::pending::<Result<(), Error>>().await
+			};
+			tokio::select! {
+				res = acceptor => res,
+				res = serving => res,
+			}
+		});
+		(auth, h, serving)
+	}
+
+	/// Whether `serving` is still running after the acceptor and the serve loop have had their
+	/// turns.
+	async fn still_serving(serving: &mut Serving) -> bool {
+		for _ in 0..300 {
+			if futures::poll!(serving.as_mut()).is_ready() {
+				return false;
+			}
+			settle().await;
+		}
+		true
+	}
+
+	/// A subscriber's token grant is checked on its `subscribe` patterns: a write-only grant
+	/// does not admit a SUBSCRIBE, a read-only one does.
+	#[tokio::test]
+	async fn a_subscribe_token_needs_a_subscribe_grant() {
+		let read_only = crate::auth::Grant {
+			publish: crate::Patterns::new(),
+			subscribe: crate::Pattern::all().into(),
+			expires: None,
+		};
+		let write_only = crate::auth::Grant {
+			publish: crate::Pattern::all().into(),
+			subscribe: crate::Patterns::new(),
+			expires: None,
+		};
+		let (_auth, _h, mut serving) = serve_token_subscribe(read_only, None).await;
+		assert!(still_serving(&mut serving).await, "a read grant admits it");
+		let (_auth, _h, mut serving) = serve_token_subscribe(write_only, None).await;
+		assert!(!still_serving(&mut serving).await, "a write grant refuses it");
 	}
 
 	/// A distinctive request id, so `[FetchHeader::TYPE, REQUEST_ID]` is a usable needle.

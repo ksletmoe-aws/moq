@@ -1115,8 +1115,14 @@ where
 			match verdict.grant().await {
 				// The token's grant must cover this announce; it authorizes nothing else and
 				// never joins the session union.
-				Ok(grant) if grant.subscribe.matches(path.as_str()) => {
-					token_grant = Some(crate::auth::RequestGrant::new(&self.runtime, verdict, grant));
+				Ok(grant) if crate::auth::RequestKind::PublishNamespace.covers(&grant, path.as_str()) => {
+					token_grant = Some(crate::auth::RequestGrant::new(
+						&self.runtime,
+						verdict,
+						grant,
+						path.clone(),
+						crate::auth::RequestKind::PublishNamespace,
+					));
 				}
 				Ok(_) => {
 					self.write_error(
@@ -1235,7 +1241,7 @@ where
 				};
 				match res {
 					// On accept the old grant is dropped and the deadline re-armed (REQUEST_OK).
-					Ok(grant) if grant.subscribe.matches(path.as_str()) => {
+					Ok(grant) if rg.covers(&grant) => {
 						rg.renew(verdict, grant);
 						self.write_ok(stream, rid).await?;
 					}
@@ -5156,12 +5162,12 @@ mod tests {
 		(subscriber, requests, cred, consumer, session)
 	}
 
-	/// A grant of everything to subscribe, lapsing in `secs` (or never), on the subscriber's
-	/// clock.
-	fn subscribe_grant_expiring(runtime: &crate::time::Clock, secs: Option<u64>) -> crate::auth::Grant {
+	/// A grant to publish everything, lapsing in `secs` (or never), on the subscriber's clock:
+	/// what an announcing peer's token must carry.
+	fn publish_grant_expiring(runtime: &crate::time::Clock, secs: Option<u64>) -> crate::auth::Grant {
 		crate::auth::Grant {
-			publish: crate::Patterns::new(),
-			subscribe: crate::Pattern::all().into(),
+			publish: crate::Pattern::all().into(),
+			subscribe: crate::Patterns::new(),
 			expires: secs.map(|s| {
 				crate::runtime::Timers::now(runtime)
 					.checked_add(std::time::Duration::from_secs(s))
@@ -5291,10 +5297,10 @@ mod tests {
 				let mut held = Vec::new();
 				// The first grant lapses in 60s; the renewal never expires.
 				let first = requests.next().await.expect("a request");
-				held.push(first.accept(subscribe_grant_expiring(&rt, Some(60))));
+				held.push(first.accept(publish_grant_expiring(&rt, Some(60))));
 				answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 				let renewal = requests.next().await.expect("a renewal");
-				held.push(renewal.accept(subscribe_grant_expiring(&rt, None)));
+				held.push(renewal.accept(publish_grant_expiring(&rt, None)));
 				answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 				std::future::pending::<()>().await
 			}
@@ -5504,6 +5510,57 @@ mod tests {
 				routed_now(&consumer, "room/alice").is_none(),
 				"a refused token must not be admitted by the permissive default"
 			);
+		}
+	}
+
+	/// An announcing peer's token grant is checked on its `publish` patterns: a read-only grant
+	/// does not admit a PUBLISH_NAMESPACE, a write-only one does.
+	#[tokio::test]
+	async fn an_announce_token_needs_a_publish_grant() {
+		const VERSION: Version = Version::Draft18;
+		let read_only = crate::auth::Grant {
+			publish: crate::Patterns::new(),
+			subscribe: crate::Pattern::all().into(),
+			expires: None,
+		};
+		let write_only = crate::auth::Grant {
+			publish: crate::Pattern::all().into(),
+			subscribe: crate::Patterns::new(),
+			expires: None,
+		};
+		for (grant, admitted) in [(read_only, false), (write_only, true)] {
+			let (mut subscriber, mut requests, consumer, session) = auth_announce_harness_no_ext(VERSION);
+			let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+			let acceptor = async move {
+				let request = requests.next().await.expect("a request reaches the acceptor");
+				let _issued = request.accept(grant);
+				std::future::pending::<()>().await
+			};
+			let mut acceptor = std::pin::pin!(acceptor);
+			let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+				stream,
+				token_publish_namespace(),
+				cluster::Peer::default(),
+				None,
+			));
+			let mut ended = false;
+			for _ in 0..300 {
+				let _ = futures::poll!(acceptor.as_mut());
+				if futures::poll!(run.as_mut()).is_ready() {
+					ended = true;
+					break;
+				}
+				if admitted && routed_now(&consumer, "room/alice").is_some() {
+					break;
+				}
+				settle().await;
+			}
+			assert_eq!(
+				routed_now(&consumer, "room/alice").is_some(),
+				admitted,
+				"admitted={admitted}"
+			);
+			assert_eq!(ended, !admitted, "a grant that does not cover the announce refuses it");
 		}
 	}
 

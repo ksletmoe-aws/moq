@@ -835,6 +835,20 @@ pub enum RequestKind {
 	TrackStatus,
 }
 
+impl RequestKind {
+	/// Whether `grant`, issued to the peer that presented the token, covers this request at
+	/// `path`. A grant names what its holder may do, so a request to read is covered by its
+	/// `subscribe` patterns and a request to announce or publish by its `publish` patterns.
+	pub(crate) fn covers(self, grant: &Grant, path: &str) -> bool {
+		match self {
+			Self::Subscribe | Self::Fetch | Self::SubscribeNamespace | Self::TrackStatus => {
+				grant.subscribe.matches(path)
+			}
+			Self::Publish | Self::PublishNamespace => grant.publish.matches(path),
+		}
+	}
+}
+
 /// The request a token rode on, kept beside the token so the acceptor can scope its
 /// grant to that one request.
 struct RequestContext {
@@ -1027,19 +1041,35 @@ pub(crate) struct RequestGrant<R: crate::runtime::Timers> {
 	verdict: RequestVerdict,
 	grant: Grant,
 	deadline: crate::runtime::Deadline<R>,
+	/// The request this grant must keep covering: a replacement that no longer does ends it.
+	path: crate::PathOwned,
+	kind: RequestKind,
 }
 
 impl<R: crate::runtime::Timers> RequestGrant<R> {
 	/// Hold `grant` (the acceptor's first answer, already awaited) for the request's life,
 	/// armed to lapse at its expiry.
-	pub(crate) fn new(runtime: &R, verdict: RequestVerdict, grant: Grant) -> Self {
+	pub(crate) fn new(
+		runtime: &R,
+		verdict: RequestVerdict,
+		grant: Grant,
+		path: crate::PathOwned,
+		kind: RequestKind,
+	) -> Self {
 		let mut deadline = crate::runtime::Deadline::new(runtime);
 		deadline.set(grant.expires);
 		Self {
 			verdict,
 			grant,
 			deadline,
+			path,
+			kind,
 		}
+	}
+
+	/// Whether `grant` covers the request this guard holds.
+	pub(crate) fn covers(&self, grant: &Grant) -> bool {
+		self.kind.covers(grant, self.path.as_str())
 	}
 
 	/// The grant in force right now. Observed by the lifecycle tests; the reader checks a
@@ -1060,9 +1090,10 @@ impl<R: crate::runtime::Timers> RequestGrant<R> {
 
 	/// Resolve with the error that ends the request: the deadline lapsing
 	/// ([`Error::Unauthorized`]; [`Error::Expired`] once the code split lands), or the
-	/// acceptor revoking or dropping the grant (its code). An acceptor-side update (a
-	/// replacement grant on the same token, e.g. a lowered expiry) is folded in and polling
-	/// continues. Never resolves while the grant still stands.
+	/// acceptor revoking or dropping the grant (its code), or an acceptor-side update (a
+	/// replacement grant on the same token) that no longer covers the request
+	/// ([`Error::Unauthorized`]). A covering update, such as a lowered expiry, is folded in and
+	/// polling continues. Never resolves while the grant still stands.
 	pub(crate) fn poll_ended(&mut self, waiter: &kio::Waiter) -> Poll<Error> {
 		loop {
 			if self.deadline.poll(waiter).is_ready() {
@@ -1070,6 +1101,9 @@ impl<R: crate::runtime::Timers> RequestGrant<R> {
 			}
 			match self.verdict.poll_reply(waiter) {
 				Poll::Ready(Reply::Grant(grant)) => {
+					if !self.covers(&grant) {
+						return Poll::Ready(Error::Unauthorized);
+					}
 					self.deadline.set(grant.expires);
 					self.grant = grant;
 					// Re-poll: the new deadline may already have lapsed, or another reply may
@@ -1465,8 +1499,8 @@ mod request_token_tests {
 
 	fn grant_in(runtime: &crate::time::Clock, secs: u64) -> Grant {
 		Grant {
-			publish: crate::Pattern::all().into(),
-			subscribe: Patterns::new(),
+			publish: Patterns::new(),
+			subscribe: crate::Pattern::all().into(),
 			expires: crate::runtime::Timers::now(runtime).checked_add(Duration::from_secs(secs)),
 		}
 	}
@@ -1482,7 +1516,7 @@ mod request_token_tests {
 		let expires = grant.expires;
 		let _issued = requests.next().await.unwrap().accept(grant);
 		let answered = verdict.grant().await.unwrap();
-		let request_grant = RequestGrant::new(&runtime, verdict, answered);
+		let request_grant = RequestGrant::new(&runtime, verdict, answered, subscribe_path(), RequestKind::Subscribe);
 		assert_eq!(request_grant.grant().expires, expires);
 		assert!(expires.is_some());
 	}
@@ -1499,7 +1533,8 @@ mod request_token_tests {
 		let first_expires = first.expires;
 		let _issued = requests.next().await.unwrap().accept(first);
 		let answered = verdict.grant().await.unwrap();
-		let mut request_grant = RequestGrant::new(&runtime, verdict, answered);
+		let mut request_grant =
+			RequestGrant::new(&runtime, verdict, answered, subscribe_path(), RequestKind::Subscribe);
 
 		// A REQUEST_UPDATE carrying a fresh token the acceptor accepts with a later expiry.
 		let renewal = handle.verify_request(Bytes::from_static(b"jwt2"), 0, subscribe_path(), RequestKind::Subscribe);
@@ -1524,7 +1559,8 @@ mod request_token_tests {
 		// Held for the request's life, so only the deadline (not a drop) ends it.
 		let _issued = requests.next().await.unwrap().accept(grant_in(&runtime, 60));
 		let answered = verdict.grant().await.unwrap();
-		let mut request_grant = RequestGrant::new(&runtime, verdict, answered);
+		let mut request_grant =
+			RequestGrant::new(&runtime, verdict, answered, subscribe_path(), RequestKind::Subscribe);
 
 		let err = kio::wait(|waiter| request_grant.poll_ended(waiter)).await;
 		assert!(matches!(err, Error::Unauthorized), "{err:?}");
@@ -1543,7 +1579,8 @@ mod request_token_tests {
 		let first_expires = first.expires;
 		let _issued = requests.next().await.unwrap().accept(first);
 		let answered = verdict.grant().await.unwrap();
-		let mut request_grant = RequestGrant::new(&runtime, verdict, answered);
+		let mut request_grant =
+			RequestGrant::new(&runtime, verdict, answered, subscribe_path(), RequestKind::Subscribe);
 
 		// The renewal token is refused: verify it resolves to a refusal, and the caller does
 		// NOT renew. The old grant is untouched.
@@ -1565,6 +1602,54 @@ mod request_token_tests {
 		assert!(matches!(err, Error::Unauthorized), "{err:?}");
 	}
 
+	/// An acceptor-side update that no longer covers the request ends it, even when the
+	/// replacement has no expiry to lapse at; one that still covers it is folded in.
+	#[tokio::test(start_paused = true)]
+	async fn an_update_that_stops_covering_ends_the_request() {
+		let runtime = crate::time::Clock::tokio();
+		let handle = Handle::new(true);
+		let mut requests = handle.requests().unwrap();
+		let verdict = handle.verify_request(Bytes::from_static(b"jwt"), 0, subscribe_path(), RequestKind::Subscribe);
+		let issued = requests.next().await.unwrap().accept(Grant::all());
+		let answered = verdict.grant().await.unwrap();
+		let mut request_grant =
+			RequestGrant::new(&runtime, verdict, answered, subscribe_path(), RequestKind::Subscribe);
+
+		// A covering update (everything, still unexpiring) leaves the request standing.
+		issued.update(Grant::all());
+		let pending = kio::wait(|waiter| Poll::Ready(request_grant.poll_ended(waiter).is_pending())).await;
+		assert!(pending, "a covering update keeps the request");
+
+		issued.update(Grant::default());
+		let err = tokio::time::timeout(
+			Duration::from_secs(1),
+			kio::wait(|waiter| request_grant.poll_ended(waiter)),
+		)
+		.await
+		.expect("an uncovering update must end the request");
+		assert!(matches!(err, Error::Unauthorized), "{err:?}");
+	}
+
+	/// The grant is the presenting peer's: a read is covered by `subscribe`, an announce by
+	/// `publish`, never the other way around.
+	#[test]
+	fn request_coverage_is_from_the_presenters_side() {
+		let read_only = Grant {
+			publish: Patterns::new(),
+			subscribe: crate::Pattern::all().into(),
+			expires: None,
+		};
+		let write_only = Grant {
+			publish: crate::Pattern::all().into(),
+			subscribe: Patterns::new(),
+			expires: None,
+		};
+		assert!(RequestKind::Subscribe.covers(&read_only, "room"));
+		assert!(!RequestKind::Subscribe.covers(&write_only, "room"));
+		assert!(RequestKind::PublishNamespace.covers(&write_only, "room"));
+		assert!(!RequestKind::PublishNamespace.covers(&read_only, "room"));
+	}
+
 	/// An acceptor-side revoke ends the request before the deadline, and does not close the
 	/// session.
 	#[tokio::test(start_paused = true)]
@@ -1576,7 +1661,8 @@ mod request_token_tests {
 		// A grant that never expires, so only the revoke can end the request.
 		let issued = requests.next().await.unwrap().accept(Grant::all());
 		let answered = verdict.grant().await.unwrap();
-		let mut request_grant = RequestGrant::new(&runtime, verdict, answered);
+		let mut request_grant =
+			RequestGrant::new(&runtime, verdict, answered, subscribe_path(), RequestKind::Subscribe);
 
 		issued.revoke(SessionError::Unauthorized, "revoked");
 		let err = kio::wait(|waiter| request_grant.poll_ended(waiter)).await;
