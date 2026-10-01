@@ -40,7 +40,7 @@ impl Param for IncludeProperties {
 
 /// Subscribe message (0x03)
 /// Sent by the subscriber to request all future objects for the given track.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Subscribe<'a> {
 	pub request_id: RequestId,
 	pub track_namespace: Path<'a>,
@@ -58,6 +58,25 @@ pub struct Subscribe<'a> {
 	/// (MoQ request-token); the value is the Token structure of section 8.9, decoded with
 	/// [`super::token::decode_value`].
 	pub authorization_token: Option<bytes::Bytes>,
+}
+
+impl std::fmt::Debug for Subscribe<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Subscribe")
+			.field("request_id", &self.request_id)
+			.field("track_namespace", &self.track_namespace)
+			.field("track_name", &self.track_name)
+			.field("subscriber_priority", &self.subscriber_priority)
+			.field("group_order", &self.group_order)
+			.field("filter", &self.filter)
+			.field("fill", &self.fill)
+			.field("properties_wanted", &self.properties_wanted)
+			.field(
+				"authorization_token",
+				&super::token::Redacted(&self.authorization_token),
+			)
+			.finish()
+	}
 }
 
 impl Message for Subscribe<'_> {
@@ -385,7 +404,7 @@ impl Message for Unsubscribe {
 }
 
 /// SubscribeUpdate message (0x02)
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SubscribeUpdate {
 	pub request_id: RequestId,
 	pub subscription_request_id: Option<RequestId>,
@@ -397,6 +416,23 @@ pub struct SubscribeUpdate {
 	/// token refreshes the request's grant (MoQ request-token); the value is the Token
 	/// structure of section 8.9, decoded with [`super::token::decode_value`].
 	pub authorization_token: Option<bytes::Bytes>,
+}
+
+impl std::fmt::Debug for SubscribeUpdate {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SubscribeUpdate")
+			.field("request_id", &self.request_id)
+			.field("subscription_request_id", &self.subscription_request_id)
+			.field("start_location", &self.start_location)
+			.field("end_group", &self.end_group)
+			.field("subscriber_priority", &self.subscriber_priority)
+			.field("forward", &self.forward)
+			.field(
+				"authorization_token",
+				&super::token::Redacted(&self.authorization_token),
+			)
+			.finish()
+	}
 }
 
 impl Message for SubscribeUpdate {

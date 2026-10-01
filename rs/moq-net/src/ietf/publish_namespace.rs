@@ -12,7 +12,7 @@ use super::Version;
 
 /// PublishNamespace message (0x06)
 /// Sent by the publisher to announce the availability of a namespace.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PublishNamespace<'a> {
 	pub request_id: RequestId,
 	pub track_namespace: Path<'a>,
@@ -27,6 +27,20 @@ pub struct PublishNamespace<'a> {
 	/// namespace (MoQ request-token); the value is the Token structure of section 8.9,
 	/// decoded with [`super::token::decode_value`].
 	pub authorization_token: Option<bytes::Bytes>,
+}
+
+impl std::fmt::Debug for PublishNamespace<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PublishNamespace")
+			.field("request_id", &self.request_id)
+			.field("track_namespace", &self.track_namespace)
+			.field("cluster", &self.cluster)
+			.field(
+				"authorization_token",
+				&super::token::Redacted(&self.authorization_token),
+			)
+			.finish()
+	}
 }
 
 impl PublishNamespace<'_> {
@@ -133,7 +147,7 @@ fn decode_request_params<R: bytes::Buf>(
 /// An omitted parameter keeps its value (moq-transport Section 9.5), so a cost that
 /// dropped to 0 is sent as an explicit 0, unlike the advertisement itself where absent
 /// means 0. Draft-17+ only: the extension negotiates on nothing earlier.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PublishNamespaceUpdate {
 	/// The update's own Request ID; every REQUEST_UPDATE consumes one.
 	pub request_id: RequestId,
@@ -145,6 +159,20 @@ pub struct PublishNamespaceUpdate {
 	/// token refreshes the announce's request grant (MoQ request-token); the value is the
 	/// Token structure of section 8.9, decoded with [`super::token::decode_value`].
 	pub authorization_token: Option<bytes::Bytes>,
+}
+
+impl std::fmt::Debug for PublishNamespaceUpdate {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PublishNamespaceUpdate")
+			.field("request_id", &self.request_id)
+			.field("hops", &self.hops)
+			.field("cost", &self.cost)
+			.field(
+				"authorization_token",
+				&super::token::Redacted(&self.authorization_token),
+			)
+			.finish()
+	}
 }
 
 impl PublishNamespaceUpdate {

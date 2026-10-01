@@ -74,6 +74,46 @@ fn decode(mut buf: &[u8], version: Version) -> Result<Token, Error> {
 	})
 }
 
+/// Debug for a request-borne `AUTHORIZATION TOKEN` field that shows its length, never its
+/// bytes, so a credential cannot reach the logs through a message's `Debug`.
+pub(super) struct Redacted<'a>(pub &'a Option<bytes::Bytes>);
+
+impl std::fmt::Debug for Redacted<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self.0 {
+			Some(token) => write!(f, "Some(<{} bytes>)", token.len()),
+			None => f.write_str("None"),
+		}
+	}
+}
+
+#[cfg(test)]
+mod redacted_tests {
+	use super::super::{PublishNamespace, PublishNamespaceUpdate, RequestId};
+
+	/// A request-borne credential shows only its length in a message's `Debug`.
+	#[test]
+	fn debug_never_shows_the_token_bytes() {
+		let secret = bytes::Bytes::from_static(b"s3cr3t-jwt");
+		let announce = PublishNamespace {
+			request_id: RequestId(1),
+			track_namespace: crate::Path::new("room"),
+			cluster: None,
+			authorization_token: Some(secret.clone()),
+		};
+		let update = PublishNamespaceUpdate {
+			request_id: RequestId(2),
+			hops: None,
+			cost: None,
+			authorization_token: Some(secret),
+		};
+		for debug in [format!("{announce:?}"), format!("{update:?}")] {
+			assert!(!debug.contains("s3cr3t"), "{debug}");
+			assert!(debug.contains("<10 bytes>"), "{debug}");
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
