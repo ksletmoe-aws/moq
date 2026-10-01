@@ -1669,11 +1669,12 @@ where
 		suffix: &crate::PathOwned,
 		path: &crate::PathOwned,
 	) -> Result<(), Error> {
-		// A token-bearing client does not self-censor on its connection grant: a request token
-		// authorizes an announce the connection grant does not cover (MoQ request-token, quest
-		// Goal), and the server's covers-gate is the authority, refusing a bad token per request.
-		// Without a token this is unchanged: the connection grant filters as before.
-		let permitted = self.request_token.peek().is_some() || ns.permitted(path);
+		// A request token authorizes an announce the connection grant does not cover, but only
+		// when the announce carries it: a PUBLISH_NAMESPACE request does, an inline NAMESPACE
+		// entry has no slot for one. So the grant still filters inline entries, and stands down
+		// only for requests, where the server's covers-gate refuses a bad token per request.
+		let carries_token = matches!(ns.target, Target::Requests(_)) && self.request_token.peek().is_some();
+		let permitted = carries_token || ns.permitted(path);
 		let Namespaces {
 			peer,
 			target,
@@ -3371,6 +3372,72 @@ mod serve_tests {
 			0,
 			"a token-less client self-censors on its grant"
 		);
+	}
+
+	/// A peer that requires solicitation gets inline NAMESPACE entries, which have no slot for a
+	/// request token, so the token cannot authorize them: the connection grant still filters the
+	/// answer to its SUBSCRIBE_NAMESPACE.
+	#[tokio::test]
+	async fn a_request_token_does_not_lift_the_grant_on_inline_namespaces() {
+		const VERSION: Version = Version::Draft18;
+		let token = bytes::Bytes::from_static(&[0x03, 0x00, b'o', b'k']);
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
+		let _other = origin.announce("other/mic", crate::origin::Route::default()).unwrap();
+		settle().await;
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![Vec::new()]);
+		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer {
+			solicit: Some(true),
+			..Default::default()
+		});
+		let auth = crate::auth::Handle::new(true);
+		let _cred = auth.present(bytes::Bytes::from_static(b"cred"), true).unwrap();
+		auth.granted(
+			0,
+			crate::auth::Grant {
+				publish: crate::Pattern::subtree("other").unwrap().into(),
+				subscribe: crate::Patterns::new(),
+				expires: None,
+			},
+		);
+		let publisher = Publisher::new(
+			crate::time::Clock::tokio(),
+			session.clone(),
+			origin.consume(),
+			Control::new(None, false),
+			None,
+			peer_setup,
+			VERSION,
+		)
+		.with_auth(auth)
+		.with_request_token(crate::RequestToken::new(Some(token.clone())));
+
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+		let msg = ietf::SubscribeNamespace {
+			request_id: RequestId(1),
+			namespace: crate::Path::new(""),
+			hidden: false,
+		};
+		let mut run = std::pin::pin!(publisher.run_subscribe_namespace_stream(stream, msg));
+		let mut covered = false;
+		for _ in 0..200 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, b"mic") >= 1 {
+				covered = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(covered, "a namespace the grant covers is advertised inline");
+		for _ in 0..50 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			settle().await;
+		}
+		assert_eq!(occurrences(&log, b"cam"), 0, "the grant still filters inline entries");
+		assert_eq!(occurrences(&log, &token), 0, "an inline entry carries no token");
 	}
 
 	/// A Token structure value that decodes via `token::decode_value` (USE_VALUE, kind 300).

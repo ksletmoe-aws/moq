@@ -357,9 +357,10 @@ where
 					let origin = publish.clone();
 					let session = session.clone();
 					let request_token = request_token.clone();
+					let peer_setup = peer_setup.clone();
 					async move {
 						match client {
-							true => enforce_grant(auth, origin, session, request_token).await,
+							true => enforce_grant(auth, origin, session, request_token, peer_setup, version).await,
 							false => std::future::pending().await,
 						}
 					}
@@ -1083,13 +1084,15 @@ async fn enforce_grant<S: crate::transport::poll::Session>(
 	origin: origin::Consumer,
 	mut session: S,
 	request_token: crate::RequestToken,
+	peer_setup: peer::PeerSetup,
+	version: Version,
 ) -> Result<(), Error> {
-	// A client that presents a request token authorizes each of its own requests at the server
-	// per-request (the covers-gate plus the app's acceptor), so its connection grant does not
-	// bound them: the token is precisely how it publishes outside that grant. Enforcing the
-	// grant here would close the client for exactly the announce the token was meant to carry,
-	// before the server ever saw it. The server refuses a bad token per request instead.
-	if request_token.peek().is_some() {
+	// A request token authorizes an announce outside the connection grant only when the
+	// announce carries it, which is when it rides its own PUBLISH_NAMESPACE request: always on
+	// draft-14/15, and on later drafts unless the peer requires solicitation, which turns every
+	// advertisement into an inline NAMESPACE entry with no token slot. Then the grant still
+	// bounds what we publish.
+	if request_token.peek().is_some() && announces_carry_token(&peer_setup, version).await {
 		return Ok(());
 	}
 	let mut announced = origin.announced();
@@ -1104,6 +1107,16 @@ async fn enforce_grant<S: crate::transport::poll::Session>(
 		&crate::auth::unauthorized_reason(&path),
 	);
 	Err(err)
+}
+
+/// Whether our announces will ride their own PUBLISH_NAMESPACE requests, the only form that
+/// carries a request token, rather than inline NAMESPACE entries. Draft-14/15 predate
+/// NAMESPACE; later drafts send requests unless the peer requires solicitation.
+async fn announces_carry_token(peer_setup: &peer::PeerSetup, version: Version) -> bool {
+	match version {
+		Version::Draft14 | Version::Draft15 => true,
+		_ => !peer_setup.get().await.solicit.unwrap_or(false),
+	}
 }
 
 #[cfg(test)]
@@ -1259,12 +1272,10 @@ mod tests {
 	/// parks again; a busy machine cannot turn a slow announce into a passing silence.
 	const ANNOUNCE_TURNS: usize = 100;
 
-	/// A client that presents a request token authorizes each of its own requests at the
-	/// server per-request (the covers-gate plus the app's acceptor), so its connection grant
-	/// does not bound them. Dialing-side grant enforcement must therefore stand down when a
-	/// request token is set: enforcing it would close the client for announcing outside the
-	/// connection grant the token was meant to extend, before the server ever saw the token.
-	/// The connection grant here is irrelevant precisely because the token short-circuits it.
+	/// A client that presents a request token authorizes each announce at the server when the
+	/// announce carries the token, so dialing-side grant enforcement stands down for a peer
+	/// that takes unsolicited PUBLISH_NAMESPACE requests: enforcing it would close the client
+	/// for announcing outside the connection grant the token was meant to extend.
 	#[tokio::test]
 	async fn a_client_may_send_a_token_bearing_request_its_connection_grant_does_not_cover() {
 		let auth = crate::auth::Handle::new(true);
@@ -1272,12 +1283,19 @@ mod tests {
 		let _cam = origin.announce("room/alice", crate::origin::Route::default()).unwrap();
 		let session = crate::lite::test_transport::SinkSession::new(Default::default());
 		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer {
+			solicit: Some(false),
+			..Default::default()
+		});
 
 		let result = enforce_grant(
 			auth,
 			origin.consume(),
 			session,
 			crate::RequestToken::new(Some(bytes::Bytes::from_static(b"jwt"))),
+			peer_setup,
+			Version::Draft18,
 		)
 		.await;
 
@@ -1289,6 +1307,48 @@ mod tests {
 			log.closes().is_empty(),
 			"the session must stay open for a token-bearing client"
 		);
+	}
+
+	/// When the peer requires solicitation, every advertisement is an inline NAMESPACE entry,
+	/// which has no slot for a request token. A token set for SUBSCRIBE must not let the client
+	/// advertise outside its connection grant there: the grant is still enforced.
+	#[tokio::test]
+	async fn a_request_token_does_not_lift_the_grant_when_announces_are_inline() {
+		let auth = crate::auth::Handle::new(true);
+		let setup = auth.present(bytes::Bytes::new(), true).unwrap();
+		auth.granted(
+			0,
+			crate::auth::Grant {
+				publish: crate::Pattern::subtree("room/alice").unwrap().into(),
+				subscribe: crate::Patterns::new(),
+				expires: None,
+			},
+		);
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin
+			.announce("room/bob/cam", crate::origin::Route::default())
+			.unwrap();
+		let session = crate::lite::test_transport::SinkSession::new(Default::default());
+		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer {
+			solicit: Some(true),
+			..Default::default()
+		});
+
+		let result = enforce_grant(
+			auth,
+			origin.consume(),
+			session,
+			crate::RequestToken::new(Some(bytes::Bytes::from_static(b"jwt"))),
+			peer_setup,
+			Version::Draft18,
+		)
+		.await;
+
+		assert!(matches!(result, Err(Error::Unauthorized)), "{result:?}");
+		assert_eq!(log.closes().len(), 1, "the session closes on the uncovered announce");
+		drop(setup);
 	}
 
 	/// Run a publish-only session against a peer that declared `peer_declared`, returning
