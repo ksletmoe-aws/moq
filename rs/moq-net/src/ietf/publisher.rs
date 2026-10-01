@@ -831,17 +831,26 @@ where
 							let Some(rg) = request_grant.as_mut() else {
 								continue;
 							};
+							// Before draft-17 the update shares the control stream, where an
+							// answer keyed by the update's Request ID reaches nothing the peer
+							// tracks (and draft-14's SUBSCRIBE_ERROR would read as ending the
+							// subscription), so the renewal is decided silently there.
+							let answer =
+								!matches!(self.version, Version::Draft14 | Version::Draft15 | Version::Draft16);
 							match res {
 								// The renewal's grant must still cover this request. On accept the
 								// old grant is dropped (ending the old token) and the deadline is
 								// re-armed at the new expiry.
 								Ok(grant) if grant.publish.matches(msg.track_namespace.as_str()) => {
 									rg.renew(verdict, grant);
-									self.write_request_ok(&mut stream.writer, rid).await?;
+									if answer {
+										self.write_request_ok(&mut stream.writer).await?;
+									}
 								}
 								// A refused or uncovered renewal keeps the old grant (per the quest,
 								// the request ends only when that lapses) and answers UNAUTHORIZED so
 								// the peer can retry before then.
+								_ if !answer => {}
 								_ => {
 									self.write_subscribe_error(
 										&mut stream.writer,
@@ -1043,28 +1052,10 @@ where
 		Ok(())
 	}
 
-	/// Acknowledge an accepted REQUEST_UPDATE on the subscribe stream. Draft-14 predates
-	/// REQUEST_OK and gives SUBSCRIBE_UPDATE no response, so the renewal is silent there.
-	async fn write_request_ok(
-		&self,
-		writer: &mut Writer<S::SendStream, Version>,
-		request_id: RequestId,
-	) -> Result<(), Error> {
-		match self.version {
-			Version::Draft14 => {}
-			Version::Draft15 | Version::Draft16 => {
-				writer.encode(&ietf::RequestOk::ID).await?;
-				writer
-					.encode(&ietf::RequestOk {
-						request_id: Some(request_id),
-					})
-					.await?;
-			}
-			_ => {
-				writer.encode(&ietf::RequestOk::ID).await?;
-				writer.encode(&ietf::RequestOk { request_id: None }).await?;
-			}
-		}
+	/// Acknowledge an accepted REQUEST_UPDATE on its draft-17+ subscribe stream.
+	async fn write_request_ok(&self, writer: &mut Writer<S::SendStream, Version>) -> Result<(), Error> {
+		writer.encode(&ietf::RequestOk::ID).await?;
+		writer.encode(&ietf::RequestOk { request_id: None }).await?;
 		Ok(())
 	}
 
@@ -3549,17 +3540,22 @@ mod serve_tests {
 		}
 	}
 
-	/// The draft-14 mirror of the d18 renewal test (B2): a SUBSCRIBE_UPDATE carrying a fresh token
-	/// renews a token-authorized subscription past the old grant's expiry at draft-14, where the
-	/// update rides the control-stream adapter. This exercises `run_subscribe_stream`'s d14 decode
-	/// and renew; the adapter's follow-up routing to the subscription's stream is proven by
+	/// The pre-draft-17 mirror of the renewal test: a SUBSCRIBE_UPDATE carrying a fresh token
+	/// renews a token-authorized subscription past the old grant's expiry at draft-14/15/16,
+	/// where the update rides the control-stream adapter. No answer is written there: one keyed
+	/// by the update's Request ID reaches nothing the peer routes. The adapter's follow-up
+	/// routing to the subscription's stream is proven by
 	/// `super::super::adapter::tests::test_classify_subscribe_update_followup`.
 	#[tokio::test(start_paused = true)]
-	async fn a_subscribe_update_renews_at_draft_14() {
-		const VERSION: Version = Version::Draft14;
+	async fn a_subscribe_update_renews_silently_before_draft_17() {
+		for version in [Version::Draft14, Version::Draft15, Version::Draft16] {
+			renews_silently(version).await;
+		}
+	}
 
+	async fn renews_silently(version: Version) {
 		let (auth, mut requests, _cred) = auth_covering_other();
-		let h = serve_with_auth(VERSION, auth, subscribe_update_with_token(VERSION).await);
+		let h = serve_with_auth(version, auth, subscribe_update_with_token(version).await);
 		let rt = h.publisher.runtime.clone();
 
 		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
@@ -3567,17 +3563,22 @@ mod serve_tests {
 		group.finish().unwrap();
 		settle().await;
 
-		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+		let stream = Stream::open(&mut h.session.clone(), version).await.unwrap();
 
+		// The renewal is held until the setup writes have settled, so anything written after
+		// it is released is the renewal's answer.
+		let release = std::sync::Arc::new(tokio::sync::Notify::new());
 		let answered = std::sync::Arc::new(AtomicU64::new(0));
 		let acceptor = {
 			let answered = answered.clone();
+			let release = release.clone();
 			async move {
 				let mut held = Vec::new();
 				let first = requests.next().await.unwrap();
 				held.push(first.accept(grant_all_expiring(&rt, Some(60))));
 				answered.fetch_add(1, Ordering::Relaxed);
 				let renewal = requests.next().await.unwrap();
+				release.notified().await;
 				held.push(renewal.accept(grant_all_expiring(&rt, None)));
 				answered.fetch_add(1, Ordering::Relaxed);
 				std::future::pending::<()>().await
@@ -3586,35 +3587,44 @@ mod serve_tests {
 		let mut acceptor = std::pin::pin!(acceptor);
 		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
 
-		for _ in 0..500 {
+		for _ in 0..200 {
 			let _ = futures::poll!(acceptor.as_mut());
 			assert!(
 				futures::poll!(serving.as_mut()).is_pending(),
-				"subscription ended during setup"
+				"{version:?}: ended during setup"
 			);
-			if answered.load(Ordering::Relaxed) >= 2 {
-				break;
-			}
+			settle().await;
+		}
+		assert_eq!(
+			answered.load(Ordering::Relaxed),
+			1,
+			"{version:?}: the first token was answered"
+		);
+		let before = h.log.writes.lock().unwrap().len();
+
+		release.notify_one();
+		for _ in 0..200 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending());
 			settle().await;
 		}
 		assert_eq!(
 			answered.load(Ordering::Relaxed),
 			2,
-			"acceptor never answered both tokens"
+			"{version:?}: the renewal was answered"
 		);
-
-		for _ in 0..20 {
-			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(serving.as_mut()).is_pending());
-			settle().await;
-		}
+		assert_eq!(
+			h.log.writes.lock().unwrap().len(),
+			before,
+			"{version:?}: a renewal before draft-17 writes no answer"
+		);
 
 		tokio::time::advance(Duration::from_secs(120)).await;
 		for _ in 0..50 {
 			let _ = futures::poll!(acceptor.as_mut());
 			assert!(
 				futures::poll!(serving.as_mut()).is_pending(),
-				"the renewal did not extend the subscription past the old expiry"
+				"{version:?}: the renewal did not extend the subscription past the old expiry"
 			);
 			settle().await;
 		}
