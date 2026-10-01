@@ -963,10 +963,12 @@ impl RequestVerdict {
 		let Some(issue) = &self.issue else {
 			return Poll::Ready(Err(Error::Unsupported));
 		};
-		let mut guard = ready_or!(issue.poll(waiter, |issue| match issue.outbox.is_empty() && !issue.done {
-			true => Poll::Pending,
-			false => Poll::Ready(()),
-		}));
+		let mut guard = ready_or!(
+			issue.poll(waiter, |issue| match issue.outbox.is_empty() && !issue.done {
+				true => Poll::Pending,
+				false => Poll::Ready(()),
+			})
+		);
 		Poll::Ready(match guard.outbox.pop_front() {
 			Some(Reply::Grant(grant)) => Ok(grant),
 			Some(Reply::Refuse { code, .. }) => Err(Error::Session(code)),
@@ -985,10 +987,12 @@ impl RequestVerdict {
 				reason: "no verifier".to_string(),
 			});
 		};
-		let mut guard = ready_or!(issue.poll(waiter, |issue| match issue.outbox.is_empty() && !issue.done {
-			true => Poll::Pending,
-			false => Poll::Ready(()),
-		}));
+		let mut guard = ready_or!(
+			issue.poll(waiter, |issue| match issue.outbox.is_empty() && !issue.done {
+				true => Poll::Pending,
+				false => Poll::Ready(()),
+			})
+		);
 		Poll::Ready(match guard.outbox.pop_front() {
 			Some(reply) => reply,
 			// Done with nothing more to read: the acceptor dropped the issued grant, ending
@@ -1364,12 +1368,7 @@ mod request_token_tests {
 	async fn a_request_token_reaches_the_acceptor_with_its_context() {
 		let handle = Handle::new(true);
 		let mut requests = handle.requests().expect("take the requests");
-		let verdict = handle.verify_request(
-			Bytes::from_static(b"jwt"),
-			7,
-			subscribe_path(),
-			RequestKind::Subscribe,
-		);
+		let verdict = handle.verify_request(Bytes::from_static(b"jwt"), 7, subscribe_path(), RequestKind::Subscribe);
 
 		let request = requests.next().await.expect("a request");
 		assert_eq!(request.token(), &Bytes::from_static(b"jwt"));
@@ -1419,11 +1418,7 @@ mod request_token_tests {
 		let handle = Handle::new(true);
 		let mut requests = handle.requests().unwrap();
 		let verdict = handle.verify_request(Bytes::from_static(b"jwt"), 0, subscribe_path(), RequestKind::Subscribe);
-		requests
-			.next()
-			.await
-			.unwrap()
-			.reject(SessionError::Unauthorized, "no");
+		requests.next().await.unwrap().reject(SessionError::Unauthorized, "no");
 		let err = verdict.grant().await.expect_err("refused");
 		assert!(matches!(err, Error::Session(SessionError::Unauthorized)), "{err:?}");
 	}
@@ -1558,7 +1553,10 @@ mod request_token_tests {
 			.await
 			.unwrap()
 			.reject(SessionError::Unauthorized, "bad token");
-		assert!(matches!(renewal.grant().await, Err(Error::Session(SessionError::Unauthorized))));
+		assert!(matches!(
+			renewal.grant().await,
+			Err(Error::Session(SessionError::Unauthorized))
+		));
 
 		// The old grant still stands with its original expiry, and the request ends only
 		// when that lapses.

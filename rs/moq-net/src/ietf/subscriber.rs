@@ -1095,8 +1095,13 @@ where
 					return Err(err);
 				}
 				Err(_) => {
-					self.write_error(&mut stream, request_id, &Error::Unauthorized, "malformed authorization token")
-						.await?;
+					self.write_error(
+						&mut stream,
+						request_id,
+						&Error::Unauthorized,
+						"malformed authorization token",
+					)
+					.await?;
 					let _ = stream.writer.close().await;
 					return Ok(());
 				}
@@ -1126,7 +1131,8 @@ where
 				}
 				// UNAUTHORIZED for a refusal, NOT_SUPPORTED when no consumer verifies tokens.
 				Err(err) => {
-					self.write_error(&mut stream, request_id, &err, &err.to_string()).await?;
+					self.write_error(&mut stream, request_id, &err, &err.to_string())
+						.await?;
 					let _ = stream.writer.close().await;
 					return Ok(());
 				}
@@ -1316,8 +1322,13 @@ where
 						return Err(err);
 					}
 					Err(_) => {
-						self.write_error(stream, msg.request_id, &Error::Unauthorized, "malformed authorization token")
-							.await?;
+						self.write_error(
+							stream,
+							msg.request_id,
+							&Error::Unauthorized,
+							"malformed authorization token",
+						)
+						.await?;
 						continue;
 					}
 				};
@@ -1858,8 +1869,7 @@ where
 		let subscription = request.subscription();
 		// The wire priority this subscription was opened at, re-sent unchanged on a
 		// request-token renewal so the update carries the token without disturbing anything.
-		let subscriber_priority =
-			super::priority::to_wire(subscription.as_ref().map(|s| s.priority).unwrap_or(0));
+		let subscriber_priority = super::priority::to_wire(subscription.as_ref().map(|s| s.priority).unwrap_or(0));
 		// A live join delivers nothing below the group SUBSCRIBE_OK names as Largest.
 		let live = subscription.as_ref().and_then(|s| s.start).is_none();
 		let join = match subscribe_join(
@@ -4359,7 +4369,10 @@ mod tests {
 			}
 			settle().await;
 		}
-		assert!(sent, "a token-bearing client must subscribe outside its connection grant");
+		assert!(
+			sent,
+			"a token-bearing client must subscribe outside its connection grant"
+		);
 		drop(subscription);
 		drop(track);
 		drop(consumer);
@@ -5296,7 +5309,10 @@ mod tests {
 
 		for _ in 0..500 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended during setup");
+			assert!(
+				futures::poll!(run.as_mut()).is_pending(),
+				"the announce ended during setup"
+			);
 			if answered.load(std::sync::atomic::Ordering::Relaxed) >= 2 {
 				break;
 			}
@@ -5319,7 +5335,10 @@ mod tests {
 		tokio::time::advance(std::time::Duration::from_secs(120)).await;
 		for _ in 0..50 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(run.as_mut()).is_pending(), "renewal did not extend the announce");
+			assert!(
+				futures::poll!(run.as_mut()).is_pending(),
+				"renewal did not extend the announce"
+			);
 			settle().await;
 		}
 		assert!(
@@ -5435,14 +5454,20 @@ mod tests {
 			let mut routed = false;
 			for _ in 0..500 {
 				let _ = futures::poll!(acceptor.as_mut());
-				assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended during setup");
+				assert!(
+					futures::poll!(run.as_mut()).is_pending(),
+					"the announce ended during setup"
+				);
 				if routed_now(&consumer, "room/alice").is_some() {
 					routed = true;
 					break;
 				}
 				settle().await;
 			}
-			assert!(routed, "a token on a no-auth session must be verified and admitted, not ignored");
+			assert!(
+				routed,
+				"a token on a no-auth session must be verified and admitted, not ignored"
+			);
 			assert!(
 				consulted.load(std::sync::atomic::Ordering::Relaxed) >= 1,
 				"the token must reach the acceptor, not be admitted by the permissive default"
@@ -5493,12 +5518,8 @@ mod tests {
 		let mut msg = token_publish_namespace();
 		msg.authorization_token = None;
 
-		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
-			stream,
-			msg,
-			cluster::Peer::default(),
-			None,
-		));
+		let mut run =
+			std::pin::pin!(subscriber.run_publish_namespace_stream(stream, msg, cluster::Peer::default(), None,));
 		let mut routed = false;
 		for _ in 0..500 {
 			assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended early");
@@ -5508,7 +5529,10 @@ mod tests {
 			}
 			settle().await;
 		}
-		assert!(routed, "a token-less announce is admitted by the origin model as before");
+		assert!(
+			routed,
+			"a token-less announce is admitted by the origin model as before"
+		);
 	}
 
 	/// NAMESPACE has no REQUEST_UPDATE, so a peer reprices one by re-sending it on the

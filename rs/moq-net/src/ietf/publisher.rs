@@ -554,7 +554,9 @@ where
 				let structure = match crate::ietf::token::decode_value(token, self.version) {
 					Ok(structure) => structure,
 					Err(err @ Error::ProtocolViolation) => {
-						self.session.clone().close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
+						self.session
+							.clone()
+							.close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
 						return Err(err);
 					}
 					Err(_) => {
@@ -880,7 +882,9 @@ where
 							let structure = match crate::ietf::token::decode_value(token, self.version) {
 								Ok(structure) => structure,
 								Err(err @ Error::ProtocolViolation) => {
-									self.session.clone().close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
+									self.session
+										.clone()
+										.close(crate::SessionError::ProtocolViolation.to_code(), &err.to_string());
 									return Err(err);
 								}
 								Err(_) => {
@@ -3334,7 +3338,10 @@ mod serve_tests {
 			}
 			settle().await;
 		}
-		assert!(advertised, "a token-bearing client must announce outside its connection grant");
+		assert!(
+			advertised,
+			"a token-bearing client must announce outside its connection grant"
+		);
 
 		// Without a token, the same grant filters "cam": nothing is advertised.
 		let origin2 = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
@@ -3359,7 +3366,11 @@ mod serve_tests {
 			assert!(futures::poll!(run2.as_mut()).is_pending());
 			settle().await;
 		}
-		assert_eq!(occurrences(&log2, b"cam"), 0, "a token-less client self-censors on its grant");
+		assert_eq!(
+			occurrences(&log2, b"cam"),
+			0,
+			"a token-less client self-censors on its grant"
+		);
 	}
 
 	/// A Token structure value that decodes via `token::decode_value` (USE_VALUE, kind 300).
@@ -3438,13 +3449,20 @@ mod serve_tests {
 		// Drive until the acceptor has answered the initial token and the renewal.
 		for _ in 0..500 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(serving.as_mut()).is_pending(), "subscription ended during setup");
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"subscription ended during setup"
+			);
 			if answered.load(Ordering::Relaxed) >= 2 {
 				break;
 			}
 			settle().await;
 		}
-		assert_eq!(answered.load(Ordering::Relaxed), 2, "acceptor never answered both tokens");
+		assert_eq!(
+			answered.load(Ordering::Relaxed),
+			2,
+			"acceptor never answered both tokens"
+		);
 
 		// Let the serve loop apply the renewal it read off the stream.
 		for _ in 0..20 {
@@ -3505,13 +3523,20 @@ mod serve_tests {
 
 		for _ in 0..500 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(serving.as_mut()).is_pending(), "subscription ended during setup");
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"subscription ended during setup"
+			);
 			if answered.load(Ordering::Relaxed) >= 2 {
 				break;
 			}
 			settle().await;
 		}
-		assert_eq!(answered.load(Ordering::Relaxed), 2, "acceptor never answered both tokens");
+		assert_eq!(
+			answered.load(Ordering::Relaxed),
+			2,
+			"acceptor never answered both tokens"
+		);
 
 		for _ in 0..20 {
 			let _ = futures::poll!(acceptor.as_mut());
@@ -3566,13 +3591,20 @@ mod serve_tests {
 
 		for _ in 0..500 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(serving.as_mut()).is_pending(), "subscription ended during setup");
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"subscription ended during setup"
+			);
 			if answered.load(Ordering::Relaxed) >= 2 {
 				break;
 			}
 			settle().await;
 		}
-		assert_eq!(answered.load(Ordering::Relaxed), 2, "acceptor never answered both tokens");
+		assert_eq!(
+			answered.load(Ordering::Relaxed),
+			2,
+			"acceptor never answered both tokens"
+		);
 
 		// Let the serve loop apply the refusal (which keeps the old grant).
 		for _ in 0..20 {
@@ -3656,7 +3688,10 @@ mod serve_tests {
 		// Let the loop read the REQUEST_UPDATE and the acceptor pop both requests.
 		for _ in 0..500 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(serving.as_mut()).is_pending(), "the subscription ended during setup");
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"the subscription ended during setup"
+			);
 			if popped.load(Ordering::Relaxed) >= 2 {
 				break;
 			}
@@ -3689,8 +3724,14 @@ mod serve_tests {
 		const VERSION: Version = Version::Draft18;
 		let auth = crate::auth::Handle::new(false);
 		let mut requests = auth.requests().unwrap();
-		assert!(auth.allows(crate::auth::Direction::Publish, "room"), "None union is permissive");
-		assert!(!auth.covers(crate::auth::Direction::Publish, "room"), "None union does not cover");
+		assert!(
+			auth.allows(crate::auth::Direction::Publish, "room"),
+			"None union is permissive"
+		);
+		assert!(
+			!auth.covers(crate::auth::Direction::Publish, "room"),
+			"None union does not cover"
+		);
 
 		let h = serve_with_auth(VERSION, auth, Vec::new());
 		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
@@ -3715,7 +3756,10 @@ mod serve_tests {
 		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
 		for _ in 0..500 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(futures::poll!(serving.as_mut()).is_pending(), "the subscription ended early");
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"the subscription ended early"
+			);
 			if consulted.load(Ordering::Relaxed) >= 1 {
 				break;
 			}
@@ -5286,7 +5330,11 @@ mod tests {
 			}
 			settle().await;
 		}
-		assert_eq!(occurrences(&log, &token_bytes), 1, "the initial token rode the announce once");
+		assert_eq!(
+			occurrences(&log, &token_bytes),
+			1,
+			"the initial token rode the announce once"
+		);
 
 		// Setting the same value again wakes the loop but changes nothing, so no REQUEST_UPDATE.
 		token.set(Some(token_bytes.clone()));

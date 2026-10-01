@@ -779,7 +779,9 @@ mod tests {
 		encode_params!(&mut body, version, 0x03 => Some(bytes::Bytes::from_static(token)));
 		let mut buf = body.freeze();
 		assert_eq!(
-			Fetch::decode_msg(&mut buf, version).expect("strict token accepted").request_id,
+			Fetch::decode_msg(&mut buf, version)
+				.expect("strict token accepted")
+				.request_id,
 			RequestId(1)
 		);
 		assert!(buf.is_empty());

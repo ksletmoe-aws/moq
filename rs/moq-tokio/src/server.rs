@@ -438,7 +438,8 @@ impl Server {
 	/// than the values it returns.
 	///
 	/// Empty when no TLS-bearing backend is configured (e.g. a stream-only server).
-	pub fn certificates(&self) -> crate::tls::Certificates {		#[cfg(feature = "noq")]
+	pub fn certificates(&self) -> crate::tls::Certificates {
+		#[cfg(feature = "noq")]
 		if let Some(noq) = self.noq.as_ref() {
 			return noq.certificates();
 		}

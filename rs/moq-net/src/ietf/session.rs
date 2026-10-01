@@ -1282,7 +1282,10 @@ mod tests {
 		)
 		.await;
 
-		assert!(result.is_ok(), "a token-bearing client must not be closed by grant enforcement");
+		assert!(
+			result.is_ok(),
+			"a token-bearing client must not be closed by grant enforcement"
+		);
 		assert!(
 			log.closes().is_empty(),
 			"the session must stay open for a token-bearing client"
