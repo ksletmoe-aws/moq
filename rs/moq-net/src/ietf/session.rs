@@ -328,20 +328,19 @@ where
 					let declare_auth = auth.supported();
 					let declare_solicit = solicit;
 					async move {
-						if let Err(err) =
-							run_setup(
-								runtime,
-								session,
-								version,
-								path,
-								authority,
-								self_origin,
-								cost,
-								declare_auth,
-								declare_solicit,
-								goaway,
-							)
-							.await
+						if let Err(err) = run_setup(
+							runtime,
+							session,
+							version,
+							path,
+							authority,
+							self_origin,
+							cost,
+							declare_auth,
+							declare_solicit,
+							goaway,
+						)
+						.await
 						{
 							tracing::warn!(%err, "setup send error");
 						}
@@ -1581,6 +1580,8 @@ mod tests {
 				peer_setup_stream: None,
 				peer_declared: Some(peer::Peer::default()),
 				auth: crate::auth::Handle::new(false),
+				request_token: crate::RequestToken::default(),
+				solicit: true,
 			})
 			.expect("start the session");
 

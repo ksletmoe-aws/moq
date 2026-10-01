@@ -359,7 +359,7 @@ impl Handle {
 	) -> RequestVerdict {
 		match self.acceptor() {
 			Some(queue) => {
-				let issue = Issue::shared();
+				let issue = kio::Shared::<Issue>::default();
 				// A closed queue (the app dropped its Requests) hands the request back, and
 				// dropping it refuses the token with Unauthorized.
 				let _ = queue.try_push(Request::new_request(token, token_kind, path, kind, issue.clone()));
@@ -549,10 +549,10 @@ impl Handle {
 	/// default. Only the token-bearing path uses this; the token-less path keeps `allows`.
 	pub(crate) fn covers(&self, direction: Direction, path: &str) -> bool {
 		let state = self.state.read();
-		state
-			.union
-			.as_ref()
-			.is_some_and(|union| union.patterns(direction).matches(path))
+		state.union.as_ref().is_some_and(|union| match direction {
+			Direction::Publish => union.publish.matches(path),
+			Direction::Subscribe => union.subscribe.matches(path),
+		})
 	}
 
 	/// The peer turned out not to negotiate AUTH: fail every token as unsupported and
@@ -1455,7 +1455,7 @@ mod request_token_tests {
 	/// acceptor can tell it apart from a request token.
 	#[test]
 	fn a_session_token_has_no_request_context() {
-		let request = Request::new(Bytes::new(), Issue::shared());
+		let request = Request::new(Bytes::new(), kio::Shared::<Issue>::default());
 		assert_eq!(request.path(), None);
 		assert_eq!(request.kind(), None);
 		assert_eq!(request.token_kind(), None);
