@@ -1893,9 +1893,7 @@ where
 			return Ok(Refused::No);
 		};
 		let request_id = self.control.next_request_id(&self.runtime).await?;
-		let mut update = ietf::PublishNamespaceUpdate::between(request_id, &held, &next);
-		// The credential rides the update too, so a reprice also refreshes the request token.
-		update.authorization_token = self.request_token.peek();
+		let update = ietf::PublishNamespaceUpdate::between(request_id, &held, &next);
 
 		request.stream.writer.encode(&ietf::PublishNamespaceUpdate::ID).await?;
 		request.stream.writer.encode(&update).await?;
@@ -5875,6 +5873,69 @@ mod tests {
 		assert_eq!(occurrences(&log, &expected), 1, "REQUEST_UPDATE with an explicit 0");
 		assert_eq!(occurrences(&log, b"cam"), 1, "PUBLISH_NAMESPACE was not repeated");
 		assert_eq!(log.bi_opens(), 1, "the update rode the request's own stream");
+	}
+
+	/// A token-bearing client's reprice carries only the cluster change, never the unchanged
+	/// token: a receiver renewing a token-authorized announce answers a token-bearing update as
+	/// a renewal, which would drop the HOP_PATH / ROUTE_COST riding it.
+	#[tokio::test]
+	async fn a_reprice_does_not_carry_the_request_token() {
+		const VERSION: Version = Version::Draft19;
+		let token = bytes::Bytes::from_static(&[0x03, 0x00, b'o', b'k']);
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cold = origin
+			.announce("cam", crate::origin::Route::default().with_cost(4))
+			.unwrap();
+		settle().await;
+
+		let ok = publish_namespace_ok(VERSION).await;
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![[ok.clone(), ok].concat()]);
+		let log = session.log.clone();
+
+		let publisher = Publisher::new(
+			crate::time::Clock::tokio(),
+			session,
+			origin.consume(),
+			Control::new(None, false),
+			None,
+			clustered(Some(false)),
+			VERSION,
+		)
+		.with_request_token(crate::RequestToken::new(Some(token.clone())));
+
+		let mut run = std::pin::pin!(publisher.run_publish_namespaces());
+		for _ in 0..100 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, &token) >= 1 {
+				break;
+			}
+			settle().await;
+		}
+		assert_eq!(occurrences(&log, &token), 1, "the token rides the PUBLISH_NAMESPACE");
+
+		let _warm = origin
+			.announce("cam", crate::origin::Route::default().with_cost(0))
+			.unwrap();
+		let expected = request_update(
+			VERSION,
+			&ietf::PublishNamespaceUpdate {
+				request_id: RequestId(3),
+				hops: None,
+				cost: Some(0),
+				authorization_token: None,
+			},
+		)
+		.await;
+		for _ in 0..100 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			if occurrences(&log, &expected) >= 1 {
+				break;
+			}
+			settle().await;
+		}
+		assert_eq!(occurrences(&log, &expected), 1, "the reprice is token-free");
+		assert_eq!(occurrences(&log, &token), 1, "the token was not re-sent on the reprice");
 	}
 
 	/// A route from a different original publisher updates the advertisement in place,

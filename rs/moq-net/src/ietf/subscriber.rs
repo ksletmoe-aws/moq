@@ -1306,8 +1306,8 @@ where
 
 			// A REQUEST_UPDATE carrying a fresh token refreshes the announce's request grant
 			// (MoQ request-token), when the announce is token-authorized. The verify is not
-			// awaited here: it becomes the pending renewal raced against the deadline above. A
-			// cluster reprice never carries a token.
+			// awaited here: it becomes the pending renewal raced against the deadline above.
+			// Our sender keeps renewals token-only, so a reprice never rides one.
 			if let Some(token) = &msg.authorization_token
 				&& token_grant.is_some()
 			{
