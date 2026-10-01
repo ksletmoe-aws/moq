@@ -1176,6 +1176,8 @@ pub(crate) struct Gate {
 	path: crate::PathOwned,
 	direction: Direction,
 	epoch: u64,
+	/// Watch the limit alone, for a request a token authorized in place of the union.
+	limit_only: bool,
 }
 
 impl Gate {
@@ -1185,6 +1187,16 @@ impl Gate {
 			path,
 			direction,
 			epoch: 0,
+			limit_only: false,
+		}
+	}
+
+	/// A gate on the limit alone: a request token stands in for the union, never for the
+	/// ceiling this side set on the peer, so a later narrowing still ends the request.
+	pub(crate) fn limit(handle: Handle, path: crate::PathOwned, direction: Direction) -> Self {
+		Self {
+			limit_only: true,
+			..Self::new(handle, path, direction)
 		}
 	}
 
@@ -1194,7 +1206,11 @@ impl Gate {
 	pub(crate) fn poll_denied(&mut self, waiter: &kio::Waiter) -> Poll<()> {
 		loop {
 			let permit = ready_or!(self.handle.poll_permit(self.direction, &mut self.epoch, waiter));
-			if !permit.matches(self.path.as_str()) {
+			let allowed = match self.limit_only {
+				true => permit.within_limit(self.path.as_str()),
+				false => permit.matches(self.path.as_str()),
+			};
+			if !allowed {
 				return Poll::Ready(());
 			}
 		}

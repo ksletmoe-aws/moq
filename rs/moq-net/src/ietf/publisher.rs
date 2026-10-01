@@ -533,10 +533,10 @@ where
 			// origin. The session grant is checked first; a request it does not cover falls
 			// back to an AUTHORIZATION TOKEN carried on the SUBSCRIBE itself (MoQ
 			// request-token), verified by the app's acceptor and scoped to this one request.
-			// A union-authorized subscription is gated on the union so it ends if the union
-			// later narrows; a token-authorized one is not (the union never covered it), and
-			// its grant instead ends with the request when `_request_grant` drops.
-			let mut gate = None;
+			// Every admitted subscription is gated so it ends if the session narrows: a
+			// union-authorized one on the union and the limit, a token-authorized one on the
+			// limit alone (the union never covered it; its grant ends with the request).
+			let mut gate;
 			let mut request_grant = None;
 			// A request presenting a token is authorized by it whenever the session union does
 			// not positively cover the path. `covers` treats a `None` union (no answer yet, or a
@@ -548,6 +548,15 @@ where
 					.auth
 					.covers(crate::auth::Direction::Publish, msg.track_namespace.as_str())
 			{
+				// The token stands in for the union, never for the limit this side set on the
+				// peer: a request outside that ceiling is refused whatever the token grants.
+				if !self
+					.auth
+					.within_limit(crate::auth::Direction::Publish, msg.track_namespace.as_str())
+				{
+					let err = Error::Unauthorized;
+					return self.reject_subscribe(stream, request_id, &err, "not granted").await;
+				}
 				// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol violation
 				// and closes the session exactly as on the SETUP path; a merely-undecodable
 				// structure is refused per request without tearing down the connection.
@@ -578,13 +587,18 @@ where
 					Ok(grant) if crate::auth::RequestKind::Subscribe.covers(&grant, msg.track_namespace.as_str()) => {
 						// Held for the subscription's life: the request ends when this grant
 						// lapses, is revoked, or stops covering it (RequestGrant::poll_ended
-						// below), never the session.
+						// below), or when the limit narrows past it (the gate), never the session.
 						request_grant = Some(crate::auth::RequestGrant::new(
 							&self.runtime,
 							verdict,
 							grant,
 							msg.track_namespace.to_owned(),
 							crate::auth::RequestKind::Subscribe,
+						));
+						gate = Some(crate::auth::Gate::limit(
+							self.auth.clone(),
+							msg.track_namespace.to_owned(),
+							crate::auth::Direction::Publish,
 						));
 					}
 					Ok(_) => {
@@ -1671,8 +1685,12 @@ where
 		// when the announce carries it: a PUBLISH_NAMESPACE request does, an inline NAMESPACE
 		// entry has no slot for one. So the grant still filters inline entries, and stands down
 		// only for requests, where the server's covers-gate refuses a bad token per request.
+		// The token never stands in for the limit this side set on the peer.
 		let carries_token = matches!(ns.target, Target::Requests(_)) && self.request_token.peek().is_some();
-		let permitted = carries_token || ns.permitted(path);
+		let permitted = match carries_token {
+			true => ns.permit.within_limit(path.as_str()),
+			false => ns.permitted(path),
+		};
 		let Namespaces {
 			peer,
 			target,
@@ -3370,6 +3388,40 @@ mod serve_tests {
 		);
 	}
 
+	/// A request token stands in for the connection grant, never for the limit this side set
+	/// on the peer: a token-bearing client still withholds an announce outside that limit.
+	#[tokio::test]
+	async fn a_request_token_does_not_lift_the_local_limit_on_announces() {
+		const VERSION: Version = Version::Draft18;
+		let token = bytes::Bytes::from_static(&[0x03, 0x00, b'o', b'k']);
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("cam", crate::origin::Route::default()).unwrap();
+		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![Vec::new()]);
+		let log = session.log.clone();
+		let peer_setup = peer::PeerSetup::default();
+		peer_setup.set(peer::Peer::default());
+		let auth = crate::auth::Handle::new(false);
+		auth.authorize(&crate::auth::Grant::default());
+		let publisher = Publisher::new(
+			crate::time::Clock::tokio(),
+			session,
+			origin.consume(),
+			Control::new(None, false),
+			None,
+			peer_setup,
+			VERSION,
+		)
+		.with_auth(auth)
+		.with_request_token(crate::RequestToken::new(Some(token.clone())));
+		let mut run = std::pin::pin!(publisher.run_publish_namespaces());
+		for _ in 0..100 {
+			assert!(futures::poll!(run.as_mut()).is_pending());
+			settle().await;
+		}
+		assert_eq!(occurrences(&log, b"cam"), 0, "the limit still withholds the announce");
+	}
+
 	/// A peer that requires solicitation gets inline NAMESPACE entries, which have no slot for a
 	/// request token, so the token cannot authorize them: the connection grant still filters the
 	/// answer to its SUBSCRIBE_NAMESPACE.
@@ -3921,6 +3973,30 @@ mod serve_tests {
 		assert!(still_serving(&mut serving).await, "a read grant admits it");
 		let (_auth, _h, mut serving) = serve_token_subscribe(write_only, None).await;
 		assert!(!still_serving(&mut serving).await, "a write grant refuses it");
+	}
+
+	/// A request token stands in for the union, never for the limit this side set on the
+	/// peer: a SUBSCRIBE outside that ceiling is refused whatever the token grants, and a
+	/// later narrowing ends one the token admitted.
+	#[tokio::test]
+	async fn a_request_token_cannot_exceed_the_local_limit() {
+		let nothing = Some(crate::auth::Grant::default());
+		let (_auth, _h, mut serving) = serve_token_subscribe(crate::auth::Grant::all(), nothing).await;
+		assert!(
+			!still_serving(&mut serving).await,
+			"a limit of nothing refuses an all-covering token"
+		);
+
+		let (auth, _h, mut serving) = serve_token_subscribe(crate::auth::Grant::all(), None).await;
+		assert!(
+			still_serving(&mut serving).await,
+			"an unlimited session admits the token"
+		);
+		auth.authorize(&crate::auth::Grant::default());
+		assert!(
+			!still_serving(&mut serving).await,
+			"narrowing the limit ends a token-authorized subscription"
+		);
 	}
 
 	/// A distinctive request id, so `[FetchHeader::TYPE, REQUEST_ID]` is a usable needle.

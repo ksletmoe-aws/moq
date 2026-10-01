@@ -1853,20 +1853,28 @@ where
 			return;
 		}
 
-		// A token-bearing client does not self-censor on its connection grant: a request token
-		// authorizes a subscribe the connection grant does not cover (MoQ request-token, quest
-		// Goal), and the server's covers-gate is the authority. Without a token this is unchanged:
-		// the connection grant filters, and its shrink revokes, as before.
+		// A SUBSCRIBE always carries the token, so a token-bearing client does not self-censor
+		// on its connection grant: the token authorizes what that grant does not cover, and the
+		// server's covers-gate is the authority. The token stands in for the grant only, never
+		// for the limit this side set on the peer, which still filters and, narrowing, revokes.
 		let token_authorized = self.request_token.peek().is_some();
-		if !token_authorized
-			&& !self
+		let allowed = match token_authorized {
+			true => self
 				.auth
-				.allows(crate::auth::Direction::Subscribe, broadcast_path.as_str())
-		{
+				.within_limit(crate::auth::Direction::Subscribe, broadcast_path.as_str()),
+			false => self
+				.auth
+				.allows(crate::auth::Direction::Subscribe, broadcast_path.as_str()),
+		};
+		if !allowed {
 			request.reject(Error::Unauthorized);
 			return;
 		}
-		let mut gate = crate::auth::Gate::new(
+		let gate_for = match token_authorized {
+			true => crate::auth::Gate::limit,
+			false => crate::auth::Gate::new,
+		};
+		let mut gate = gate_for(
 			self.auth.clone(),
 			broadcast_path.to_owned(),
 			crate::auth::Direction::Subscribe,
@@ -2128,7 +2136,7 @@ where
 					{
 						fetch_done = true;
 					}
-					if !token_authorized && gate.poll_denied(waiter).is_ready() {
+					if gate.poll_denied(waiter).is_ready() {
 						return Poll::Ready(End::Revoked);
 					}
 					if track.poll_unused(waiter).is_ready() {
