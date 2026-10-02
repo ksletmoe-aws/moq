@@ -167,13 +167,13 @@ after which it can never sign a broader token.
 ### On a request
 
 The same `AUTHORIZATION TOKEN` may ride an individual request (SUBSCRIBE,
-REQUEST_UPDATE, PUBLISH_NAMESPACE, FETCH, PUBLISH, SUBSCRIBE_NAMESPACE,
-TRACK_STATUS), not only the SETUP. A request is authorized by the session's
+REQUEST\_UPDATE, PUBLISH\_NAMESPACE, FETCH, PUBLISH, SUBSCRIBE\_NAMESPACE,
+TRACK\_STATUS), not only the SETUP. A request is authorized by the session's
 grant first; when that does not cover the request's path, by the token on the
 request; with neither it is refused `UNAUTHORIZED`. A request token's grant
 covers only the request it rode on, never widens the session, and ends when
-the request ends. A REQUEST_UPDATE carrying a fresh token refreshes it, so a
-long-lived request (an ingest PUBLISH_NAMESPACE, a subscription) renews its
+the request ends. A REQUEST\_UPDATE carrying a fresh token refreshes it, so a
+long-lived request (an ingest PUBLISH\_NAMESPACE, a subscription) renews its
 credential in place without reconnecting; a refused renewal leaves the old
 grant standing until it lapses.
 
