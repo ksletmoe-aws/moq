@@ -43,6 +43,8 @@ impl Config {
 pub struct Client {
 	moq: moq_net::Client,
 	/// The request token each session presents, from [`crate::connect::Config::with_request_token`].
+	/// Only the dial paths read it, so it is absent without a transport, like [`Self::timeout`].
+	#[cfg(feature = "_transport")]
 	request_token: Option<bytes::Bytes>,
 	/// The single resolved set of protocol versions, used to advertise moq ALPNs across
 	/// every transport (passed into the QUIC backend's `connect` and used directly for
