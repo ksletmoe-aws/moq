@@ -872,6 +872,13 @@ where
 	}
 }
 
+/// Whether to serve an inbound AUTH stream: only when the peer advertised MoQ Auth AND this
+/// endpoint offered it (its handle is supported). The Auth draft's Setup Negotiation requires
+/// both offers; without this endpoint's offer, an inbound AUTH stream is a protocol violation.
+fn serve_inbound_auth(peer_offered: bool, local_supported: bool) -> bool {
+	peer_offered && local_supported
+}
+
 /// Accept incoming bidi streams and dispatch to the correct handler based on message type.
 async fn run_dispatch<S>(
 	session: S,
@@ -891,12 +898,12 @@ where
 	// costs a handshake round rather than blocking.
 	let peer = subscriber.peer().await;
 
-	// An AUTH from a peer that did not negotiate MoQ Auth is an unknown request, which
-	// falls through to the protocol violation below.
-	let serve = match peer_setup.get().await.auth {
-		true => serve,
-		false => None,
-	};
+	// Serve inbound AUTH only when both endpoints negotiated it. The handle carries
+	// `peer.auth && local.auth` from the handshake, so a peer that advertised AUTH this
+	// endpoint never offered leaves no serve task and its AUTH stream falls through to the
+	// protocol violation below, as the Auth draft's Setup Negotiation requires both offers.
+	let peer_auth = peer_setup.get().await.auth;
+	let serve = serve.filter(|serve| serve_inbound_auth(peer_auth, serve.handle.supported()));
 
 	// From the same slot, so this costs nothing extra: it decides whether an unsolicited
 	// advertisement is the peer ignoring our own SETUP (MoQ Solicit).
@@ -1115,6 +1122,21 @@ async fn announces_carry_token(peer_setup: &peer::PeerSetup, version: Version) -
 mod tests {
 	use super::*;
 	use crate::model::ProduceTest;
+
+	// An inbound AUTH is served only when both sides offered it. Before the fix the dispatch
+	// kept the serve task on the peer's offer alone, so a server that declined MoQ Auth still
+	// served a client that offered it; now a declined local offer drops the serve task and the
+	// AUTH stream becomes an UnexpectedStream protocol violation.
+	#[test]
+	fn inbound_auth_requires_both_offers() {
+		assert!(serve_inbound_auth(true, true), "both offered: serve it");
+		assert!(
+			!serve_inbound_auth(true, false),
+			"peer offered, this endpoint declined: an inbound AUTH is a protocol violation"
+		);
+		assert!(!serve_inbound_auth(false, true), "peer did not offer: nothing to serve");
+		assert!(!serve_inbound_auth(false, false), "neither offered");
+	}
 
 	fn occurrences(log: &crate::lite::test_transport::Log, needle: &[u8]) -> usize {
 		let writes = log.writes.lock().unwrap();
