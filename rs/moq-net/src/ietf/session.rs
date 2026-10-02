@@ -71,11 +71,6 @@ pub struct Config<S: crate::transport::poll::Session> {
 	/// version can negotiate it; the peer's SETUP decides whether it does.
 	pub auth: crate::auth::Handle,
 
-	/// The AUTHORIZATION TOKEN a client presents on its own SUBSCRIBE / PUBLISH_NAMESPACE
-	/// requests (MoQ request-token), a shared handle so it can be replaced while the session
-	/// runs. The default presents none, for a server or a client that presents none.
-	pub request_token: crate::RequestToken,
-
 	/// The extensions we offer in our SETUP (draft-17+). Without MoQ Solicit a peer that
 	/// speaks it sends an unsolicited PUBLISH_NAMESPACE (the base moq-transport behavior)
 	/// instead of answering our SUBSCRIBE_NAMESPACE inline. MoQ Auth is offered only when
@@ -103,9 +98,9 @@ where
 		peer_setup_stream,
 		peer_declared,
 		auth,
-		request_token,
 		extensions,
 	} = config;
+	let request_token = auth.request_token();
 	let solicit = extensions.solicit;
 
 	// GOAWAY wiring: the public Session holds one half (drain trigger, received
@@ -1190,7 +1185,6 @@ mod tests {
 				..Default::default()
 			}),
 			auth: crate::auth::Handle::new(false),
-			request_token: crate::RequestToken::default(),
 			extensions: Default::default(),
 		})
 		.expect("start the session");
@@ -1245,7 +1239,6 @@ mod tests {
 			// The requests wait on the peer's SETUP (MoQ Hidden).
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
-			request_token: crate::RequestToken::default(),
 			extensions: Default::default(),
 		})
 		.expect("start the session");
@@ -1378,7 +1371,6 @@ mod tests {
 			peer_setup_stream: None,
 			peer_declared,
 			auth: crate::auth::Handle::new(false),
-			request_token: crate::RequestToken::default(),
 			extensions: Default::default(),
 		})
 		.expect("start the session");
@@ -1481,7 +1473,6 @@ mod tests {
 				..Default::default()
 			}),
 			auth: handle.clone(),
-			request_token: crate::RequestToken::default(),
 			extensions: Default::default(),
 		})
 		.expect("start the session");
@@ -1596,7 +1587,6 @@ mod tests {
 			// carry and the dispatch loop actually runs.
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
-			request_token: crate::RequestToken::default(),
 			extensions: Default::default(),
 		})
 		.expect("start the session");
@@ -1637,7 +1627,6 @@ mod tests {
 				peer_setup_stream: None,
 				peer_declared: Some(peer::Peer::default()),
 				auth: crate::auth::Handle::new(false),
-				request_token: crate::RequestToken::default(),
 				extensions: Default::default(),
 			})
 			.expect("start the session");
@@ -1837,7 +1826,6 @@ mod tests {
 			peer_setup_stream: None,
 			peer_declared: None,
 			auth: crate::auth::Handle::new(false),
-			request_token: crate::RequestToken::default(),
 			extensions: Default::default(),
 		})
 		.expect("start the session");

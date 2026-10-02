@@ -198,9 +198,6 @@ async fn connect(opts: Options) -> Pair {
 	if let Some(subscribe) = opts.client_subscribe {
 		client = client.with_subscriber(subscribe);
 	}
-	if let Some(token) = opts.client_request_token {
-		client = client.with_request_token(token);
-	}
 	if opts.client_decline_auth {
 		let mut extensions = moq_net::setup::Extensions::default();
 		extensions.auth = false;
@@ -223,8 +220,13 @@ async fn connect(opts: Options) -> Pair {
 
 	let observe = client_transport.clone();
 	let observe_server = server_transport.clone();
+	let client_token = opts.client_request_token;
 	let client_fut = async {
 		let (session, driver) = client.connect(now(), client_transport).await.expect("client handshake");
+		// Set before the driver runs, so the first request already carries it.
+		if let Some(token) = client_token {
+			session.auth().set_request_token(token);
+		}
 		tokio::spawn(run(driver));
 		session
 	};
@@ -508,6 +510,86 @@ async fn a_client_may_decline_the_auth_extension() {
 		bc.announce(Default::default()).unwrap();
 		wait_announced(&bare_relay.consume(), "room/bob", true).await;
 		assert_eq!(bare.client_transport.close_reason(), None);
+	})
+	.await
+	.expect("timed out");
+}
+
+/// A request token renews over the wire: replacing it on the client's `Session::auth()`
+/// re-presents it on the live SUBSCRIBE as a REQUEST_UPDATE, the server's driver routes it to
+/// the acceptor, and the new grant keeps the subscription alive past the old one's expiry.
+/// Runs through both drivers at draft-18, in the shape a base moq-transport peer produces
+/// (no MoQ Auth, so the token is what authorizes).
+#[tokio::test]
+async fn a_request_token_renews_a_subscription_through_the_driver() {
+	within(async {
+		let ts = |ms| moq_net::Timestamp::from_millis(ms).unwrap();
+		let prefs = || moq_net::track::Subscription::default().with_max_age(Duration::from_secs(10));
+		let server_origin = produce_origin(1);
+		let down = server_origin.create_broadcast("room/alice").unwrap();
+		let down_track = down.create_track("video", None).unwrap();
+		down.announce(Default::default()).unwrap();
+
+		let first = vec![0x03, 0x00, b'a', b'a'];
+		let second = vec![0x03, 0x00, b'b', b'b'];
+		let received = produce_origin(3);
+		let mut pair = connect(Options {
+			version: Some(MOQT_18),
+			client_subscribe: Some(received.clone()),
+			client_request_token: Some(first.clone()),
+			client_decline_auth: true,
+			server_publish: Some(server_origin.clone()),
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+
+		// The first token lapses in a second; the renewal never does.
+		let expires = Some(now() + Duration::from_secs(1));
+		// The acceptor sees the Token structure's value, past its USE_VALUE header.
+		let renewal = second[2..].to_vec();
+		let requests = pair.requests.take().expect("server took its requests pre-ok");
+		let mut answered = serve(requests, move |token| {
+			let mut granted = grant(&[], &["room/alice"]);
+			if token != renewal.as_slice() {
+				granted.expires = expires;
+			}
+			Some(granted)
+		});
+
+		let remote = received.consume().routed_broadcast("room/alice").await.unwrap();
+		let mut sub = remote.track("video").unwrap().subscribe(prefs()).await.unwrap();
+		let mut group = down_track.append_group().unwrap();
+		group.write_frame(ts(0), b"one".as_ref()).unwrap();
+		group.finish().unwrap();
+		let (token, _first_issued) = answered.recv().await.expect("the first token reached the acceptor");
+		assert_eq!(token, first[2..]);
+		sub.recv_group().await.unwrap().unwrap();
+
+		pair.client.auth().set_request_token(second.clone());
+		let (token, _renewed) = answered.recv().await.expect("the renewal reached the acceptor");
+		assert_eq!(token, second[2..], "the replaced token rides the REQUEST_UPDATE");
+
+		// Past the first grant's expiry the subscription still delivers.
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+		let mut group = down_track.append_group().unwrap();
+		group.write_frame(ts(2000), b"two".as_ref()).unwrap();
+		group.finish().unwrap();
+		sub.recv_group()
+			.await
+			.unwrap()
+			.expect("the renewed subscription is still live");
+		assert_eq!(
+			pair.client_transport.close_reason(),
+			None,
+			"renewal never touches the session"
+		);
+		// The same subscription carried on: a lapse would have ended it, and the client's
+		// re-subscribe would have reached the acceptor as another request.
+		assert!(
+			answered.try_recv().is_err(),
+			"the original subscription was renewed, not replaced"
+		);
 	})
 	.await
 	.expect("timed out");

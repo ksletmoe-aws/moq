@@ -238,12 +238,64 @@ impl Permit {
 	}
 }
 
+/// The `AUTHORIZATION TOKEN` this side presents on its own SUBSCRIBE and PUBLISH_NAMESPACE
+/// requests (MoQ request-token), shared between a session's [`Handle`] and its driver.
+///
+/// The session reads the current value when it first sends a request, and re-presents a
+/// changed one on each live request as a REQUEST_UPDATE. The default presents no token,
+/// which is byte-identical to a session that never sets one.
+#[derive(Clone, Default)]
+pub(crate) struct RequestToken {
+	token: kio::Shared<Option<bytes::Bytes>>,
+}
+
+impl RequestToken {
+	/// A credential presenting `token` (or none) until replaced.
+	#[cfg(test)]
+	pub(crate) fn new(token: Option<bytes::Bytes>) -> Self {
+		Self {
+			token: kio::Shared::new(token),
+		}
+	}
+
+	/// Replace the token presented on this session's requests. A live request re-presents
+	/// it as a REQUEST_UPDATE on its next turn; setting the same value again is a no-op.
+	pub(crate) fn set(&self, token: Option<Bytes>) {
+		*self.token.lock() = token;
+	}
+
+	/// The token to present right now, read when a request is first sent.
+	pub(crate) fn peek(&self) -> Option<bytes::Bytes> {
+		self.token.read().clone()
+	}
+
+	/// Ready with the current token once it differs from `last`, registering `waiter`
+	/// otherwise. The send loops park here to re-present a replaced token on their live
+	/// requests; it reads without advancing `last`, so a poll that loses its turn to
+	/// another arm is re-offered the change rather than dropping it.
+	pub(crate) fn poll_changed(
+		&self,
+		last: &Option<bytes::Bytes>,
+		waiter: &kio::Waiter,
+	) -> std::task::Poll<Option<bytes::Bytes>> {
+		use std::task::Poll;
+		match self.token.poll(waiter, |cur| match **cur == *last {
+			true => Poll::Pending,
+			false => Poll::Ready(()),
+		}) {
+			Poll::Ready(guard) => Poll::Ready((*guard).clone()),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
 /// The session's auth handle, returned by [`Session::auth`](crate::Session::auth).
 ///
 /// Cheap to clone; every clone shares the session's tokens.
 #[derive(Clone)]
 pub struct Handle {
 	state: kio::Shared<State>,
+	request_token: RequestToken,
 }
 
 impl Handle {
@@ -254,7 +306,25 @@ impl Handle {
 				supported,
 				..Default::default()
 			}),
+			request_token: RequestToken::default(),
 		}
+	}
+
+	/// Present `token` as the `AUTHORIZATION TOKEN` on this side's own requests (MoQ
+	/// request-token), as distinct from a connection credential, which [`add`](Self::add)
+	/// presents for the whole session.
+	///
+	/// Set it before running the session's driver to present it on the first request.
+	/// Replacing it later re-presents the new token on every live request as a
+	/// REQUEST_UPDATE, renewing a token-authorized request in place; setting the same value
+	/// again sends nothing. Independent of the MoQ Auth extension.
+	pub fn set_request_token(&self, token: impl Into<Bytes>) {
+		self.request_token.set(Some(token.into()));
+	}
+
+	/// The request-token cell the session's publisher and subscriber present from.
+	pub(crate) fn request_token(&self) -> RequestToken {
+		self.request_token.clone()
 	}
 
 	/// Whether this session speaks the AUTH extension. False on a version that cannot

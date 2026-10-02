@@ -573,7 +573,6 @@ where
 				peer_setup_stream: Some(peer_setup.stream),
 				peer_declared: Some(peer_setup.declared),
 				auth: auth.clone(),
-				request_token: crate::RequestToken::default(),
 				extensions: server.extensions,
 			})?;
 			tracing::debug!(?version, "connected");
@@ -695,7 +694,6 @@ where
 						peer_setup_stream: None,
 						peer_declared: Some(peer_declared),
 						auth: auth.clone(),
-						request_token: crate::RequestToken::default(),
 						// The legacy server already declared its extensions in its SETUP above;
 						// this arm sends no further SETUP.
 						extensions: server.extensions,

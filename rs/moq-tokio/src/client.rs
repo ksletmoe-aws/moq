@@ -42,6 +42,8 @@ impl Config {
 #[derive(Clone)]
 pub struct Client {
 	moq: moq_net::Client,
+	/// The request token each session presents, from [`crate::connect::Config::with_request_token`].
+	request_token: Option<bytes::Bytes>,
 	/// The single resolved set of protocol versions, used to advertise moq ALPNs across
 	/// every transport (passed into the QUIC backend's `connect` and used directly for
 	/// raw TCP/UDS qmux and WebSocket). Resolved once in [`Client::new`] so the ALPN list
@@ -135,6 +137,7 @@ impl Client {
 			moq: moq_net::Client::new()
 				.with_versions(versions.clone())
 				.with_extensions(config.extensions),
+			request_token: config.request_token.clone().map(|token| token.0),
 			#[cfg(any(
 				feature = "noq",
 				feature = "iroh",
@@ -223,22 +226,6 @@ impl Client {
 	pub fn with_peer_hop(mut self, hop: moq_net::Hop) -> Self {
 		self.moq = self.moq.with_peer_hop(hop);
 		self
-	}
-
-	/// Present an `AUTHORIZATION TOKEN` on this client's own requests (SUBSCRIBE /
-	/// PUBLISH_NAMESPACE and their REQUEST_UPDATEs), so a request the session grant does not
-	/// cover is authorized the standard draft-17+ way (MoQ request-token); see
-	/// [`moq_net::Client::with_request_token`].
-	pub fn with_request_token(mut self, token: impl Into<bytes::Bytes>) -> Self {
-		self.moq = self.moq.with_request_token(token);
-		self
-	}
-
-	/// Replace the `AUTHORIZATION TOKEN` this client presents, for a session already running,
-	/// so a refreshed credential is re-presented on every live request as a REQUEST_UPDATE
-	/// without reconnecting; see [`moq_net::Client::set_request_token`].
-	pub fn set_request_token(&self, token: impl Into<bytes::Bytes>) {
-		self.moq.set_request_token(token);
 	}
 
 	/// Override whether this client redials after a session drop.
@@ -399,7 +386,12 @@ impl Client {
 		if url.scheme() == "tcp" {
 			let session =
 				crate::tcp::connect(url, &self.versions.alpns(), self.failover_delay, self.resolution_delay).await?;
-			return Ok(connect_session(&moq, crate::transport::Session::new(session)).await?);
+			return Ok(connect_session(
+				&moq,
+				self.request_token.as_ref(),
+				crate::transport::Session::new(session),
+			)
+			.await?);
 		}
 
 		// Unix domain socket (qmux, no TLS). Same-host only; the server can
@@ -407,7 +399,12 @@ impl Client {
 		#[cfg(all(feature = "uds", unix))]
 		if url.scheme() == "unix" {
 			let session = crate::unix::connect(url, &self.versions.alpns()).await?;
-			return Ok(connect_session(&moq, crate::transport::Session::new(session)).await?);
+			return Ok(connect_session(
+				&moq,
+				self.request_token.as_ref(),
+				crate::transport::Session::new(session),
+			)
+			.await?);
 		}
 
 		// A WebSocket URL names its transport. No QUIC backend can dial it, so there is
@@ -433,7 +430,12 @@ impl Client {
 				crate::iroh::Binding::H3 => self.moq.clone(),
 			};
 
-			return Ok(connect_session(&moq, crate::transport::Session::new(session)).await?);
+			return Ok(connect_session(
+				&moq,
+				self.request_token.as_ref(),
+				crate::transport::Session::new(session),
+			)
+			.await?);
 		}
 
 		#[cfg(feature = "noq")]
@@ -455,7 +457,7 @@ impl Client {
 			#[cfg(not(feature = "websocket"))]
 			{
 				let session = quic_handle.await?;
-				return Ok(connect_session(&moq, session).await?);
+				return Ok(connect_session(&moq, self.request_token.as_ref(), session).await?);
 			}
 		}
 
@@ -473,7 +475,12 @@ impl Client {
 		let alpns = self.versions.alpns();
 		let session =
 			crate::websocket::connect(&self.websocket, &self.tls, self.tls_host_name.as_deref(), addr, &alpns).await?;
-		Ok(connect_session(&self.moq, crate::transport::Session::new(session)).await?)
+		Ok(connect_session(
+			&self.moq,
+			self.request_token.as_ref(),
+			crate::transport::Session::new(session),
+		)
+		.await?)
 	}
 
 	/// Race the QUIC dial against the WebSocket fallback, handshaking whichever wins.
@@ -506,10 +513,13 @@ impl Client {
 		};
 
 		match race_transport_connect(quic, websocket).await? {
-			TransportRace::Quic(quic) => Ok(connect_session(moq, quic).await?),
-			TransportRace::WebSocket(websocket) => {
-				Ok(connect_session(&self.moq, crate::transport::Session::new(websocket)).await?)
-			}
+			TransportRace::Quic(quic) => Ok(connect_session(moq, self.request_token.as_ref(), quic).await?),
+			TransportRace::WebSocket(websocket) => Ok(connect_session(
+				&self.moq,
+				self.request_token.as_ref(),
+				crate::transport::Session::new(websocket),
+			)
+			.await?),
 		}
 	}
 }
@@ -674,11 +684,16 @@ where
 ))]
 async fn connect_session<S: moq_net::transport::poll::Boxable>(
 	client: &moq_net::Client,
+	request_token: Option<&bytes::Bytes>,
 	transport: S,
 ) -> Result<moq_net::Session, moq_net::Error> {
 	let (session, driver) = client
 		.connect(tokio::time::Instant::now().into_std(), transport)
 		.await?;
+	// Before the driver runs, so the session's first request already carries it.
+	if let Some(token) = request_token {
+		session.auth().set_request_token(token.clone());
+	}
 	use tracing::Instrument;
 	tokio::spawn(moq_net::time::run(driver).instrument(tracing::Span::current()));
 	Ok(session)
@@ -687,16 +702,6 @@ async fn connect_session<S: moq_net::transport::poll::Boxable>(
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	/// Compile-level check that the moq-tokio client exposes `with_request_token` and chains
-	/// (returns `Self`), delegating to `moq_net::Client`. The token's wire round-trip is proven
-	/// at the moq-net layer (`a_configured_request_token_rides_the_publish_namespace`); moq-tokio
-	/// has no in-process wire harness to re-run it here, and building a `Client` needs a
-	/// transport feature, so this is a builder-signature check rather than a live send.
-	#[allow(dead_code)]
-	fn with_request_token_chains(client: Client) -> Client {
-		client.with_request_token(bytes::Bytes::from_static(&[0x03, 0x81, 0x2c, 0x00, 0xff]))
-	}
 
 	#[cfg(feature = "noq")]
 	#[tokio::test]
