@@ -1209,8 +1209,16 @@ where
 		mut token_grant: Option<crate::auth::RequestGrant<crate::time::Clock>>,
 	) -> Result<(), Error> {
 		let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
-		// A message that arrived while a renewal was pending, handled once it resolves.
-		let mut stashed: Option<(u64, bytes::Bytes)> = None;
+		// Updates that arrived while a renewal was pending, handled in order once each verdict
+		// resolves. A FIFO queue, not a single slot: draft-18 section 10.9.1 permits coalescing
+		// the cumulative deltas but still requires an answer per update, so an earlier buffered
+		// update must not be dropped by a later one. The queue is bounded, so a peer cannot grow
+		// it without limit behind a slow verdict.
+		const MAX_BUFFERED_RENEWALS: usize = 16;
+		let mut stashed: std::collections::VecDeque<(u64, bytes::Bytes)> = std::collections::VecDeque::new();
+		// A withdrawal read while a renewal was pending, handled ahead of any queued update so
+		// a buffered update never masks it: nothing more is owed once the peer retracts.
+		let mut terminal_msg: Option<(u64, bytes::Bytes)> = None;
 		loop {
 			// A renewal verify in flight is raced against the request grant's deadline (never
 			// a bare await), so the old deadline can still fire while a slow acceptor decides,
@@ -1246,7 +1254,7 @@ where
 						// broken, so the next read starts fresh and keeps watching.
 						match waiter.poll_future(read.as_mut()) {
 							Poll::Ready(Ok(Some((id, data)))) if terminal_publish_namespace(version, id) => {
-								stashed = Some((id, data));
+								terminal_msg = Some((id, data));
 								Poll::Ready(Ren::Withdrawn)
 							}
 							Poll::Ready(Ok(Some(message))) => Poll::Ready(Ren::Buffered(message)),
@@ -1265,9 +1273,19 @@ where
 						continue;
 					}
 					Ren::Buffered(message) => {
-						// Hold the latest update to handle once the verdict resolves; the loop
-						// keeps reading, so a terminal is never masked by it.
-						stashed = Some(message);
+						// Queue the update to handle once the verdict resolves; the loop keeps
+						// reading, so a terminal is never masked by it. Each buffered update is
+						// kept, in order, so none loses its cluster delta or its answer. Too many
+						// outstanding behind a slow verdict ends this announce, never the session
+						// (an Err would reach the dispatcher as a protocol violation and close it),
+						// as draft-19 MAX_REQUEST_UPDATES allows: finish the stream and stop.
+						if stashed.len() >= MAX_BUFFERED_RENEWALS {
+							if stream.writer.finish().is_ok() {
+								let _ = stream.writer.closed().await;
+							}
+							return Ok(());
+						}
+						stashed.push_back(message);
 						continue;
 					}
 					Ren::Renewal(res) => res,
@@ -1301,7 +1319,11 @@ where
 				Closed,
 				Ended(Error),
 			}
-			let ctl = if let Some((id, data)) = stashed.take() {
+			let ctl = if let Some((id, data)) = terminal_msg.take() {
+				// A withdrawal read while a renewal was pending ends the announce now, ahead of
+				// any queued update: nothing more is owed once the peer retracts.
+				Ctl::Message(id, data)
+			} else if let Some((id, data)) = stashed.pop_front() {
 				Ctl::Message(id, data)
 			} else {
 				let mut read = std::pin::pin!(super::publisher::read_control(&mut stream.reader));
@@ -5539,6 +5561,156 @@ mod tests {
 		assert!(
 			rerouted,
 			"the update's cluster parameters must re-route the announce (cost 4 to 0), not be dropped by the renewal"
+		);
+	}
+
+	/// One PUBLISH_NAMESPACE REQUEST_UPDATE carrying a fresh token, keyed to its own Request ID,
+	/// optionally changing the HOP_PATH and/or ROUTE_COST, framed as the peer sends it.
+	async fn publish_namespace_update_token_rid(
+		version: Version,
+		rid: u64,
+		hops: Option<cluster::HopPath>,
+		cost: Option<u64>,
+	) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		let msg = ietf::PublishNamespaceUpdate {
+			request_id: RequestId(rid),
+			hops,
+			cost,
+			authorization_token: Some(announce_token()),
+		};
+		writer.encode(&ietf::PublishNamespaceUpdate::ID).await.unwrap();
+		writer.encode(&msg).await.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
+	/// Two announce renewals that arrive while a first renewal's verdict is still pending are
+	/// each verified, and each one's cluster delta is applied, not collapsed. The middle update
+	/// (0x04) changes only ROUTE_COST (4 to 1) and the last (0x05) only HOP_PATH, so the final
+	/// cost shows the middle delta survived; the single slot this replaced dropped 0x04,
+	/// leaving the cost at the initial 4 and never verifying its token.
+	#[tokio::test(start_paused = true)]
+	async fn two_announce_renewals_buffered_behind_a_pending_verdict_each_apply_and_answer() {
+		const VERSION: Version = Version::Draft18;
+
+		let mut script = publish_namespace_update_token_rid(VERSION, 0x03, None, None).await;
+		script.extend(publish_namespace_update_token_rid(VERSION, 0x04, None, Some(1)).await);
+		script.extend(publish_namespace_update_token_rid(VERSION, 0x05, Some(hop_path(&[7, 11])), None).await);
+		let (mut subscriber, mut requests, _cred, consumer, session) = auth_announce_harness(VERSION, script);
+		let rt = subscriber.runtime.clone();
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		// A negotiated peer over a free link, so the advertised cost is the route's warm cost.
+		let peer = cluster::Peer {
+			hop: Some(crate::Hop::new(9).unwrap()),
+			cost: Some(0),
+		};
+		// The announce arrives routed at cost 4; the buffered updates re-route it.
+		let mut initial = token_publish_namespace();
+		initial.cluster = Some(cluster::Advert {
+			hops: hop_path(&[7, 9]),
+			cost: 4,
+		});
+
+		// Hold the first renewal (0x03) so the next two (0x04, 0x05) are read and buffered while
+		// its verdict is pending: the window the single slot used to collapse.
+		let release = std::sync::Arc::new(tokio::sync::Notify::new());
+		let answered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let acceptor = {
+			let rt = rt.clone();
+			let answered = answered.clone();
+			let release = release.clone();
+			async move {
+				let first = requests.next().await.expect("a request");
+				let mut held = vec![first.accept(publish_grant_expiring(&rt, None))];
+				answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let a = requests.next().await.expect("a renewal");
+				release.notified().await;
+				held.push(a.accept(publish_grant_expiring(&rt, None)));
+				answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				loop {
+					let renewal = requests.next().await.expect("a renewal");
+					held.push(renewal.accept(publish_grant_expiring(&rt, None)));
+					answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				}
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(stream, initial, peer, None));
+
+		for _ in 0..200 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended early");
+			settle().await;
+		}
+		release.notify_one();
+		let mut both = false;
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended early");
+			if answered.load(std::sync::atomic::Ordering::Relaxed) >= 4
+				&& routed_now(&consumer, "room/alice").is_some_and(|route| route.cost.warm == 1)
+			{
+				both = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(
+			both,
+			"both buffered updates must each be verified (4 total) and each delta applied: the \
+			 middle update's cost (1), not the single-slot survivor's initial 4"
+		);
+	}
+
+	/// A peer cannot grow the announce renewal buffer without limit: once more than
+	/// MAX_BUFFERED_RENEWALS pile up behind a held verdict the announce ends and
+	/// run_publish_namespace_stream returns Ok, so the dispatcher does not treat it as a protocol
+	/// violation and close the session. Without the bound the loop buffered every update and never
+	/// ended; returning an error here would have closed the whole session.
+	#[tokio::test(start_paused = true)]
+	async fn too_many_announce_renewals_behind_a_held_verdict_end_the_announce_not_the_session() {
+		const VERSION: Version = Version::Draft18;
+
+		let mut script = Vec::new();
+		for rid in 0x40..=0x60u64 {
+			script.extend(publish_namespace_update_token_rid(VERSION, rid, None, None).await);
+		}
+		let (mut subscriber, mut requests, _cred, _consumer, session) = auth_announce_harness(VERSION, script);
+		let rt = subscriber.runtime.clone();
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		// Accept the initial token, then never answer a renewal, so the buffer only grows.
+		let acceptor = async move {
+			let first = requests.next().await.expect("a request");
+			let _held = first.accept(publish_grant_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+			stream,
+			token_publish_namespace(),
+			cluster::Peer::default(),
+			None,
+		));
+
+		let mut result = None;
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if let std::task::Poll::Ready(r) = futures::poll!(run.as_mut()) {
+				result = Some(r);
+				break;
+			}
+			settle().await;
+		}
+		assert!(
+			matches!(result, Some(Ok(()))),
+			"flooding past the cap must end the announce with Ok, not a session-closing error: {result:?}"
+		);
+		assert!(
+			session.log.closes().is_empty(),
+			"the flood ends the announce, not the session"
 		);
 	}
 

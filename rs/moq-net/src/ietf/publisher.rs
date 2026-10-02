@@ -803,8 +803,13 @@ where
 				// lives in an inner block, so that borrow is released before a renewal answers on
 				// `stream.writer`.
 				let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
-				// A message that arrived while a renewal was pending, handled once it resolves.
-				let mut stashed: Option<(u64, bytes::Bytes)> = None;
+				// Updates that arrived while a renewal was pending, handled in order once each
+				// verdict resolves. A FIFO queue, not a single slot: draft-18 section 10.9.1
+				// permits coalescing the cumulative deltas but still requires an answer per
+				// update, so an earlier buffered renewal must not be dropped by a later one. The
+				// queue is bounded, so a peer cannot grow it without limit behind a slow verdict.
+				const MAX_BUFFERED_RENEWALS: usize = 16;
+				let mut stashed: std::collections::VecDeque<(u64, bytes::Bytes)> = std::collections::VecDeque::new();
 				loop {
 					let step = if let Some((verdict, rid)) = pending.as_mut() {
 						let rid = *rid;
@@ -849,7 +854,7 @@ where
 							}
 						})
 						.await
-					} else if let Some((id, data)) = stashed.take() {
+					} else if let Some((id, data)) = stashed.pop_front() {
 						Step::Message(id, data)
 					} else {
 						let mut read = std::pin::pin!(read_control(&mut stream.reader));
@@ -887,10 +892,20 @@ where
 					match step {
 						Step::Served(served) | Step::Ended(served) => break Some(served),
 						Step::Closed => break None,
-						// A message arrived while a renewal was pending: hold the latest to handle
-						// once the verdict resolves (the loop keeps reading, so a terminal is never
-						// masked by it). A superseded buffered update is dropped, latest wins.
-						Step::Buffered(id, data) => stashed = Some((id, data)),
+						// A message arrived while a renewal was pending. Only a REQUEST_UPDATE is
+						// acted on, and the non-pending path ignores anything else, so drop other
+						// messages here rather than let a peer grow the queue with ones that will
+						// never be answered. Each renewal is kept, in order, so none loses its
+						// verdict or response; too many outstanding behind a slow verdict ends the
+						// request (not the session), as draft-19 MAX_REQUEST_UPDATES allows.
+						Step::Buffered(id, data) => {
+							if id == ietf::SubscribeUpdate::ID {
+								if stashed.len() >= MAX_BUFFERED_RENEWALS {
+									break Some((Err(Error::ProtocolViolation), false));
+								}
+								stashed.push_back((id, data));
+							}
+						}
 						Step::Renewal(res, rid) => {
 							// The pending verdict resolved: consume it and answer the update.
 							let (verdict, _) = pending.take().expect("a pending renewal");
@@ -3822,6 +3837,146 @@ mod serve_tests {
 			ended, !accept,
 			"{version:?}: accepted renewal keeps the subscription; a refused one lets the old grant lapse it"
 		);
+	}
+
+	/// One REQUEST_UPDATE carrying a fresh token, keyed to its own Request ID so several can be
+	/// told apart on the wire.
+	async fn subscribe_update_token_rid(version: Version, rid: u64) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		let subscription_request_id = match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => Some(RequestId(REQUEST_ID)),
+			_ => None,
+		};
+		let msg = ietf::SubscribeUpdate {
+			request_id: RequestId(rid),
+			subscription_request_id,
+			start_location: Location { group: 0, object: 0 },
+			end_group: 0,
+			subscriber_priority: Some(128),
+			forward: Some(true),
+			filter: None,
+			authorization_token: Some(request_token()),
+		};
+		writer.encode(&ietf::SubscribeUpdate::ID).await.unwrap();
+		writer.encode(&msg).await.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
+	/// Two token renewals that arrive while a first renewal's verdict is still pending are each
+	/// verified and answered, not collapsed. The loop keeps per-update state while a verify is
+	/// pending (draft-18 section 10.9.1 answers each update); the single slot it replaced
+	/// dropped the middle renewal (0x41) entirely, so its token was never verified.
+	#[tokio::test(start_paused = true)]
+	async fn two_renewals_buffered_behind_a_pending_verdict_each_get_a_verdict() {
+		const VERSION: Version = Version::Draft18;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		let mut script = subscribe_update_token_rid(VERSION, 0x40).await;
+		script.extend(subscribe_update_token_rid(VERSION, 0x41).await);
+		script.extend(subscribe_update_token_rid(VERSION, 0x42).await);
+		let h = serve_with_auth(VERSION, auth, script);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		// Hold the first renewal (0x40) so the next two (0x41, 0x42) are read and buffered while
+		// its verdict is pending: the exact window the single slot used to collapse.
+		let release = std::sync::Arc::new(tokio::sync::Notify::new());
+		let answered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let acceptor = {
+			let answered = answered.clone();
+			let release = release.clone();
+			async move {
+				let first = requests.next().await.unwrap();
+				let mut held = vec![first.accept(grant_all_expiring(&rt, None))];
+				answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let a = requests.next().await.unwrap();
+				release.notified().await;
+				held.push(a.accept(grant_all_expiring(&rt, None)));
+				answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				// 0x41 then 0x42: reached only if neither was dropped from the buffer.
+				loop {
+					let renewal = requests.next().await.unwrap();
+					held.push(renewal.accept(grant_all_expiring(&rt, None)));
+					answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				}
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		// Let 0x41 and 0x42 buffer behind the held 0x40.
+		for _ in 0..200 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending(), "ended during setup");
+			settle().await;
+		}
+		release.notify_one();
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(serving.as_mut()).is_pending());
+			if answered.load(std::sync::atomic::Ordering::Relaxed) >= 4 {
+				break;
+			}
+			settle().await;
+		}
+		assert_eq!(
+			answered.load(std::sync::atomic::Ordering::Relaxed),
+			4,
+			"the initial token and all three renewals must each be verified; the single slot dropped 0x41"
+		);
+	}
+
+	/// A peer cannot grow the pending-renewal buffer without limit: once more than
+	/// MAX_BUFFERED_RENEWALS pile up behind a held verdict the request ends, not the session, as
+	/// draft-19 MAX_REQUEST_UPDATES allows. Without the bound the loop buffered every renewal and
+	/// never ended.
+	#[tokio::test(start_paused = true)]
+	async fn too_many_renewals_behind_a_held_verdict_end_the_request() {
+		const VERSION: Version = Version::Draft18;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		// Well past the cap: the first renewal is held pending, the rest pile up behind it.
+		let mut script = Vec::new();
+		for rid in 0x40..=0x60u64 {
+			script.extend(subscribe_update_token_rid(VERSION, rid).await);
+		}
+		let h = serve_with_auth(VERSION, auth, script);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		// Accept the initial token, then never answer a renewal, so the buffer only grows.
+		let acceptor = async move {
+			let first = requests.next().await.unwrap();
+			let _held = first.accept(grant_all_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		let mut ended = false;
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if futures::poll!(serving.as_mut()).is_ready() {
+				ended = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(ended, "flooding past the renewal cap must end the request");
+		assert!(h.log.closes().is_empty(), "the flood ends the request, not the session");
 	}
 
 	/// A peer that ends the subscription while a renewal is still being verified ends it here
