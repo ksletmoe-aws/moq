@@ -445,7 +445,7 @@ pub(super) struct Subscriber<S: crate::transport::poll::Session> {
 	// session runs; the default presents none. A client credential.
 	request_token: crate::RequestToken,
 	// Whether we declared MoQ Solicit in our SETUP (`solicit::into_setup`). True by default;
-	// a server built with `Server::without_solicit` sets it false. It gates whether an
+	// a side that does not offer it (`Extensions::solicit` off) sets it false. It gates whether an
 	// unsolicited PUBLISH_NAMESPACE from a solicit-aware peer is a violation: only a peer that
 	// disregarded a requirement we actually stated is at fault.
 	declared_solicit: bool,
@@ -581,8 +581,8 @@ where
 		});
 	}
 
-	/// Whether we declared MoQ Solicit in our SETUP. A server built with
-	/// [`Server::without_solicit`](crate::Server::without_solicit) passes false, so an
+	/// Whether we declared MoQ Solicit in our SETUP. A side that does not offer it
+	/// ([`Extensions::solicit`](crate::setup::Extensions::solicit) off) passes false, so an
 	/// unsolicited PUBLISH_NAMESPACE from a solicit-aware peer is expected rather than a
 	/// violation.
 	pub fn with_solicit(mut self, declared: bool) -> Self {
@@ -1032,8 +1032,8 @@ where
 	/// request is also how a peer answers our SUBSCRIBE_NAMESPACE there, and the message
 	/// alone does not say which it is.
 	fn unsolicited_is_a_violation(&self, declared: Option<bool>) -> bool {
-		// We only hold a peer to a requirement we actually stated. A server that declined MoQ
-		// Solicit (`Server::without_solicit`) invited unsolicited advertisements, so one is
+		// We only hold a peer to a requirement we actually stated. A side that did not offer MoQ
+		// Solicit invited unsolicited advertisements, so one is
 		// expected even from a solicit-aware peer.
 		if !self.declared_solicit {
 			return false;

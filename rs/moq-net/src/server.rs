@@ -20,7 +20,7 @@ pub struct Server {
 	subscribe: Option<origin::Producer>,
 	stats: stats::Session,
 	versions: Versions,
-	decline_solicit: bool,
+	extensions: crate::setup::Extensions,
 }
 
 impl Server {
@@ -66,18 +66,9 @@ impl Server {
 		self
 	}
 
-	/// Do not require solicited announcements: omit the MoQ Solicit Setup Option from this
-	/// server's SETUP.
-	///
-	/// By default a server declares MoQ Solicit, so a peer that speaks the extension answers
-	/// our SUBSCRIBE_NAMESPACE inline rather than sending an unsolicited PUBLISH_NAMESPACE.
-	/// Declining it makes such a peer fall back to the base moq-transport behavior and send an
-	/// unsolicited PUBLISH_NAMESPACE. Use for peers that do not speak the MoQ Solicit extension
-	/// (a standard moq-transport encoder or CDN), which never solicit and always announce
-	/// unasked; the server already accepts an unsolicited PUBLISH_NAMESPACE either way. Additive:
-	/// the default still declares the extension.
-	pub fn without_solicit(mut self) -> Self {
-		self.decline_solicit = true;
+	/// Choose which moq-transport extensions this server offers in its SETUP. Defaults to all.
+	pub fn with_extensions(mut self, extensions: crate::setup::Extensions) -> Self {
+		self.extensions = extensions;
 		self
 	}
 
@@ -442,8 +433,9 @@ impl Server {
 			origin: peer_setup.declared.cluster.hop.filter(|h| *h != crate::Hop::UNKNOWN),
 			token: peer_setup.token.clone(),
 			assigned_hop: crate::Hop::random(),
-			// The client's SETUP already settled whether MoQ Auth is negotiated.
-			auth: crate::auth::Handle::new(peer_setup.declared.auth),
+			// The client's SETUP already settled whether MoQ Auth is negotiated, unless this
+			// server does not offer it.
+			auth: crate::auth::Handle::new(peer_setup.declared.auth && self.extensions.auth),
 			inner: Some(RequestInner {
 				server: self.clone(),
 				runtime,
@@ -582,8 +574,7 @@ where
 				peer_declared: Some(peer_setup.declared),
 				auth: auth.clone(),
 				request_token: crate::RequestToken::default(),
-				// Declare MoQ Solicit unless the server declined it.
-				solicit: !server.decline_solicit,
+				extensions: server.extensions,
 			})?;
 			tracing::debug!(?version, "connected");
 			Ok(Session::new(
@@ -646,8 +637,7 @@ where
 					let mut parameters = ietf::Parameters::default();
 					parameters.set_varint(ietf::ParameterVarInt::MaxRequestId, u32::MAX as u64);
 					parameters.set_bytes(ietf::ParameterBytes::Implementation, b"moq-lite-rs".to_vec());
-					// Declare MoQ Solicit unless the server declined it.
-					if !server.decline_solicit {
+					if server.extensions.solicit {
 						ietf::solicit::into_setup(&mut parameters, v);
 					}
 					ietf::hidden::into_setup(&mut parameters, v);
@@ -706,9 +696,9 @@ where
 						peer_declared: Some(peer_declared),
 						auth: auth.clone(),
 						request_token: crate::RequestToken::default(),
-						// The legacy server already declared Solicit (or not) in its SETUP above;
-						// this arm sends no further SETUP, so the flag is inert here.
-						solicit: !server.decline_solicit,
+						// The legacy server already declared its extensions in its SETUP above;
+						// this arm sends no further SETUP.
+						extensions: server.extensions,
 					})?;
 					(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 				}

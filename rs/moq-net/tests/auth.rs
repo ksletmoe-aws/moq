@@ -168,10 +168,12 @@ struct Options {
 	server_requests: bool,
 	/// A request token the client attaches to its outgoing PUBLISH_NAMESPACE / SUBSCRIBE.
 	client_request_token: Option<Vec<u8>>,
-	/// The client declines the MoQ Auth extension (`Client::without_auth_extension`).
+	/// The client does not offer the MoQ Auth extension (`Extensions::auth` off).
 	client_decline_auth: bool,
-	/// The server declines the MoQ Solicit extension (`Server::without_solicit`).
+	/// The server does not offer the MoQ Solicit extension (`Extensions::solicit` off).
 	server_decline_solicit: bool,
+	/// The server does not offer the MoQ Auth extension (`Extensions::auth` off).
+	server_decline_auth: bool,
 	version: Option<&'static str>,
 }
 
@@ -200,12 +202,17 @@ async fn connect(opts: Options) -> Pair {
 		client = client.with_request_token(token);
 	}
 	if opts.client_decline_auth {
-		client = client.without_auth_extension();
+		let mut extensions = moq_net::setup::Extensions::default();
+		extensions.auth = false;
+		client = client.with_extensions(extensions);
 	}
 
 	let mut server = Server::new().with_versions(version.into());
-	if opts.server_decline_solicit {
-		server = server.without_solicit();
+	if opts.server_decline_solicit || opts.server_decline_auth {
+		let mut extensions = moq_net::setup::Extensions::default();
+		extensions.solicit = !opts.server_decline_solicit;
+		extensions.auth = !opts.server_decline_auth;
+		server = server.with_extensions(extensions);
 	}
 	if let Some(publish) = &opts.server_publish {
 		server = server.with_publisher(publish);
@@ -413,6 +420,37 @@ async fn a_request_token_authorizes_a_legacy_announce_through_the_driver() {
 /// draft-16+ regardless of this option: moq-net declares MoQ Solicit unconditionally, so
 /// the announce answers the peer's SUBSCRIBE_NAMESPACE inline via `ietf::Namespace`, which
 /// carries no token, and the token-bearing unsolicited PUBLISH_NAMESPACE loop is disabled.
+/// A server that does not offer the MoQ Auth extension leaves it un-negotiated even with a
+/// client that offers it: neither side presents a session token.
+#[tokio::test]
+async fn a_server_may_decline_the_auth_extension() {
+	within(async {
+		// Control: with the default extensions the client's connection credential earns a grant.
+		let offered = connect(Options {
+			version: Some(MOQT_18),
+			..Default::default()
+		})
+		.await;
+		wait_for(offered.client.auth().grant(), Option::is_some).await.unwrap();
+
+		let declined = connect(Options {
+			version: Some(MOQT_18),
+			server_decline_auth: true,
+			..Default::default()
+		})
+		.await;
+		let granted = tokio::time::timeout(
+			Duration::from_millis(200),
+			wait_for(declined.client.auth().grant(), Option::is_some),
+		)
+		.await;
+		assert!(granted.is_err(), "no grant without the extension: {granted:?}");
+		assert!(matches!(declined.client.auth().add("x").await, Err(Error::Unsupported)));
+	})
+	.await
+	.expect("timed out");
+}
+
 #[tokio::test]
 async fn a_client_may_decline_the_auth_extension() {
 	within(async {

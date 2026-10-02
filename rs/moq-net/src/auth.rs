@@ -258,8 +258,8 @@ impl Handle {
 	}
 
 	/// Whether this session speaks the AUTH extension. False on a version that cannot
-	/// negotiate it, and on a handle a caller built declined (see
-	/// `Client::without_auth_extension`), so the SETUP omits the option and no
+	/// negotiate it, and on a handle whose side does not offer it (`Extensions::auth` off),
+	/// so the SETUP omits the option and no
 	/// connection credential is presented.
 	pub(crate) fn supported(&self) -> bool {
 		self.state.lock().supported

@@ -76,11 +76,11 @@ pub struct Config<S: crate::transport::poll::Session> {
 	/// runs. The default presents none, for a server or a client that presents none.
 	pub request_token: crate::RequestToken,
 
-	/// Whether to declare the MoQ Solicit Setup Option in our SETUP (draft-17+). Default true.
-	/// A server built with `Server::without_solicit` passes false, so a peer that speaks the
-	/// extension sends an unsolicited PUBLISH_NAMESPACE (the base moq-transport behavior)
-	/// instead of answering our SUBSCRIBE_NAMESPACE inline. A client always declares it.
-	pub solicit: bool,
+	/// The extensions we offer in our SETUP (draft-17+). Without MoQ Solicit a peer that
+	/// speaks it sends an unsolicited PUBLISH_NAMESPACE (the base moq-transport behavior)
+	/// instead of answering our SUBSCRIBE_NAMESPACE inline. MoQ Auth is offered only when
+	/// [`Self::auth`] also supports it.
+	pub extensions: crate::setup::Extensions,
 }
 
 pub fn start<S>(config: Config<S>) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
@@ -104,8 +104,9 @@ where
 		peer_declared,
 		auth,
 		request_token,
-		solicit,
+		extensions,
 	} = config;
+	let solicit = extensions.solicit;
 
 	// GOAWAY wiring: the public Session holds one half (drain trigger, received
 	// signal), the protocol tasks below hold the other.
@@ -325,8 +326,10 @@ where
 					let runtime = runtime.clone();
 					let session = session.clone();
 					let goaway = goaway.clone();
-					let declare_auth = auth.supported();
-					let declare_solicit = solicit;
+					let extensions = crate::setup::Extensions {
+						auth: auth.supported(),
+						..extensions
+					};
 					async move {
 						if let Err(err) = run_setup(
 							runtime,
@@ -336,8 +339,7 @@ where
 							authority,
 							self_origin,
 							cost,
-							declare_auth,
-							declare_solicit,
+							extensions,
 							goaway,
 						)
 						.await
@@ -646,12 +648,8 @@ fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer:
 ///
 /// `path` is the request path we advertise (clients on URL-less transports); a
 /// server passes `None`. `self_origin` and `cost` are the MoQ Cluster options, which
-/// declare our identity and (client-only) what this link costs to cross. `declare_solicit`
-/// offers the MoQ Solicit Setup Option; a server that declined it (see
-/// `Server::without_solicit`) passes false so a peer sends an unsolicited PUBLISH_NAMESPACE
-/// instead of answering our SUBSCRIBE_NAMESPACE inline. `declare_auth` offers the MoQ
-/// Auth Setup Option; a client that declined it (see `Client::without_auth_extension`)
-/// passes false to emulate a peer without the extension.
+/// declare our identity and (client-only) what this link costs to cross. `extensions`
+/// names which moq-dev Setup Options we offer.
 #[allow(clippy::too_many_arguments)]
 async fn run_setup<S: crate::transport::poll::Session>(
 	runtime: crate::time::Clock,
@@ -661,8 +659,7 @@ async fn run_setup<S: crate::transport::poll::Session>(
 	authority: Option<String>,
 	self_origin: Hop,
 	cost: Option<u64>,
-	declare_auth: bool,
-	declare_solicit: bool,
+	extensions: crate::setup::Extensions,
 	goaway: crate::goaway::Protocol,
 ) -> Result<(), Error> {
 	let outer_version = crate::Version::Ietf(version);
@@ -679,11 +676,11 @@ async fn run_setup<S: crate::transport::poll::Session>(
 		parameters.set_bytes(ietf::ParameterBytes::Authority, authority.into_bytes());
 	}
 	cluster::peer_into_setup(&mut parameters, self_origin, cost, version);
-	if declare_solicit {
+	if extensions.solicit {
 		solicit::into_setup(&mut parameters, version);
 	}
 	hidden::into_setup(&mut parameters, version);
-	if declare_auth {
+	if extensions.auth {
 		auth::into_setup(&mut parameters, version);
 	}
 	let parameters = parameters.encode_bytes(version)?;
@@ -1194,7 +1191,7 @@ mod tests {
 			}),
 			auth: crate::auth::Handle::new(false),
 			request_token: crate::RequestToken::default(),
-			solicit: true,
+			extensions: Default::default(),
 		})
 		.expect("start the session");
 
@@ -1249,7 +1246,7 @@ mod tests {
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
 			request_token: crate::RequestToken::default(),
-			solicit: true,
+			extensions: Default::default(),
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -1382,7 +1379,7 @@ mod tests {
 			peer_declared,
 			auth: crate::auth::Handle::new(false),
 			request_token: crate::RequestToken::default(),
-			solicit: true,
+			extensions: Default::default(),
 		})
 		.expect("start the session");
 		let _driver = tokio::spawn(driver);
@@ -1485,7 +1482,7 @@ mod tests {
 			}),
 			auth: handle.clone(),
 			request_token: crate::RequestToken::default(),
-			solicit: true,
+			extensions: Default::default(),
 		})
 		.expect("start the session");
 		AuthSession {
@@ -1600,7 +1597,7 @@ mod tests {
 			peer_declared: Some(peer::Peer::default()),
 			auth: crate::auth::Handle::new(false),
 			request_token: crate::RequestToken::default(),
-			solicit: true,
+			extensions: Default::default(),
 		})
 		.expect("start the session");
 
@@ -1641,7 +1638,7 @@ mod tests {
 				peer_declared: Some(peer::Peer::default()),
 				auth: crate::auth::Handle::new(false),
 				request_token: crate::RequestToken::default(),
-				solicit: true,
+				extensions: Default::default(),
 			})
 			.expect("start the session");
 
@@ -1841,7 +1838,7 @@ mod tests {
 			peer_declared: None,
 			auth: crate::auth::Handle::new(false),
 			request_token: crate::RequestToken::default(),
-			solicit: true,
+			extensions: Default::default(),
 		})
 		.expect("start the session");
 		let driver = tokio::spawn(driver);

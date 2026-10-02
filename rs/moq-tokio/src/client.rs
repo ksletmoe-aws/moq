@@ -132,7 +132,9 @@ impl Client {
 		let timeout = resolved.timeout;
 
 		Ok(Self {
-			moq: moq_net::Client::new().with_versions(versions.clone()),
+			moq: moq_net::Client::new()
+				.with_versions(versions.clone())
+				.with_extensions(config.extensions),
 			#[cfg(any(
 				feature = "noq",
 				feature = "iroh",
@@ -237,13 +239,6 @@ impl Client {
 	/// without reconnecting; see [`moq_net::Client::set_request_token`].
 	pub fn set_request_token(&self, token: impl Into<bytes::Bytes>) {
 		self.moq.set_request_token(token);
-	}
-
-	/// Do not declare the MoQ Auth extension in this client's SETUP, so it connects as a
-	/// peer without it (interop testing); see [`moq_net::Client::without_auth_extension`].
-	pub fn without_auth_extension(mut self) -> Self {
-		self.moq = self.moq.without_auth_extension();
-		self
 	}
 
 	/// Override whether this client redials after a session drop.

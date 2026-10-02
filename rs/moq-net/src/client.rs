@@ -74,7 +74,7 @@ pub struct Client {
 	cost: Option<u64>,
 	peer_hop: Option<crate::Hop>,
 	request_token: RequestToken,
-	decline_auth_extension: bool,
+	extensions: crate::setup::Extensions,
 }
 
 impl Client {
@@ -211,19 +211,9 @@ impl Client {
 		self.request_token.set(Some(token.into()));
 	}
 
-	/// Do not declare the MoQ Auth extension in this client's SETUP, so it connects as a
-	/// peer without it (interop testing).
-	///
-	/// A standard moq-transport peer (for example a non-moq-dev encoder or CDN) never
-	/// negotiates the moq-dev AUTH Setup Option, so its session carries no connection
-	/// grant and a request-borne `AUTHORIZATION TOKEN` (see
-	/// [`with_request_token`](Self::with_request_token)) is the authorizing artifact. A
-	/// moq-dev client normally declares the extension, which fills the session grant and
-	/// short-circuits the request token; this lets one emulate the peer that does not, so
-	/// the request-token path can be exercised at draft-17+. Additive: the default still
-	/// declares the extension. No effect on versions that do not negotiate it.
-	pub fn without_auth_extension(mut self) -> Self {
-		self.decline_auth_extension = true;
+	/// Choose which moq-transport extensions this client offers in its SETUP. Defaults to all.
+	pub fn with_extensions(mut self, extensions: crate::setup::Extensions) -> Self {
+		self.extensions = extensions;
 		self
 	}
 
@@ -359,10 +349,10 @@ impl Client {
 
 				// Draft-17+: SETUP is exchanged by the connection driver.
 				// We advertise the request path in our SETUP for URL-less transports.
-				// The peer's SETUP decides whether AUTH is negotiated. A client that
-				// declined the extension builds a handle that does not speak it, so its
-				// SETUP omits the option and no connection credential is presented.
-				let auth = crate::auth::Handle::new(!self.decline_auth_extension);
+				// The peer's SETUP decides whether AUTH is negotiated. A client that does not
+				// offer the extension builds a handle that does not speak it, so its SETUP
+				// omits the option and no connection credential is presented.
+				let auth = crate::auth::Handle::new(self.extensions.auth);
 				let (protocol, goaway) = ietf::start(ietf::Config {
 					runtime: runtime.clone(),
 					session: session.clone(),
@@ -380,8 +370,7 @@ impl Client {
 					peer_declared: None,
 					auth: auth.clone(),
 					request_token: self.request_token.clone(),
-					// A client always declares MoQ Solicit; only a server declines it.
-					solicit: true,
+					extensions: self.extensions,
 				})?;
 
 				tracing::debug!(version = ?v, "connected");
@@ -459,7 +448,9 @@ impl Client {
 		if let Some(authority) = &self.setup_authority {
 			parameters.set_bytes(ietf::ParameterBytes::Authority, authority.clone().into_bytes());
 		}
-		ietf::solicit::into_setup(&mut parameters, ietf_encoding);
+		if self.extensions.solicit {
+			ietf::solicit::into_setup(&mut parameters, ietf_encoding);
+		}
 		ietf::hidden::into_setup(&mut parameters, ietf_encoding);
 		let parameters = parameters.encode_bytes(ietf_encoding)?;
 
@@ -539,8 +530,7 @@ impl Client {
 					peer_declared: Some(peer_declared),
 					auth: auth.clone(),
 					request_token: self.request_token.clone(),
-					// A client always declares MoQ Solicit; only a server declines it.
-					solicit: true,
+					extensions: self.extensions,
 				})?;
 				(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 			}
