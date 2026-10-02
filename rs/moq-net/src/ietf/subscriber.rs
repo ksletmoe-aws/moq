@@ -1224,6 +1224,9 @@ where
 					Closed(Result<(), Error>),
 					// The peer withdrew the announce: the renewal no longer matters.
 					Withdrawn,
+					// A non-terminal update read while the verdict is pending: buffered to handle
+					// once it resolves, so the read keeps watching for a terminal meanwhile.
+					Buffered((u64, bytes::Bytes)),
 				}
 				let version = self.version;
 				let ren = {
@@ -1237,21 +1240,20 @@ where
 						if let Poll::Ready(res) = verdict.poll_grant(waiter) {
 							return Poll::Ready(Ren::Renewal(res));
 						}
-						if stashed.is_none() {
-							match waiter.poll_future(read.as_mut()) {
-								Poll::Ready(Ok(Some(message))) => {
-									let terminal = terminal_publish_namespace(version, message.0);
-									stashed = Some(message);
-									if terminal {
-										return Poll::Ready(Ren::Withdrawn);
-									}
-								}
-								Poll::Ready(Ok(None)) => return Poll::Ready(Ren::Closed(Ok(()))),
-								Poll::Ready(Err(err)) => return Poll::Ready(Ren::Closed(Err(err))),
-								Poll::Pending => {}
+						// Keep reading while the verdict is pending so a withdrawal still ends the
+						// announce: a buffered update must not mask a later terminal. A terminal is
+						// stashed and reported now; a non-terminal update is buffered and the wait
+						// broken, so the next read starts fresh and keeps watching.
+						match waiter.poll_future(read.as_mut()) {
+							Poll::Ready(Ok(Some((id, data)))) if terminal_publish_namespace(version, id) => {
+								stashed = Some((id, data));
+								Poll::Ready(Ren::Withdrawn)
 							}
+							Poll::Ready(Ok(Some(message))) => Poll::Ready(Ren::Buffered(message)),
+							Poll::Ready(Ok(None)) => Poll::Ready(Ren::Closed(Ok(()))),
+							Poll::Ready(Err(err)) => Poll::Ready(Ren::Closed(Err(err))),
+							Poll::Pending => Poll::Pending,
 						}
-						Poll::Pending
 					})
 					.await
 				};
@@ -1260,6 +1262,12 @@ where
 					Ren::Closed(res) => return res,
 					Ren::Withdrawn => {
 						pending = None;
+						continue;
+					}
+					Ren::Buffered(message) => {
+						// Hold the latest update to handle once the verdict resolves; the loop
+						// keeps reading, so a terminal is never masked by it.
+						stashed = Some(message);
 						continue;
 					}
 					Ren::Renewal(res) => res,

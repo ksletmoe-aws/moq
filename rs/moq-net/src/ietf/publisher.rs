@@ -786,6 +786,9 @@ where
 					Closed,
 					// A `[type][size][body]` control message off the subscribe stream.
 					Message(u64, bytes::Bytes),
+					// A non-terminal message read while a renewal is pending: held to handle once
+					// the verdict resolves, so the read keeps watching for a terminal meanwhile.
+					Buffered(u64, bytes::Bytes),
 					// A pending renewal's verdict resolved, for the update with this request id.
 					Renewal(Result<crate::auth::Grant, Error>, RequestId),
 				}
@@ -794,10 +797,11 @@ where
 				// to refresh the request's token. The loop reads one control message per turn
 				// while serving; a renewal's verify is raced against serving and the old grant's
 				// deadline (never a bare await), so media keeps flowing and the old deadline can
-				// still fire when the acceptor is slow. While a renewal is pending the loop stops
-				// reading until its verdict resolves. The read future borrows only
-				// `stream.reader` and lives in an inner block, so that borrow is released before a
-				// renewal answers on `stream.writer`.
+				// still fire when the acceptor is slow. While a renewal is pending the loop keeps
+				// reading so a cancellation still ends it, buffering a further renewal to handle
+				// once the verdict resolves. The read future borrows only `stream.reader` and
+				// lives in an inner block, so that borrow is released before a renewal answers on
+				// `stream.writer`.
 				let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
 				// A message that arrived while a renewal was pending, handled once it resolves.
 				let mut stashed: Option<(u64, bytes::Bytes)> = None;
@@ -828,14 +832,21 @@ where
 							if closed_session.poll_closed(&mut cx).is_ready() {
 								return Poll::Ready(Step::Closed);
 							}
-							if stashed.is_none() {
-								match waiter.poll_future(read.as_mut()) {
-									Poll::Ready(Ok(Some(message))) => stashed = Some(message),
-									Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => return Poll::Ready(Step::Closed),
-									Poll::Pending => {}
+							// Keep reading while the verdict is pending so a cancellation still ends
+							// the request: an acceptor that never answers and a non-expiring grant
+							// would otherwise hang on it. Draft-14/15/16 cancel with an UNSUBSCRIBE
+							// message (the adapter delivers it before the FIN), draft-17+ with the
+							// FIN or a reset. A further renewal is buffered to handle once the
+							// verdict resolves; breaking the wait starts a fresh read that keeps
+							// watching for a terminal, so a buffered update never masks one.
+							match waiter.poll_future(read.as_mut()) {
+								Poll::Ready(Ok(Some((id, _)))) if id == ietf::Unsubscribe::ID => {
+									Poll::Ready(Step::Closed)
 								}
+								Poll::Ready(Ok(Some((id, data)))) => Poll::Ready(Step::Buffered(id, data)),
+								Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => Poll::Ready(Step::Closed),
+								Poll::Pending => Poll::Pending,
 							}
-							Poll::Pending
 						})
 						.await
 					} else if let Some((id, data)) = stashed.take() {
@@ -876,6 +887,10 @@ where
 					match step {
 						Step::Served(served) | Step::Ended(served) => break Some(served),
 						Step::Closed => break None,
+						// A message arrived while a renewal was pending: hold the latest to handle
+						// once the verdict resolves (the loop keeps reading, so a terminal is never
+						// masked by it). A superseded buffered update is dropped, latest wins.
+						Step::Buffered(id, data) => stashed = Some((id, data)),
 						Step::Renewal(res, rid) => {
 							// The pending verdict resolved: consume it and answer the update.
 							let (verdict, _) = pending.take().expect("a pending renewal");
@@ -3856,6 +3871,65 @@ mod serve_tests {
 			ended,
 			"closing the stream ends the subscription despite the pending renewal"
 		);
+	}
+
+	/// One UNSUBSCRIBE keyed to the subscription, the draft-14/15/16 cancellation message.
+	async fn unsubscribe_bytes(version: Version) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		writer.encode(&ietf::Unsubscribe::ID).await.unwrap();
+		writer
+			.encode(&ietf::Unsubscribe {
+				request_id: RequestId(REQUEST_ID),
+			})
+			.await
+			.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
+	/// Before draft-17 a cancellation is an UNSUBSCRIBE message, not a FIN. It must end the
+	/// request even while a renewal verdict is pending: with a non-expiring grant and an
+	/// acceptor that never answers the renewal, the UNSUBSCRIBE is the only thing that can.
+	#[tokio::test(start_paused = true)]
+	async fn a_pending_renewal_ends_on_an_unsubscribe_before_draft_17() {
+		for version in [Version::Draft14, Version::Draft15, Version::Draft16] {
+			let (auth, mut requests, _cred) = auth_covering_other();
+			// The stream carries the renewal then the UNSUBSCRIBE and never FINs, so only the
+			// message can end the request.
+			let script = [
+				subscribe_update_with_token(version).await,
+				unsubscribe_bytes(version).await,
+			]
+			.concat();
+			let h = serve_with_auth(version, auth, script);
+			let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+			group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+			group.finish().unwrap();
+			settle().await;
+
+			let stream = Stream::open(&mut h.session.clone(), version).await.unwrap();
+			let acceptor = async move {
+				let first = requests.next().await.expect("a request");
+				let _issued = first.accept(crate::auth::Grant::all());
+				let _never_answered = requests.next().await.expect("a renewal");
+				std::future::pending::<()>().await
+			};
+			let mut acceptor = std::pin::pin!(acceptor);
+			let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+			let mut ended = false;
+			for _ in 0..500 {
+				let _ = futures::poll!(acceptor.as_mut());
+				if futures::poll!(serving.as_mut()).is_ready() {
+					ended = true;
+					break;
+				}
+				settle().await;
+			}
+			assert!(
+				ended,
+				"{version:?}: an UNSUBSCRIBE ends the subscription despite the pending renewal"
+			);
+		}
 	}
 
 	/// A REQUEST_UPDATE the acceptor refuses does NOT extend the grant: the old grant stands
