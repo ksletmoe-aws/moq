@@ -882,12 +882,18 @@ where
 							let Some(rg) = request_grant.as_mut() else {
 								continue;
 							};
-							// Before draft-17 the update shares the control stream, where an
-							// answer keyed by the update's Request ID reaches nothing the peer
-							// tracks (and draft-14's SUBSCRIBE_ERROR would read as ending the
-							// subscription), so the renewal is decided silently there.
-							let answer =
-								!matches!(self.version, Version::Draft14 | Version::Draft15 | Version::Draft16);
+							// Draft-15 section 9.11 and draft-16 section 9.11 require one
+							// REQUEST_OK or REQUEST_ERROR per update, keyed to the update's own
+							// Request ID so the peer matches it to the REQUEST_UPDATE it sent.
+							// Draft-14 section 9.10 defines no such response, and its control
+							// stream would read a 0x05 as ending the subscription and a 0x07 as
+							// PUBLISH_NAMESPACE_OK, so the renewal is decided silently there.
+							// Draft-17+ answers on the real subscribe stream with the id omitted.
+							let answer_id = match self.version {
+								Version::Draft15 | Version::Draft16 => Some(rid),
+								_ => None,
+							};
+							let answer = !matches!(self.version, Version::Draft14);
 							match res {
 								// The renewal's grant must still cover this request. On accept the
 								// old grant is dropped (ending the old token) and the deadline is
@@ -895,7 +901,7 @@ where
 								Ok(grant) if rg.covers(&grant) => {
 									rg.renew(verdict, grant);
 									if answer {
-										self.write_request_ok(&mut stream.writer).await?;
+										self.write_request_ok(&mut stream.writer, answer_id).await?;
 									}
 								}
 								// A refused or uncovered renewal keeps the old grant (per the quest,
@@ -1103,14 +1109,23 @@ where
 		Ok(())
 	}
 
-	/// Acknowledge an accepted REQUEST_UPDATE on its draft-17+ subscribe stream.
-	async fn write_request_ok(&self, writer: &mut Writer<S::SendStream, Version>) -> Result<(), Error> {
-		debug_assert!(!matches!(
-			self.version,
-			Version::Draft14 | Version::Draft15 | Version::Draft16
-		));
+	/// Acknowledge an accepted REQUEST_UPDATE.
+	///
+	/// Draft-15/16 carry the update's own Request ID so the peer matches the response to
+	/// the REQUEST_UPDATE it sent; draft-17+ answers on the real subscribe stream with the
+	/// id omitted. Draft-14 sends no response and never reaches here.
+	async fn write_request_ok(
+		&self,
+		writer: &mut Writer<S::SendStream, Version>,
+		request_id: Option<RequestId>,
+	) -> Result<(), Error> {
+		debug_assert_eq!(
+			request_id.is_some(),
+			matches!(self.version, Version::Draft15 | Version::Draft16),
+			"draft-15/16 carry the update request id; draft-17+ omit it",
+		);
 		writer.encode(&ietf::RequestOk::ID).await?;
-		writer.encode(&ietf::RequestOk { request_id: None }).await?;
+		writer.encode(&ietf::RequestOk { request_id }).await?;
 		Ok(())
 	}
 
@@ -3555,6 +3570,39 @@ mod serve_tests {
 		log.writes.lock().unwrap().clone()
 	}
 
+	/// The wire bytes of one REQUEST_OK keyed to `request_id`, the draft-15/16 accept answer.
+	async fn request_ok_bytes(version: Version, request_id: RequestId) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		writer.encode(&ietf::RequestOk::ID).await.unwrap();
+		writer
+			.encode(&ietf::RequestOk {
+				request_id: Some(request_id),
+			})
+			.await
+			.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
+	/// The wire bytes of one REQUEST_ERROR keyed to `request_id`, the draft-15/16 refuse answer,
+	/// matching [`Publisher::write_subscribe_error`]'s code and reason for a refused renewal.
+	async fn request_error_bytes(version: Version, request_id: RequestId) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		let error_code = request::to_code(&Error::Unauthorized, request::Kind::Subscribe, version);
+		writer.encode(&ietf::RequestError::ID).await.unwrap();
+		writer
+			.encode(&ietf::RequestError {
+				request_id: Some(request_id),
+				error_code,
+				reason_phrase: "renewal not granted".into(),
+				retry_interval: 0,
+			})
+			.await
+			.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
 	/// A live SUBSCRIBE for `room/video` presenting a request token, with one published
 	/// group so the subscription parks at the live edge rather than ending.
 	fn token_subscribe() -> ietf::Subscribe<'static> {
@@ -3639,20 +3687,31 @@ mod serve_tests {
 		}
 	}
 
-	/// The pre-draft-17 mirror of the renewal test: a SUBSCRIBE_UPDATE carrying a fresh token
-	/// renews a token-authorized subscription past the old grant's expiry at draft-14/15/16,
-	/// where the update rides the control-stream adapter. No answer is written there: one keyed
-	/// by the update's Request ID reaches nothing the peer routes. The adapter's follow-up
-	/// routing to the subscription's stream is proven by
+	/// The pre-draft-17 renewal: a SUBSCRIBE_UPDATE carrying a fresh token renews a
+	/// token-authorized subscription past the old grant's expiry at draft-14/15/16, where the
+	/// update rides the control-stream adapter. Draft-14 writes no answer (it defines none, and
+	/// its control stream would read a 0x05 as ending the subscription); draft-15 and draft-16
+	/// (section 9.11) write exactly one REQUEST_OK, keyed to the update's own Request ID so the
+	/// peer matches it to the REQUEST_UPDATE it sent. The adapter's follow-up routing of the
+	/// update to the subscription's stream is proven by
 	/// `super::super::adapter::tests::test_classify_subscribe_update_followup`.
 	#[tokio::test(start_paused = true)]
-	async fn a_subscribe_update_renews_silently_before_draft_17() {
+	async fn a_subscribe_update_renewal_is_answered_from_draft_15() {
 		for version in [Version::Draft14, Version::Draft15, Version::Draft16] {
-			renews_silently(version).await;
+			renews(version, true).await;
 		}
 	}
 
-	async fn renews_silently(version: Version) {
+	/// A refused renewal before draft-17 answers exactly one REQUEST_ERROR on draft-15/16 (none
+	/// on draft-14) and leaves the old grant to lapse the subscription, never the session.
+	#[tokio::test(start_paused = true)]
+	async fn a_refused_subscribe_update_renewal_is_answered_from_draft_15() {
+		for version in [Version::Draft14, Version::Draft15, Version::Draft16] {
+			renews(version, false).await;
+		}
+	}
+
+	async fn renews(version: Version, accept: bool) {
 		let (auth, mut requests, _cred) = auth_covering_other();
 		let h = serve_with_auth(version, auth, subscribe_update_with_token(version).await);
 		let rt = h.publisher.runtime.clone();
@@ -3678,7 +3737,11 @@ mod serve_tests {
 				answered.fetch_add(1, Ordering::Relaxed);
 				let renewal = requests.next().await.unwrap();
 				release.notified().await;
-				held.push(renewal.accept(grant_all_expiring(&rt, None)));
+				if accept {
+					held.push(renewal.accept(grant_all_expiring(&rt, None)));
+				} else {
+					renewal.reject(crate::SessionError::Unauthorized, "no");
+				}
 				answered.fetch_add(1, Ordering::Relaxed);
 				std::future::pending::<()>().await
 			}
@@ -3712,21 +3775,38 @@ mod serve_tests {
 			2,
 			"{version:?}: the renewal was answered"
 		);
-		assert_eq!(
-			h.log.writes.lock().unwrap().len(),
-			before,
-			"{version:?}: a renewal before draft-17 writes no answer"
-		);
+		// Draft-14 writes nothing; draft-15/16 write exactly one keyed answer to the update's
+		// own Request ID (0x40), the id the renewing peer waits on: REQUEST_OK on accept,
+		// REQUEST_ERROR on refuse.
+		let written = h.log.writes.lock().unwrap()[before..].to_vec();
+		let expected = match accept {
+			true => request_ok_bytes(version, RequestId(0x40)).await,
+			false => request_error_bytes(version, RequestId(0x40)).await,
+		};
+		match version {
+			Version::Draft14 => assert!(written.is_empty(), "{version:?}: a renewal writes no answer"),
+			_ => assert_eq!(
+				written, expected,
+				"{version:?}: one keyed answer to the update's request id"
+			),
+		}
 
+		// An accepted renewal re-armed the deadline, so the subscription lives past the old 60s
+		// expiry; a refused one leaves the old grant to lapse it there, never the session.
 		tokio::time::advance(Duration::from_secs(120)).await;
+		let mut ended = false;
 		for _ in 0..50 {
 			let _ = futures::poll!(acceptor.as_mut());
-			assert!(
-				futures::poll!(serving.as_mut()).is_pending(),
-				"{version:?}: the renewal did not extend the subscription past the old expiry"
-			);
+			if futures::poll!(serving.as_mut()).is_ready() {
+				ended = true;
+				break;
+			}
 			settle().await;
 		}
+		assert_eq!(
+			ended, !accept,
+			"{version:?}: accepted renewal keeps the subscription; a refused one lets the old grant lapse it"
+		);
 	}
 
 	/// A peer that ends the subscription while a renewal is still being verified ends it here
