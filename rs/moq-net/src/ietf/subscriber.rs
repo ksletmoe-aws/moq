@@ -1349,10 +1349,65 @@ where
 				return Err(Error::WrongSize);
 			}
 
+			// Cluster parameters and a token renewal can ride the same update, so apply the
+			// routing first, for every update that carries it, before dealing with the token.
+			// A different original publisher applies in place too: the origin drains what the
+			// old one already serves and never splices the two. The parameters exist only on a
+			// session that negotiated the extension; anywhere else they are the peer's violation.
+			let carries_cluster = msg.hops.is_some() || msg.cost.is_some();
+			held = match &held {
+				Some(current) => Some(msg.apply(current)),
+				None if carries_cluster => {
+					tracing::warn!(%path, "cluster parameters on a session that negotiated none");
+					return Err(Error::ProtocolViolation);
+				}
+				None => None,
+			};
+
+			// Re-route only when the update actually changes the route (an omitted parameter
+			// keeps its value, so a token-only update leaves it untouched). A path that now runs
+			// through us is unusable, so detach rather than keep serving it; reading continues,
+			// since this stream is the advertisement's only channel and a later clean path
+			// arrives here or nowhere. Ending the stream is not ours to do: a peer MAY
+			// legitimately send a path carrying our Hop ID when a redundant sibling shares it.
+			let applied: Result<(), Error> = if carries_cluster {
+				match self.route(held.as_ref(), &peer) {
+					None => {
+						if std::mem::take(attached) {
+							tracing::debug!(%path, "publish_namespace now loops back; detaching");
+							let _ = self.stop_announce(path.clone());
+						}
+						Ok(())
+					}
+					Some(advert) => {
+						tracing::debug!(%path, hops = advert.route.hops.len(), cost = ?advert.route.cost, "publish_namespace update");
+						match *attached {
+							true => self.update_announce(path.clone(), advert),
+							// Re-attach: a clean path replaced the reflected one we detached from.
+							false => self.start_announce(path.clone(), advert).map(|()| *attached = true),
+						}
+					}
+				}
+			} else {
+				Ok(())
+			};
+
+			// An unroutable apply withdraws the announce whether or not a token also rides it.
+			if let Err(err) = &applied {
+				tracing::warn!(%path, %err, "publish_namespace update refused");
+				self.write_error(stream, msg.request_id, err, &err.to_string()).await?;
+				// The close is the withdrawal; the caller releases what was attached.
+				if stream.writer.finish().is_ok() {
+					let _ = stream.writer.closed().await;
+				}
+				return Ok(());
+			}
+
 			// A REQUEST_UPDATE carrying a fresh token refreshes the announce's request grant
 			// (MoQ request-token), when the announce is token-authorized. The verify is not
 			// awaited here: it becomes the pending renewal raced against the deadline above.
-			// Our sender keeps renewals token-only, so a reprice never rides one.
+			// The routing above is already applied, so the renewal's answer (written when its
+			// verdict resolves) is this update's single response, cluster parameters included.
 			if let Some(token) = &msg.authorization_token
 				&& token_grant.is_some()
 			{
@@ -1387,54 +1442,8 @@ where
 				continue;
 			}
 
-			// An omitted parameter keeps its value, so the update lands on what the peer
-			// already advertised. The parameters exist only on a session that negotiated
-			// the extension; anywhere else they are the peer's violation.
-			// A different original publisher applies in place too: the origin drains what
-			// the old one already serves and never splices the two.
-			held = match &held {
-				Some(current) => Some(msg.apply(current)),
-				None if msg.hops.is_some() || msg.cost.is_some() => {
-					tracing::warn!(%path, "cluster parameters on a session that negotiated none");
-					return Err(Error::ProtocolViolation);
-				}
-				None => None,
-			};
-
-			// A path that now runs through us is unusable, so detach rather than keep
-			// serving it. The update itself is accepted, and reading continues: this
-			// stream is the only channel the advertisement has, so a later clean path
-			// arrives here or nowhere. Ending the stream is also not ours to do, since a
-			// peer MAY legitimately send a path carrying our Hop ID when a redundant
-			// sibling shares it.
-			let Some(advert) = self.route(held.as_ref(), &peer) else {
-				if std::mem::take(attached) {
-					tracing::debug!(%path, "publish_namespace now loops back; detaching");
-					let _ = self.stop_announce(path.clone());
-				}
-				self.write_ok(stream, msg.request_id).await?;
-				continue;
-			};
-
-			tracing::debug!(%path, hops = advert.route.hops.len(), cost = ?advert.route.cost, "publish_namespace update");
-			let applied = match *attached {
-				true => self.update_announce(path.clone(), advert),
-				// Re-attach: a clean path replaced the reflected one we detached from.
-				false => self.start_announce(path.clone(), advert).map(|()| *attached = true),
-			};
-
-			match applied {
-				Ok(()) => self.write_ok(stream, msg.request_id).await?,
-				Err(err) => {
-					tracing::warn!(%path, %err, "publish_namespace update refused");
-					self.write_error(stream, msg.request_id, &err, &err.to_string()).await?;
-					// The close is the withdrawal; the caller releases what was attached.
-					if stream.writer.finish().is_ok() {
-						let _ = stream.writer.closed().await;
-					}
-					return Ok(());
-				}
-			}
+			// No token rides this update: acknowledge it now.
+			self.write_ok(stream, msg.request_id).await?;
 		}
 	}
 
@@ -5317,6 +5326,22 @@ mod tests {
 		log.writes.lock().unwrap().clone()
 	}
 
+	/// One REQUEST_UPDATE on the announce stream carrying both a fresh token and new cluster
+	/// parameters (HOP_PATH/ROUTE_COST), framed as the peer sends it.
+	async fn publish_namespace_update_with_token_and_cluster(version: Version) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		let msg = ietf::PublishNamespaceUpdate {
+			request_id: RequestId(3),
+			hops: Some(hop_path(&[7, 9])),
+			cost: Some(0),
+			authorization_token: Some(announce_token()),
+		};
+		writer.encode(&ietf::PublishNamespaceUpdate::ID).await.unwrap();
+		writer.encode(&msg).await.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
 	/// A request token on a PUBLISH_NAMESPACE the session grant does not cover authorizes
 	/// the announce: the subscriber verifies it through the acceptor and attaches the route.
 	#[tokio::test]
@@ -5461,6 +5486,59 @@ mod tests {
 		assert!(
 			routed_now(&consumer, "room/alice").is_some(),
 			"the renewed announce must still be attached"
+		);
+	}
+	/// A REQUEST_UPDATE carrying both a fresh token and cluster parameters applies both: the
+	/// renewal re-arms the grant and the HOP_PATH/ROUTE_COST re-route the advertisement,
+	/// answered with the renewal's single response. Before the fix the token branch
+	/// short-circuited the loop and the cluster parameters on the same update were dropped.
+	#[tokio::test(start_paused = true)]
+	async fn an_update_applies_both_a_renewal_and_cluster_params() {
+		const VERSION: Version = Version::Draft18;
+		let (mut subscriber, mut requests, _cred, consumer, session) =
+			auth_announce_harness(VERSION, publish_namespace_update_with_token_and_cluster(VERSION).await);
+		let rt = subscriber.runtime.clone();
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		// A negotiated peer over a free link, so the advertised cost is the route's warm cost.
+		let peer = cluster::Peer {
+			hop: Some(crate::Hop::new(9).unwrap()),
+			cost: Some(0),
+		};
+		// The announce arrives already routed at cost 4; the update re-routes it to cost 0.
+		let mut initial = token_publish_namespace();
+		initial.cluster = Some(cluster::Advert {
+			hops: hop_path(&[7, 9]),
+			cost: 4,
+		});
+
+		let acceptor = {
+			let rt = rt.clone();
+			async move {
+				let mut held = Vec::new();
+				let first = requests.next().await.expect("a request");
+				held.push(first.accept(publish_grant_expiring(&rt, Some(60))));
+				let renewal = requests.next().await.expect("a renewal");
+				held.push(renewal.accept(publish_grant_expiring(&rt, None)));
+				std::future::pending::<()>().await
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(stream, initial, peer, None));
+
+		let mut rerouted = false;
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(futures::poll!(run.as_mut()).is_pending(), "the announce ended early");
+			if routed_now(&consumer, "room/alice").is_some_and(|route| route.cost.warm == 0) {
+				rerouted = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(
+			rerouted,
+			"the update's cluster parameters must re-route the announce (cost 4 to 0), not be dropped by the renewal"
 		);
 	}
 
