@@ -6684,6 +6684,7 @@ mod tests {
 			solicit,
 			hidden: false,
 			auth: false,
+			max_request_updates: None,
 		});
 		slot
 	}
