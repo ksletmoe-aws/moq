@@ -1190,10 +1190,7 @@ where
 	/// travels the other way, so receiving it on an advertisement *we* were offered is a
 	/// violation, not a withdrawal.
 	fn terminal_publish_namespace(&self, type_id: u64) -> bool {
-		match self.version {
-			Version::Draft14 | Version::Draft15 | Version::Draft16 => type_id == ietf::PublishNamespaceDone::ID,
-			_ => false,
-		}
+		terminal_publish_namespace(self.version, type_id)
 	}
 
 	/// Read advertisement updates off a live PUBLISH_NAMESPACE stream until it closes.
@@ -1212,27 +1209,59 @@ where
 		mut token_grant: Option<crate::auth::RequestGrant<crate::time::Clock>>,
 	) -> Result<(), Error> {
 		let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
+		// A message that arrived while a renewal was pending, handled once it resolves.
+		let mut stashed: Option<(u64, bytes::Bytes)> = None;
 		loop {
 			// A renewal verify in flight is raced against the request grant's deadline (never
-			// a bare await), so the old deadline can still fire while a slow acceptor decides;
-			// the loop stops reading until the verdict resolves.
+			// a bare await), so the old deadline can still fire while a slow acceptor decides,
+			// and against the stream, so a peer ending the announce ends it whatever the
+			// acceptor does. A message that arrives meanwhile waits for the verdict.
 			if let Some((verdict, rid)) = pending.as_mut() {
 				let rid = *rid;
 				enum Ren {
 					Renewal(Result<crate::auth::Grant, Error>),
 					Ended(Error),
+					Closed(Result<(), Error>),
+					// The peer withdrew the announce: the renewal no longer matters.
+					Withdrawn,
 				}
-				let ren = kio::wait(|waiter| {
-					if let Some(rg) = token_grant.as_mut()
-						&& let Poll::Ready(err) = rg.poll_ended(waiter)
-					{
-						return Poll::Ready(Ren::Ended(err));
-					}
-					verdict.poll_grant(waiter).map(Ren::Renewal)
-				})
-				.await;
+				let version = self.version;
+				let ren = {
+					let mut read = std::pin::pin!(super::publisher::read_control(&mut stream.reader));
+					kio::wait(|waiter| {
+						if let Some(rg) = token_grant.as_mut()
+							&& let Poll::Ready(err) = rg.poll_ended(waiter)
+						{
+							return Poll::Ready(Ren::Ended(err));
+						}
+						if let Poll::Ready(res) = verdict.poll_grant(waiter) {
+							return Poll::Ready(Ren::Renewal(res));
+						}
+						if stashed.is_none() {
+							match waiter.poll_future(read.as_mut()) {
+								Poll::Ready(Ok(Some(message))) => {
+									let terminal = terminal_publish_namespace(version, message.0);
+									stashed = Some(message);
+									if terminal {
+										return Poll::Ready(Ren::Withdrawn);
+									}
+								}
+								Poll::Ready(Ok(None)) => return Poll::Ready(Ren::Closed(Ok(()))),
+								Poll::Ready(Err(err)) => return Poll::Ready(Ren::Closed(Err(err))),
+								Poll::Pending => {}
+							}
+						}
+						Poll::Pending
+					})
+					.await
+				};
 				let res = match ren {
 					Ren::Ended(err) => return Err(err),
+					Ren::Closed(res) => return res,
+					Ren::Withdrawn => {
+						pending = None;
+						continue;
+					}
 					Ren::Renewal(res) => res,
 				};
 				let (verdict, _) = pending.take().expect("a pending renewal");
@@ -1264,7 +1293,9 @@ where
 				Closed,
 				Ended(Error),
 			}
-			let ctl = {
+			let ctl = if let Some((id, data)) = stashed.take() {
+				Ctl::Message(id, data)
+			} else {
 				let mut read = std::pin::pin!(super::publisher::read_control(&mut stream.reader));
 				kio::wait(|waiter| -> Poll<Result<Ctl, Error>> {
 					if let Some(rg) = token_grant.as_mut()
@@ -5175,9 +5206,26 @@ mod tests {
 		origin::Consumer,
 		crate::lite::test_transport::ScriptedSession,
 	) {
+		auth_announce_harness_on(
+			version,
+			crate::lite::test_transport::ScriptedSession::per_stream(vec![first_script]),
+		)
+	}
+
+	/// [`auth_announce_harness`] over a given session, such as one that finishes the stream
+	/// after its script.
+	fn auth_announce_harness_on(
+		version: Version,
+		session: crate::lite::test_transport::ScriptedSession,
+	) -> (
+		Subscriber<crate::lite::test_transport::ScriptedSession>,
+		crate::auth::Requests,
+		crate::auth::Token,
+		origin::Consumer,
+		crate::lite::test_transport::ScriptedSession,
+	) {
 		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 		let consumer = origin.consume();
-		let session = crate::lite::test_transport::ScriptedSession::per_stream(vec![first_script]);
 		let (tasks, task_set) = crate::util::TaskSet::new();
 		std::mem::forget(task_set);
 		let peer_setup = peer::PeerSetup::default();
@@ -5566,6 +5614,59 @@ mod tests {
 				"a refused token must not be admitted by the permissive default"
 			);
 		}
+	}
+
+	/// A peer that ends the announce while a renewal is still being verified ends it here too:
+	/// with a grant that never expires and an acceptor that never answers the renewal, only
+	/// the stream closing can end the request, and it must.
+	#[tokio::test]
+	async fn a_closed_announce_ends_while_a_renewal_is_pending() {
+		const VERSION: Version = Version::Draft18;
+		let session = crate::lite::test_transport::ScriptedSession::per_stream_eof(vec![
+			publish_namespace_update_with_token(VERSION).await,
+		]);
+		let (mut subscriber, mut requests, _cred, consumer, session) = auth_announce_harness_on(VERSION, session);
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+		let popped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let acceptor = {
+			let popped = popped.clone();
+			async move {
+				let first = requests.next().await.expect("a request");
+				let _issued = first.accept(crate::auth::Grant::all());
+				popped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				let _never_answered = requests.next().await.expect("a renewal");
+				popped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				std::future::pending::<()>().await
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+			stream,
+			token_publish_namespace(),
+			cluster::Peer::default(),
+			None,
+		));
+		let mut ended = false;
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if futures::poll!(run.as_mut()).is_ready() {
+				ended = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(
+			popped.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+			"the announce was token-authorized"
+		);
+		assert!(
+			ended,
+			"closing the stream ends the announce despite the pending renewal"
+		);
+		assert!(
+			routed_now(&consumer, "room/alice").is_none(),
+			"the announce is withdrawn"
+		);
 	}
 
 	/// An announcing peer's token grant is checked on its `publish` patterns: a read-only grant
@@ -6671,6 +6772,15 @@ mod tests {
 				"{version} must decline the PUBLISH as NOT_SUPPORTED"
 			);
 		}
+	}
+}
+
+/// Whether `type_id` ends a PUBLISH_NAMESPACE stream: PUBLISH_NAMESPACE_DONE before
+/// draft-17; later drafts end it by closing the stream.
+fn terminal_publish_namespace(version: Version, type_id: u64) -> bool {
+	match version {
+		Version::Draft14 | Version::Draft15 | Version::Draft16 => type_id == ietf::PublishNamespaceDone::ID,
+		_ => false,
 	}
 }
 

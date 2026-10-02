@@ -42,15 +42,31 @@ fn serving_subscription(subscriber_priority: u8) -> Subscription {
 /// the peer finishes it. Mirrors [`super::auth`]'s reader, but borrows only the reader so
 /// a renewal can answer on the writer once the read yields a message. Shared with the
 /// subscriber's announce loop.
+///
+/// Cancel-safe: the message decodes as one value, so a read dropped part-way consumes
+/// nothing and the next one starts at the same message.
 pub(super) async fn read_control<R: crate::transport::poll::RecvStream>(
 	reader: &mut Reader<R, Version>,
 ) -> Result<Option<(u64, bytes::Bytes)>, Error> {
-	let Some(id) = reader.decode_maybe::<u64>().await? else {
-		return Ok(None);
-	};
-	let size: u16 = reader.decode().await?;
-	let data = reader.read_exact(size as usize).await?;
-	Ok(Some((id, data)))
+	Ok(reader
+		.decode_maybe::<ControlMessage>()
+		.await?
+		.map(|ControlMessage(id, data)| (id, data)))
+}
+
+/// A whole `[type][size][body]` control message, decoded at once.
+#[derive(Debug)]
+struct ControlMessage(u64, bytes::Bytes);
+
+impl crate::coding::Decode<Version> for ControlMessage {
+	fn decode<B: bytes::Buf>(buf: &mut B, version: Version) -> Result<Self, crate::coding::DecodeError> {
+		let id = u64::decode(buf, version)?;
+		let size = u16::decode(buf, version)? as usize;
+		if buf.remaining() < size {
+			return Err(crate::coding::DecodeError::Short);
+		}
+		Ok(Self(id, buf.copy_to_bytes(size)))
+	}
 }
 
 enum FillStep {
@@ -783,9 +799,14 @@ where
 				// `stream.reader` and lives in an inner block, so that borrow is released before a
 				// renewal answers on `stream.writer`.
 				let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
+				// A message that arrived while a renewal was pending, handled once it resolves.
+				let mut stashed: Option<(u64, bytes::Bytes)> = None;
 				loop {
 					let step = if let Some((verdict, rid)) = pending.as_mut() {
 						let rid = *rid;
+						// The stream is still watched while the verdict is pending: a peer that
+						// ends the request then must end it here too, whatever the acceptor does.
+						let mut read = std::pin::pin!(read_control(&mut stream.reader));
 						kio::wait(|waiter| {
 							if let Poll::Ready(served) = waiter.poll_future(serve.as_mut()) {
 								return Poll::Ready(Step::Served(served));
@@ -807,9 +828,18 @@ where
 							if closed_session.poll_closed(&mut cx).is_ready() {
 								return Poll::Ready(Step::Closed);
 							}
+							if stashed.is_none() {
+								match waiter.poll_future(read.as_mut()) {
+									Poll::Ready(Ok(Some(message))) => stashed = Some(message),
+									Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => return Poll::Ready(Step::Closed),
+									Poll::Pending => {}
+								}
+							}
 							Poll::Pending
 						})
 						.await
+					} else if let Some((id, data)) = stashed.take() {
+						Step::Message(id, data)
 					} else {
 						let mut read = std::pin::pin!(read_control(&mut stream.reader));
 						kio::wait(|waiter| {
@@ -3233,11 +3263,16 @@ mod serve_tests {
 	/// Like [`serve`], but with an app auth acceptor wired in and the subscribe stream's
 	/// reader scripted with `first_script` (a REQUEST_UPDATE, for the renewal tests).
 	fn serve_with_auth(version: Version, auth: crate::auth::Handle, first_script: Vec<u8>) -> Serve {
+		serve_on(version, auth, ScriptedSession::per_stream(vec![first_script]))
+	}
+
+	/// [`serve_with_auth`] over a given session, such as one that finishes the stream after
+	/// its script.
+	fn serve_on(version: Version, auth: crate::auth::Handle, session: ScriptedSession) -> Serve {
 		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 		let broadcast = origin.publish("room", crate::origin::Route::default()).unwrap();
 		let track = broadcast.create_track("video", None).unwrap();
 
-		let session = ScriptedSession::per_stream(vec![first_script]);
 		let log = session.log.clone();
 
 		let peer_setup = peer::PeerSetup::default();
@@ -3688,6 +3723,55 @@ mod serve_tests {
 			);
 			settle().await;
 		}
+	}
+
+	/// A peer that ends the subscription while a renewal is still being verified ends it here
+	/// too: with a grant that never expires and an acceptor that never answers the renewal,
+	/// only the stream closing can end the request, and it must.
+	#[tokio::test(start_paused = true)]
+	async fn a_closed_subscription_ends_while_a_renewal_is_pending() {
+		const VERSION: Version = Version::Draft18;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		let session = ScriptedSession::per_stream_eof(vec![subscribe_update_with_token(VERSION).await]);
+		let h = serve_on(VERSION, auth, session);
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+		let popped = std::sync::Arc::new(AtomicU64::new(0));
+		let acceptor = {
+			let popped = popped.clone();
+			async move {
+				let first = requests.next().await.expect("a request");
+				let _issued = first.accept(crate::auth::Grant::all());
+				popped.fetch_add(1, Ordering::Relaxed);
+				let _never_answered = requests.next().await.expect("a renewal");
+				popped.fetch_add(1, Ordering::Relaxed);
+				std::future::pending::<()>().await
+			}
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+		let mut ended = false;
+		for _ in 0..500 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if futures::poll!(serving.as_mut()).is_ready() {
+				ended = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(
+			popped.load(Ordering::Relaxed) >= 1,
+			"the subscription was token-authorized"
+		);
+		assert!(
+			ended,
+			"closing the stream ends the subscription despite the pending renewal"
+		);
 	}
 
 	/// A REQUEST_UPDATE the acceptor refuses does NOT extend the grant: the old grant stands
