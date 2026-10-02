@@ -544,7 +544,8 @@ async fn a_request_token_renews_a_subscription_through_the_driver() {
 		})
 		.await;
 
-		// The first token lapses in a second; the renewal never does.
+		// The first token lapses in a second; the renewal never does. Real time, not a paused
+		// clock: both drivers and the mock transport run on their own tasks.
 		let expires = Some(now() + Duration::from_secs(1));
 		// The acceptor sees the Token structure's value, past its USE_VALUE header.
 		let renewal = second[2..].to_vec();

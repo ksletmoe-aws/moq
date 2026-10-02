@@ -1105,6 +1105,10 @@ where
 
 	/// Acknowledge an accepted REQUEST_UPDATE on its draft-17+ subscribe stream.
 	async fn write_request_ok(&self, writer: &mut Writer<S::SendStream, Version>) -> Result<(), Error> {
+		debug_assert!(!matches!(
+			self.version,
+			Version::Draft14 | Version::Draft15 | Version::Draft16
+		));
 		writer.encode(&ietf::RequestOk::ID).await?;
 		writer.encode(&ietf::RequestOk { request_id: None }).await?;
 		Ok(())
