@@ -22,6 +22,7 @@ const LITE_06: &str = "moq-lite-06";
 const MOQT_17: &str = "moq-transport-17";
 /// A draft at the deployed floor, used for the request-token launch shape.
 const MOQT_18: &str = "moq-transport-18";
+const MOQT_19: &str = "moq-transport-19";
 const MOQT_22: &str = "moq-transport-22";
 
 /// Run each case on every version that exchanges AUTH.
@@ -591,6 +592,145 @@ async fn a_request_token_renews_a_subscription_through_the_driver() {
 			answered.try_recv().is_err(),
 			"the original subscription was renewed, not replaced"
 		);
+	})
+	.await
+	.expect("timed out");
+}
+
+/// The sender honors the receiver's MAX_REQUEST_UPDATES credit: it keeps at most one
+/// renewal in flight per request and coalesces replacements that arrive while one is
+/// unanswered, so a burst of token changes never outruns the credit (draft-19 section
+/// 10.3.1.7).
+///
+/// Two drivers over the in-process transport at draft-19, where the serving side advertises
+/// and enforces a 16-update credit with a session close ([`SessionError::TooManyRequestUpdates`]).
+/// The acceptor holds the first renewal's verifier, the client replaces its token well past
+/// the credit, and the test asserts the connection stays up, only the held renewal reaches the
+/// acceptor, and resolving it releases exactly the newest token, not any coalesced between.
+///
+/// A fire-and-forget sender would put every renewal outstanding behind the held verifier and
+/// the serving side would close the session, losing every request on it.
+///
+/// [`SessionError::TooManyRequestUpdates`]: moq_net::SessionError::TooManyRequestUpdates
+#[tokio::test]
+async fn a_held_renewal_coalesces_a_burst_without_tripping_the_credit() {
+	within(async {
+		let ts = |ms| moq_net::Timestamp::from_millis(ms).unwrap();
+		let prefs = || moq_net::track::Subscription::default().with_max_age(Duration::from_secs(10));
+		let server_origin = produce_origin(1);
+		let down = server_origin.create_broadcast("room/alice").unwrap();
+		let down_track = down.create_track("video", None).unwrap();
+		down.announce(Default::default()).unwrap();
+
+		// USE_VALUE (0x03), token kind 0, then a distinct value per credential.
+		let token = |n: u8| vec![0x03, 0x00, b't', n];
+		let initial = token(0);
+		let received = produce_origin(3);
+		let mut pair = connect(Options {
+			version: Some(MOQT_19),
+			client_subscribe: Some(received.clone()),
+			client_request_token: Some(initial.clone()),
+			client_decline_auth: true,
+			server_publish: Some(server_origin.clone()),
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+
+		// The acceptor runs concurrently with the subscribe (the initial token rides the
+		// SUBSCRIBE, so nothing reaches it until we subscribe). It reports every token it
+		// verifies and holds the first renewal's verifier until released, the way a relay with
+		// a slow authorizer would.
+		let mut requests = pair.requests.take().expect("server took its requests pre-ok");
+		let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+		let release = std::sync::Arc::new(tokio::sync::Notify::new());
+		let release_waiter = release.clone();
+		let acceptor = tokio::spawn(async move {
+			let mut issued = Vec::new();
+			let mut count = 0u64;
+			while let Some(request) = requests.next().await {
+				let token = request.token().to_vec();
+				count += 1;
+				// Request 1 is the initial SUBSCRIBE token; request 2 is the first renewal,
+				// held until the test releases it.
+				if count == 2 {
+					seen_tx.send(token).ok();
+					release_waiter.notified().await;
+				} else {
+					seen_tx.send(token).ok();
+				}
+				issued.push(request.accept(grant(&[], &["room/alice"])));
+			}
+		});
+
+		// Establish and deliver one group so the subscription is live. The initial token rides
+		// the SUBSCRIBE, which the acceptor (above) verifies concurrently.
+		let remote = received.consume().routed_broadcast("room/alice").await.unwrap();
+		let mut sub = remote.track("video").unwrap().subscribe(prefs()).await.unwrap();
+		let mut group = down_track.append_group().unwrap();
+		group.write_frame(ts(0), b"one".as_ref()).unwrap();
+		group.finish().unwrap();
+		sub.recv_group().await.unwrap().unwrap();
+		assert_eq!(
+			seen.recv().await.expect("initial token"),
+			initial[2..],
+			"the SUBSCRIBE carries the token"
+		);
+
+		// Replace the token once and let that one renewal reach the held acceptor, so the held
+		// renewal is deterministic regardless of scheduling.
+		pair.client.auth().set_request_token(token(1));
+		assert_eq!(
+			seen.recv().await.expect("first renewal"),
+			token(1)[2..],
+			"the first replacement goes out immediately"
+		);
+
+		// With that renewal held unanswered, replace the token many more times, spaced so the
+		// driver observes each: the scenario the credit guards. Far past any plausible credit,
+		// so the test keeps guarding if MAX_REQUEST_UPDATES grows. A fire-and-forget sender
+		// would put all of these outstanding behind the held verifier and the serving side
+		// would close the session with TOO_MANY_REQUEST_UPDATES, losing every request on it;
+		// the one-in-flight rule coalesces them behind the held one instead.
+		for n in 2..=64u8 {
+			pair.client.auth().set_request_token(token(n));
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+
+		assert_eq!(
+			pair.client_transport.close_reason(),
+			None,
+			"the burst never tripped the receiver's credit"
+		);
+		assert_eq!(
+			pair.server_transport.close_reason(),
+			None,
+			"the server never closed the session"
+		);
+
+		// Resolve the held verifier. The sender sends the coalesced renewal carrying the newest
+		// token, not any of the ones replaced between.
+		release.notify_one();
+		assert_eq!(
+			seen.recv().await.expect("coalesced renewal"),
+			token(64)[2..],
+			"the newest token wins; the rest are coalesced away"
+		);
+
+		// Only the newest coalesced renewal followed the held one: the burst collapsed to one,
+		// not a backlog queued behind it.
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), seen.recv())
+				.await
+				.is_err(),
+			"only the newest coalesced renewal followed, not a backlog"
+		);
+		assert_eq!(
+			pair.client_transport.close_reason(),
+			None,
+			"the session stayed up throughout"
+		);
+		acceptor.abort();
 	})
 	.await
 	.expect("timed out");

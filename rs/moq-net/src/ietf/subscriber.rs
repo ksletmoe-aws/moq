@@ -2220,14 +2220,30 @@ where
 			Revoked,
 			/// The client replaced its request token: re-present it on this live subscription.
 			Renew(Option<bytes::Bytes>),
+			/// The publisher answered the renewal in flight (REQUEST_OK / REQUEST_ERROR), so
+			/// a replacement coalesced behind it may now be sent.
+			Answered,
 			Done(Result<u64, Error>),
 		}
 
 		let mut fetch_done = fetching.is_none();
 		// The request token last presented on this subscription (its initial value).
 		let mut last_token = self.request_token.peek();
+		// At most one renewal (SUBSCRIBE_UPDATE) is left unanswered at a time: a replacement
+		// that arrives while one is in flight is coalesced into `last_token` and sent once
+		// the outstanding one is answered, so the sender never outruns the receiver's
+		// MAX_REQUEST_UPDATES credit (draft-19 section 10.3.1.7) whatever its value, without
+		// reading it. `in_flight` is the token value awaiting an answer, `None` when nothing
+		// is outstanding. Draft-14 answers no accepted renewal, so it cannot pace on answers
+		// and re-presents each change directly; it also advertises no credit to exceed.
+		let throttle = !matches!(self.version, Version::Draft14);
+		let mut in_flight: Option<bytes::Bytes> = None;
+		// Bumped by `read_publish_done` on each renewal answer; the loop releases the
+		// coalesced replacement when it advances past `seen_answers`.
+		let answers = kio::Shared::new(0u64);
+		let mut seen_answers = 0u64;
 		let cancelled = {
-			let mut done = std::pin::pin!(Self::read_publish_done(&mut stream.reader, self.version));
+			let mut done = std::pin::pin!(Self::read_publish_done(&mut stream.reader, self.version, &answers));
 			loop {
 				let end = kio::wait(|waiter| {
 					if !fetch_done
@@ -2244,6 +2260,16 @@ where
 					}
 					if let Poll::Ready(token) = self.request_token.poll_changed(&last_token, waiter) {
 						return Poll::Ready(End::Renew(token));
+					}
+					// Only wait on an answer while a renewal is actually outstanding.
+					if throttle
+						&& in_flight.is_some()
+						&& let Poll::Ready(count) = answers.poll(waiter, |count| match **count != seen_answers {
+							true => Poll::Ready(()),
+							false => Poll::Pending,
+						}) {
+						seen_answers = *count;
+						return Poll::Ready(End::Answered);
 					}
 					waiter.poll_future(done.as_mut()).map(End::Done)
 				})
@@ -2262,20 +2288,55 @@ where
 					// disjoint borrow from its reader, so writing here does not disturb the read.
 					End::Renew(token) => {
 						last_token = token.clone();
-						if let Some(token) = token
-							&& let Err(err) = self
+						// Send only when no renewal is outstanding; otherwise coalesce, leaving the
+						// newest in `last_token` to go out on End::Answered. A cleared token (`None`)
+						// is not a renewal and sends nothing.
+						let send_now = !throttle || in_flight.is_none();
+						if send_now && let Some(token) = token {
+							match self
 								.send_request_token_update(
 									&mut stream.writer,
 									request_id,
 									subscriber_priority,
 									renewal_start,
-									token,
+									token.clone(),
 								)
 								.await
+							{
+								Ok(()) if throttle => {
+									in_flight = Some(token);
+									// Only an answer that arrives after this send releases the
+									// coalesced follow-up, so a stray earlier answer cannot.
+									seen_answers = *answers.lock();
+								}
+								Ok(()) => {}
+								// A failed send does not end the subscription: it continues on the old
+								// grant until that lapses, and the next change re-presents the token.
+								Err(err) => tracing::debug!(%err, "failed to re-present the request token"),
+							}
+						}
+					}
+					End::Answered => {
+						// The outstanding renewal was answered. If the credential changed while it
+						// was in flight, present the newest now (a cleared token sends nothing);
+						// otherwise the publisher already holds the latest.
+						let was = in_flight.take();
+						if last_token != was
+							&& let Some(token) = last_token.clone()
 						{
-							// A failed send does not end the subscription: it continues on the old
-							// grant until that lapses, and the next change re-presents the token.
-							tracing::debug!(%err, "failed to re-present the request token");
+							match self
+								.send_request_token_update(
+									&mut stream.writer,
+									request_id,
+									subscriber_priority,
+									renewal_start,
+									token.clone(),
+								)
+								.await
+							{
+								Ok(()) => in_flight = Some(token),
+								Err(err) => tracing::debug!(%err, "failed to re-present the request token"),
+							}
 						}
 					}
 					End::Revoked => {
@@ -2347,10 +2408,15 @@ where
 	///
 	/// A request-token renewal we sent (SUBSCRIBE_UPDATE) is answered on this same stream
 	/// (REQUEST_OK / REQUEST_ERROR on draft-15+, SUBSCRIBE_ERROR on draft-14; draft-14 is
-	/// silent on an accepted renewal). Those are consumed here and the read continues: a
-	/// refused renewal leaves the old grant standing until it lapses, so the subscription
-	/// ends then, with its PUBLISH_DONE, not on the answer.
-	async fn read_publish_done(reader: &mut Reader<S::RecvStream, Version>, version: Version) -> Result<u64, Error> {
+	/// silent on an accepted renewal). Each answer bumps `answers` so the send loop can
+	/// release the renewal it coalesced behind the one in flight; the read continues
+	/// regardless, since a refused renewal leaves the old grant standing until it lapses,
+	/// so the subscription ends then, with its PUBLISH_DONE, not on the answer.
+	async fn read_publish_done(
+		reader: &mut Reader<S::RecvStream, Version>,
+		version: Version,
+		answers: &kio::Shared<u64>,
+	) -> Result<u64, Error> {
 		loop {
 			match reader.decode_maybe::<u64>().await? {
 				Some(ietf::PublishDone::ID) => {
@@ -2362,6 +2428,7 @@ where
 				Some(ietf::RequestOk::ID) => {
 					let msg: ietf::RequestOk = reader.decode().await?;
 					tracing::debug!(message = ?msg, "request token renewal accepted");
+					*answers.lock() += 1;
 				}
 				Some(ietf::RequestError::ID) => {
 					// draft-17+ generalized SUBSCRIBE_ERROR into REQUEST_ERROR at the same id;
@@ -2377,6 +2444,7 @@ where
 							tracing::warn!(message = ?msg, "request token renewal refused");
 						}
 					}
+					*answers.lock() += 1;
 				}
 				Some(_) => return Err(Error::UnexpectedMessage),
 				None => return Err(Error::ProtocolViolation),
@@ -3605,7 +3673,8 @@ mod tests {
 		let mut session = ScriptedSession::eof(responses);
 		let (_, recv) = session.open_bi().await.unwrap();
 		let mut reader = Reader::new(recv, Version::Draft19);
-		let result = Subscriber::<ScriptedSession>::read_publish_done(&mut reader, Version::Draft19).await;
+		let answers = kio::Shared::new(0u64);
+		let result = Subscriber::<ScriptedSession>::read_publish_done(&mut reader, Version::Draft19, &answers).await;
 		if clean {
 			assert_eq!(result.unwrap(), 0);
 		} else {
