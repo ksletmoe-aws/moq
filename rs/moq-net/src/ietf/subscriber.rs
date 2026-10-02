@@ -2057,6 +2057,12 @@ where
 			priority,
 			largest,
 		} = accepted;
+		// Where this subscription began: the object after the Largest Object SUBSCRIBE_OK
+		// named, which every draft before 20 subscribes at. Draft-14's renewal restates it.
+		let renewal_start = largest.map_or(ietf::Location { group: 0, object: 0 }, |largest| ietf::Location {
+			group: largest.group,
+			object: largest.object.saturating_add(1),
+		});
 		let info = track::Info::default()
 			.with_timescale(Timescale::MICRO)
 			.with_max_age(self.origin.default_max_age())
@@ -2164,7 +2170,13 @@ where
 						last_token = token.clone();
 						if let Some(token) = token
 							&& let Err(err) = self
-								.send_request_token_update(&mut stream.writer, request_id, subscriber_priority, token)
+								.send_request_token_update(
+									&mut stream.writer,
+									request_id,
+									subscriber_priority,
+									renewal_start,
+									token,
+								)
 								.await
 						{
 							// A failed send does not end the subscription: it continues on the old
@@ -2335,15 +2347,17 @@ where
 	/// REQUEST_UPDATE (SUBSCRIBE_UPDATE), so a refreshed credential reaches the publisher
 	/// before the old grant lapses (MoQ request-token renewal).
 	///
-	/// Token-only: the range, priority and forward flag are the subscription's own, so a
-	/// receiver that acts on them (ours does not, for a token update) sees no change. The
-	/// answer, if the version sends one, is read on the subscription stream by
-	/// [`read_publish_done`](Self::read_publish_done).
+	/// Token-only: draft-15+ omits the range, priority and forward flag, which an update keeps
+	/// as they are. Draft-14's fields are fixed, so it restates the subscription's own:
+	/// `start` is where it began (the Largest Object after SUBSCRIBE_OK), which the peer
+	/// MUST NOT see decrease. The answer, if the version sends one, is read on the
+	/// subscription stream by [`read_publish_done`](Self::read_publish_done).
 	async fn send_request_token_update(
 		&self,
 		writer: &mut crate::coding::Writer<S::SendStream, Version>,
 		subscription_id: RequestId,
 		subscriber_priority: u8,
+		start: ietf::Location,
 		token: bytes::Bytes,
 	) -> Result<(), Error> {
 		let request_id = self.control.next_request_id(&self.runtime).await?;
@@ -2352,15 +2366,17 @@ where
 			Version::Draft14 | Version::Draft15 | Version::Draft16 => Some(subscription_id),
 			_ => None,
 		};
+		let draft14 = self.version == Version::Draft14;
 		writer.encode(&ietf::SubscribeUpdate::ID).await?;
 		writer
 			.encode(&ietf::SubscribeUpdate {
 				request_id,
 				subscription_request_id,
-				start_location: ietf::Location { group: 0, object: 0 },
+				start_location: start,
 				end_group: 0,
-				subscriber_priority,
-				forward: true,
+				subscriber_priority: draft14.then_some(subscriber_priority),
+				forward: draft14.then_some(true),
+				filter: None,
 				authorization_token: Some(token),
 			})
 			.await?;
@@ -4310,6 +4326,37 @@ mod tests {
 			assert!(
 				renewed,
 				"{version}: a replaced token must be re-presented on the live subscription"
+			);
+
+			// The renewal leaves the subscription's range alone: draft-14 restates where it
+			// began (the object after SUBSCRIBE_OK's Largest Object, {0, 0} here), and draft-15+
+			// omits the filter, priority and forward flag so they keep their values.
+			let draft14 = version == Version::Draft14;
+			let mut expected = Vec::new();
+			for request_id in 0..16 {
+				let log = crate::lite::test_transport::Log::default();
+				let mut writer =
+					crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+				writer.encode(&ietf::SubscribeUpdate::ID).await.unwrap();
+				writer
+					.encode(&ietf::SubscribeUpdate {
+						request_id: RequestId(request_id),
+						subscription_request_id: draft14.then_some(RequestId(1)),
+						start_location: ietf::Location { group: 0, object: 1 },
+						end_group: 0,
+						// The SUBSCRIBE went out at the lowest wire priority; the renewal restates it.
+						subscriber_priority: draft14.then_some(0xff),
+						forward: draft14.then_some(true),
+						filter: None,
+						authorization_token: Some(second.clone()),
+					})
+					.await
+					.unwrap();
+				expected.push(log.writes.lock().unwrap().clone());
+			}
+			assert!(
+				expected.iter().any(|bytes| occurrences(&log, bytes) == 1),
+				"{version}: the renewal must keep the subscription's range"
 			);
 
 			drop(subscription);

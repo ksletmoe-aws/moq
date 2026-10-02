@@ -3506,8 +3506,9 @@ mod serve_tests {
 			subscription_request_id,
 			start_location: Location { group: 0, object: 0 },
 			end_group: 0,
-			subscriber_priority: 128,
-			forward: true,
+			subscriber_priority: Some(128),
+			forward: Some(true),
+			filter: None,
 			authorization_token: Some(request_token()),
 		};
 		writer.encode(&ietf::SubscribeUpdate::ID).await.unwrap();
