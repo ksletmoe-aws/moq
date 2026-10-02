@@ -21,7 +21,7 @@ use crate::{
 	util::{MaybeBoxedExt, MaybeSendBox},
 };
 
-use super::{Message, Version, cluster, error::request, peer};
+use super::{Message, Version, cluster, error::request, peer, request_update};
 
 /// Largest millisecond duration every implementation can carry losslessly.
 const MAX_SAFE_AGE_MS: u64 = (1_u64 << 53) - 1;
@@ -807,8 +807,8 @@ where
 				// verdict resolves. A FIFO queue, not a single slot: draft-18 section 10.9.1
 				// permits coalescing the cumulative deltas but still requires an answer per
 				// update, so an earlier buffered renewal must not be dropped by a later one. The
-				// queue is bounded, so a peer cannot grow it without limit behind a slow verdict.
-				const MAX_BUFFERED_RENEWALS: usize = 16;
+				// queue is bounded by MAX_REQUEST_UPDATES, counting the one being verified, so a
+				// peer cannot grow it without limit behind a slow verdict.
 				let mut stashed: std::collections::VecDeque<(u64, bytes::Bytes)> = std::collections::VecDeque::new();
 				loop {
 					let step = if let Some((verdict, rid)) = pending.as_mut() {
@@ -896,11 +896,32 @@ where
 						// acted on, and the non-pending path ignores anything else, so drop other
 						// messages here rather than let a peer grow the queue with ones that will
 						// never be answered. Each renewal is kept, in order, so none loses its
-						// verdict or response; too many outstanding behind a slow verdict ends the
-						// request (not the session), as draft-19 MAX_REQUEST_UPDATES allows.
+						// verdict or response. The one being verified plus those queued behind it
+						// are the outstanding REQUEST_UPDATEs; what happens when another would
+						// exceed the ceiling is version-appropriate.
 						Step::Buffered(id, data) => {
 							if id == ietf::SubscribeUpdate::ID {
-								if stashed.len() >= MAX_BUFFERED_RENEWALS {
+								// Outstanding counting the one being verified: 1 + stashed.len().
+								let outstanding = stashed.len() as u64 + 1;
+								if request_update::supported(self.version) {
+									// Draft-19+: we advertised MAX_REQUEST_UPDATES, so a peer with
+									// that many already outstanding sending another broke the
+									// negotiated limit. Draft-19 section 10.3.1.7 answers that with
+									// a session close, TOO_MANY_REQUEST_UPDATES. A conforming peer
+									// self-limits and never reaches here. Closing the session makes
+									// the request's own PUBLISH_DONE moot, so return straight out as
+									// the malformed-token path does.
+									if outstanding >= request_update::MAX_REQUEST_UPDATES {
+										self.session.clone().close(
+											crate::SessionError::TooManyRequestUpdates.to_code(),
+											"too many request updates",
+										);
+										return Err(Error::Session(crate::SessionError::TooManyRequestUpdates));
+									}
+								} else if stashed.len() >= request_update::UNNEGOTIATED_GUARD {
+									// Drafts below 19 negotiate no limit, so a peer agreed to no
+									// ceiling: this is a local memory guard, not a protocol fault.
+									// End this request, never the session.
 									break Some((Err(Error::ProtocolViolation), false));
 								}
 								stashed.push_back((id, data));
@@ -962,13 +983,20 @@ where
 								Err(err) => break Some((Err(err.into()), false)),
 							};
 							// A token-less REQUEST_UPDATE is an ordinary priority/forward change,
-							// which this publisher does not act on; the grant is untouched.
+							// which this publisher does not act on; the grant is untouched. It still
+							// owes one answer so the peer's MAX_REQUEST_UPDATES credit is restored.
 							let Some(token) = &update.authorization_token else {
+								self.answer_request_update_ok(&mut stream.writer, update.request_id)
+									.await?;
 								continue;
 							};
 							// Only a token-authorized subscription holds a request grant to renew;
-							// a union-authorized one is already covered by the session grant.
+							// a union-authorized one is already covered by the session grant. The
+							// update is accepted all the same, so it is acknowledged and its credit
+							// restored.
 							if request_grant.is_none() {
+								self.answer_request_update_ok(&mut stream.writer, update.request_id)
+									.await?;
 								continue;
 							}
 							// An alias reference (DELETE/USE_ALIAS) is a connection-level protocol
@@ -1157,6 +1185,24 @@ where
 		writer.encode(&ietf::RequestOk::ID).await?;
 		writer.encode(&ietf::RequestOk { request_id }).await?;
 		Ok(())
+	}
+
+	/// Acknowledge a REQUEST_UPDATE that this side accepts without a pending verify, keyed as the
+	/// version requires: draft-14 defines no response (silent), draft-15/16 key it to the update's
+	/// own request id, draft-17+ answer on the stream with the id omitted. Every REQUEST_UPDATE
+	/// owes exactly one REQUEST_OK or REQUEST_ERROR (moq-transport section 10.9), and that answer
+	/// restores one of the peer's MAX_REQUEST_UPDATES credits; without it an advertised limit would
+	/// strand a peer that only ever sends priority or forward updates.
+	async fn answer_request_update_ok(
+		&self,
+		writer: &mut Writer<S::SendStream, Version>,
+		request_id: RequestId,
+	) -> Result<(), Error> {
+		if matches!(self.version, Version::Draft14) {
+			return Ok(());
+		}
+		let answer_id = matches!(self.version, Version::Draft15 | Version::Draft16).then_some(request_id);
+		self.write_request_ok(writer, answer_id).await
 	}
 
 	/// Serve a draft-20 fill on its own fetch stream: the requested range, read from the
@@ -3863,6 +3909,31 @@ mod serve_tests {
 		log.writes.lock().unwrap().clone()
 	}
 
+	/// One token-less REQUEST_UPDATE (a priority or forward change) keyed to `rid`, framed as the
+	/// peer sends it. It carries no AUTHORIZATION TOKEN, so it starts no verify and is answered at
+	/// once rather than held.
+	async fn subscribe_update_bare_rid(version: Version, rid: u64) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+		let subscription_request_id = match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => Some(RequestId(REQUEST_ID)),
+			_ => None,
+		};
+		let msg = ietf::SubscribeUpdate {
+			request_id: RequestId(rid),
+			subscription_request_id,
+			start_location: Location { group: 0, object: 0 },
+			end_group: 0,
+			subscriber_priority: Some(128),
+			forward: Some(true),
+			filter: None,
+			authorization_token: None,
+		};
+		writer.encode(&ietf::SubscribeUpdate::ID).await.unwrap();
+		writer.encode(&msg).await.unwrap();
+		log.writes.lock().unwrap().clone()
+	}
+
 	/// Two token renewals that arrive while a first renewal's verdict is still pending are each
 	/// verified and answered, not collapsed. The loop keeps per-update state while a verify is
 	/// pending (draft-18 section 10.9.1 answers each update); the single slot it replaced
@@ -3933,18 +4004,19 @@ mod serve_tests {
 		);
 	}
 
-	/// A peer cannot grow the pending-renewal buffer without limit: once more than
-	/// MAX_BUFFERED_RENEWALS pile up behind a held verdict the request ends, not the session, as
-	/// draft-19 MAX_REQUEST_UPDATES allows. Without the bound the loop buffered every renewal and
-	/// never ended.
+	/// Draft-19 advertises MAX_REQUEST_UPDATES, so a peer that leaves more outstanding than that
+	/// broke the negotiated limit: draft-19 section 10.3.1.7 closes the session with
+	/// TOO_MANY_REQUEST_UPDATES.
 	#[tokio::test(start_paused = true)]
-	async fn too_many_renewals_behind_a_held_verdict_end_the_request() {
-		const VERSION: Version = Version::Draft18;
+	async fn renewals_past_the_advertised_limit_close_the_session() {
+		const VERSION: Version = Version::Draft19;
 
 		let (auth, mut requests, _cred) = auth_covering_other();
-		// Well past the cap: the first renewal is held pending, the rest pile up behind it.
+		// Exactly one past the limit: the held renewal plus MAX_REQUEST_UPDATES queued behind it
+		// is the (limit + 1)th outstanding, the one that must close the session.
+		let last = 0x40 + request_update::MAX_REQUEST_UPDATES;
 		let mut script = Vec::new();
-		for rid in 0x40..=0x60u64 {
+		for rid in 0x40..=last {
 			script.extend(subscribe_update_token_rid(VERSION, rid).await);
 		}
 		let h = serve_with_auth(VERSION, auth, script);
@@ -3975,8 +4047,266 @@ mod serve_tests {
 			}
 			settle().await;
 		}
-		assert!(ended, "flooding past the renewal cap must end the request");
-		assert!(h.log.closes().is_empty(), "the flood ends the request, not the session");
+		assert!(ended, "flooding past the advertised limit must end the request");
+		assert!(
+			h.log
+				.closes()
+				.iter()
+				.any(|close| close.0 == crate::SessionError::TooManyRequestUpdates.to_code()),
+			"the flood must close the session with TOO_MANY_REQUEST_UPDATES: {:?}",
+			h.log.closes()
+		);
+	}
+
+	/// Exactly MAX_REQUEST_UPDATES outstanding (the one being verified plus the queue) is within
+	/// the advertised limit, so a draft-19 peer holding that many is not faulted: the request
+	/// keeps running and the session stays up.
+	#[tokio::test(start_paused = true)]
+	async fn renewals_at_the_advertised_limit_keep_the_request() {
+		const VERSION: Version = Version::Draft19;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		// The held renewal plus MAX_REQUEST_UPDATES - 1 queued behind it is exactly the limit.
+		let last = 0x40 + request_update::MAX_REQUEST_UPDATES - 1;
+		let mut script = Vec::new();
+		for rid in 0x40..=last {
+			script.extend(subscribe_update_token_rid(VERSION, rid).await);
+		}
+		let h = serve_with_auth(VERSION, auth, script);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.unwrap();
+			let _held = first.accept(grant_all_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"the request must stay up at exactly the advertised limit"
+			);
+			settle().await;
+		}
+		assert!(
+			h.log.closes().is_empty(),
+			"no session close at the limit: {:?}",
+			h.log.closes()
+		);
+	}
+
+	/// Drafts below 19 carry no MAX_REQUEST_UPDATES option, so a peer there agreed to no ceiling:
+	/// the same flood that closes a draft-19 session must neither end the request nor close the
+	/// session on draft-18, because a conforming peer must not be stranded for a limit it never saw.
+	#[tokio::test(start_paused = true)]
+	async fn older_drafts_do_not_strand_a_renewal_flood() {
+		const VERSION: Version = Version::Draft18;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		let mut script = Vec::new();
+		for rid in 0x40..=0x60u64 {
+			script.extend(subscribe_update_token_rid(VERSION, rid).await);
+		}
+		let h = serve_with_auth(VERSION, auth, script);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.unwrap();
+			let _held = first.accept(grant_all_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"draft-18 negotiates no limit, so the flood must not strand the request"
+			);
+			settle().await;
+		}
+		assert!(h.log.closes().is_empty(), "draft-18 flood must not close the session");
+	}
+
+	/// Every REQUEST_UPDATE owes one answer, token or not (moq-transport section 10.9), and that
+	/// answer restores one MAX_REQUEST_UPDATES credit. A peer that only sends token-less priority
+	/// updates must keep its credit so it can still renew, so each gets a REQUEST_OK and the
+	/// session stays up well past the advertised limit.
+	#[tokio::test(start_paused = true)]
+	async fn token_less_updates_are_each_acknowledged() {
+		const VERSION: Version = Version::Draft19;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		// More than the advertised limit, none carrying a token: none starts a verify, so none is
+		// ever outstanding.
+		let count = request_update::MAX_REQUEST_UPDATES + 4;
+		let mut script = Vec::new();
+		for rid in 0x40..0x40 + count {
+			script.extend(subscribe_update_bare_rid(VERSION, rid).await);
+		}
+		let h = serve_with_auth(VERSION, auth, script);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.unwrap();
+			let _held = first.accept(grant_all_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(
+				futures::poll!(serving.as_mut()).is_pending(),
+				"token-less updates must not strand the request"
+			);
+			settle().await;
+		}
+
+		// Draft-19 answers each with a REQUEST_OK, request id omitted.
+		let one_ok = {
+			let log = crate::lite::test_transport::Log::default();
+			let mut writer =
+				crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), VERSION);
+			writer.encode(&ietf::RequestOk::ID).await.unwrap();
+			writer.encode(&ietf::RequestOk { request_id: None }).await.unwrap();
+			log.writes.lock().unwrap().clone()
+		};
+		let written = h.log.writes.lock().unwrap().clone();
+		assert!(
+			written.ends_with(&one_ok.repeat(count as usize)),
+			"each token-less update must get exactly one REQUEST_OK"
+		);
+		assert!(
+			h.log.closes().is_empty(),
+			"token-less updates must not close the session"
+		);
+	}
+
+	/// Before draft-17 a token-less REQUEST_UPDATE is answered keyed to its own request id
+	/// (draft-15/16), or not at all (draft-14, which defines no response). This pins the keyed and
+	/// silent branches of the acknowledgement so a wrong key cannot misroute the peer's answer.
+	#[tokio::test(start_paused = true)]
+	async fn token_less_updates_are_keyed_before_draft_17() {
+		for version in [Version::Draft14, Version::Draft15, Version::Draft16] {
+			let (auth, mut requests, _cred) = auth_covering_other();
+			let rids = [0x41u64, 0x42, 0x43];
+			let mut script = Vec::new();
+			for rid in rids {
+				script.extend(subscribe_update_bare_rid(version, rid).await);
+			}
+			let h = serve_with_auth(version, auth, script);
+			let rt = h.publisher.runtime.clone();
+
+			let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+			group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+			group.finish().unwrap();
+			settle().await;
+
+			let stream = Stream::open(&mut h.session.clone(), version).await.unwrap();
+			let acceptor = async move {
+				let first = requests.next().await.unwrap();
+				let _held = first.accept(grant_all_expiring(&rt, None));
+				std::future::pending::<()>().await
+			};
+			let mut acceptor = std::pin::pin!(acceptor);
+			let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+			for _ in 0..500 {
+				let _ = futures::poll!(acceptor.as_mut());
+				assert!(
+					futures::poll!(serving.as_mut()).is_pending(),
+					"{version}: token-less updates must not end the request"
+				);
+				settle().await;
+			}
+
+			// Draft-14 answers nothing; draft-15/16 answer each update keyed to its own request id.
+			let mut expected = Vec::new();
+			if !matches!(version, Version::Draft14) {
+				for rid in rids {
+					expected.extend(request_ok_bytes(version, RequestId(rid)).await);
+				}
+			}
+			let written = h.log.writes.lock().unwrap().clone();
+			assert!(
+				written.ends_with(&expected),
+				"{version}: each token-less update gets its keyed REQUEST_OK"
+			);
+			assert!(
+				h.log.closes().is_empty(),
+				"{version}: token-less updates must not close the session"
+			);
+		}
+	}
+
+	/// On drafts without the option the guard is a memory backstop, not a protocol limit: a flood
+	/// past it ends the one request through PUBLISH_DONE, never the session.
+	#[tokio::test(start_paused = true)]
+	async fn an_older_draft_flood_past_the_guard_ends_the_request() {
+		const VERSION: Version = Version::Draft18;
+
+		let (auth, mut requests, _cred) = auth_covering_other();
+		let last = 0x40 + request_update::UNNEGOTIATED_GUARD as u64 + 1;
+		let mut script = Vec::new();
+		for rid in 0x40..=last {
+			script.extend(subscribe_update_token_rid(VERSION, rid).await);
+		}
+		let h = serve_with_auth(VERSION, auth, script);
+		let rt = h.publisher.runtime.clone();
+
+		let mut group = h.track.create_group(group::Info { sequence: 0 }).unwrap();
+		group.write_frame(timestamp(), b"frame".as_slice()).unwrap();
+		group.finish().unwrap();
+		settle().await;
+
+		let stream = Stream::open(&mut h.session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.unwrap();
+			let _held = first.accept(grant_all_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut serving = std::pin::pin!(h.publisher.clone().run_subscribe_stream(stream, token_subscribe()));
+
+		let mut ended = false;
+		for _ in 0..4000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if futures::poll!(serving.as_mut()).is_ready() {
+				ended = true;
+				break;
+			}
+			settle().await;
+		}
+		assert!(ended, "a flood past the guard must end the request");
+		assert!(h.log.closes().is_empty(), "the guard ends the request, not the session");
 	}
 
 	/// A peer that ends the subscription while a renewal is still being verified ends it here

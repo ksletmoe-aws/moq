@@ -9,7 +9,7 @@ use crate::{
 
 use super::{
 	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, auth, cluster, hidden, peer,
-	solicit, subscriber::is_protocol_violation,
+	request_update, solicit, subscriber::is_protocol_violation,
 };
 
 /// Everything one moq-transport session needs to start.
@@ -678,6 +678,7 @@ async fn run_setup<S: crate::transport::poll::Session>(
 	if extensions.auth {
 		auth::into_setup(&mut parameters, version);
 	}
+	request_update::into_setup(&mut parameters, version);
 	let parameters = parameters.encode_bytes(version)?;
 
 	writer.encode(&setup::Setup { parameters }).await?;

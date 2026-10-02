@@ -14,7 +14,7 @@ use crate::{
 	util::{MaybeBoxedExt, MaybeSendBox, TaskSet, Tasks},
 };
 
-use super::{Message, Version, cluster, error::request, peer};
+use super::{Message, Version, cluster, error::request, peer, request_update};
 use crate::tail::{Reading, Settle, Tail};
 
 use kio::Lock;
@@ -1212,9 +1212,9 @@ where
 		// Updates that arrived while a renewal was pending, handled in order once each verdict
 		// resolves. A FIFO queue, not a single slot: draft-18 section 10.9.1 permits coalescing
 		// the cumulative deltas but still requires an answer per update, so an earlier buffered
-		// update must not be dropped by a later one. The queue is bounded, so a peer cannot grow
-		// it without limit behind a slow verdict.
-		const MAX_BUFFERED_RENEWALS: usize = 16;
+		// update must not be dropped by a later one. The queue is bounded by MAX_REQUEST_UPDATES,
+		// counting the one being verified, so a peer cannot grow it without limit behind a slow
+		// verdict.
 		let mut stashed: std::collections::VecDeque<(u64, bytes::Bytes)> = std::collections::VecDeque::new();
 		// A withdrawal read while a renewal was pending, handled ahead of any queued update so
 		// a buffered update never masks it: nothing more is owed once the peer retracts.
@@ -1275,11 +1275,35 @@ where
 					Ren::Buffered(message) => {
 						// Queue the update to handle once the verdict resolves; the loop keeps
 						// reading, so a terminal is never masked by it. Each buffered update is
-						// kept, in order, so none loses its cluster delta or its answer. Too many
-						// outstanding behind a slow verdict ends this announce, never the session
-						// (an Err would reach the dispatcher as a protocol violation and close it),
-						// as draft-19 MAX_REQUEST_UPDATES allows: finish the stream and stop.
-						if stashed.len() >= MAX_BUFFERED_RENEWALS {
+						// kept, in order, so none loses its cluster delta or its answer. Only a
+						// REQUEST_UPDATE counts toward the limit (anything else is caught as an
+						// unexpected message when it drains); the one being verified plus the
+						// queued updates are the outstanding REQUEST_UPDATEs, and what happens when
+						// another would exceed the ceiling is version-appropriate.
+						let is_update = message.0 == ietf::PublishNamespaceUpdate::ID;
+						let outstanding = stashed
+							.iter()
+							.filter(|(id, _)| *id == ietf::PublishNamespaceUpdate::ID)
+							.count() as u64 + 1;
+						if request_update::supported(self.version) && is_update {
+							// Draft-19+: we advertised MAX_REQUEST_UPDATES, so a peer with that many
+							// already outstanding sending another broke the negotiated limit.
+							// Draft-19 section 10.3.1.7 answers that with a session close,
+							// TOO_MANY_REQUEST_UPDATES. Returning the error is not enough here: the
+							// dispatcher closes only on is_protocol_violation, which excludes
+							// Error::Session, so close explicitly as the publisher does. A conforming
+							// peer self-limits and never reaches here.
+							if outstanding >= request_update::MAX_REQUEST_UPDATES {
+								self.session.clone().close(
+									crate::SessionError::TooManyRequestUpdates.to_code(),
+									"too many request updates",
+								);
+								return Err(Error::Session(crate::SessionError::TooManyRequestUpdates));
+							}
+						} else if stashed.len() >= request_update::UNNEGOTIATED_GUARD {
+							// Drafts below 19 negotiate no limit, so a peer agreed to no ceiling:
+							// this is a local memory guard, not a protocol fault. End this announce,
+							// never the session: finish the stream and stop.
 							if stream.writer.finish().is_ok() {
 								let _ = stream.writer.closed().await;
 							}
@@ -5664,17 +5688,18 @@ mod tests {
 		);
 	}
 
-	/// A peer cannot grow the announce renewal buffer without limit: once more than
-	/// MAX_BUFFERED_RENEWALS pile up behind a held verdict the announce ends and
-	/// run_publish_namespace_stream returns Ok, so the dispatcher does not treat it as a protocol
-	/// violation and close the session. Without the bound the loop buffered every update and never
-	/// ended; returning an error here would have closed the whole session.
+	/// Draft-19 advertises MAX_REQUEST_UPDATES, so a peer that leaves more outstanding than that on
+	/// an announce stream broke the negotiated limit: draft-19 section 10.3.1.7 closes the session
+	/// with TOO_MANY_REQUEST_UPDATES. run_publish_namespace_updates must close explicitly (the
+	/// dispatcher does not close on an Error::Session), and surface that error too.
 	#[tokio::test(start_paused = true)]
-	async fn too_many_announce_renewals_behind_a_held_verdict_end_the_announce_not_the_session() {
-		const VERSION: Version = Version::Draft18;
+	async fn announce_renewals_past_the_advertised_limit_close_the_session() {
+		const VERSION: Version = Version::Draft19;
 
+		// Exactly one past the limit: the held renewal plus MAX_REQUEST_UPDATES queued behind it.
+		let last = 0x40 + request_update::MAX_REQUEST_UPDATES;
 		let mut script = Vec::new();
-		for rid in 0x40..=0x60u64 {
+		for rid in 0x40..=last {
 			script.extend(publish_namespace_update_token_rid(VERSION, rid, None, None).await);
 		}
 		let (mut subscriber, mut requests, _cred, _consumer, session) = auth_announce_harness(VERSION, script);
@@ -5704,13 +5729,155 @@ mod tests {
 			}
 			settle().await;
 		}
+		let Some(Err(err)) = result else {
+			panic!("flooding past the advertised limit must end the announce with an error: {result:?}");
+		};
+		assert_eq!(
+			SessionError::from(&err),
+			SessionError::TooManyRequestUpdates,
+			"the flood must surface TOO_MANY_REQUEST_UPDATES"
+		);
+		assert!(
+			session
+				.log
+				.closes()
+				.iter()
+				.any(|close| close.0 == SessionError::TooManyRequestUpdates.to_code()),
+			"the flood must close the session with TOO_MANY_REQUEST_UPDATES: {:?}",
+			session.log.closes()
+		);
+	}
+
+	/// Exactly MAX_REQUEST_UPDATES outstanding (the one being verified plus the queue) is within
+	/// the advertised limit, so a draft-19 peer holding that many is not faulted: the announce
+	/// keeps running and the session stays up.
+	#[tokio::test(start_paused = true)]
+	async fn announce_renewals_at_the_advertised_limit_keep_the_announce() {
+		const VERSION: Version = Version::Draft19;
+
+		let last = 0x40 + request_update::MAX_REQUEST_UPDATES - 1;
+		let mut script = Vec::new();
+		for rid in 0x40..=last {
+			script.extend(publish_namespace_update_token_rid(VERSION, rid, None, None).await);
+		}
+		let (mut subscriber, mut requests, _cred, _consumer, session) = auth_announce_harness(VERSION, script);
+		let rt = subscriber.runtime.clone();
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.expect("a request");
+			let _held = first.accept(publish_grant_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+			stream,
+			token_publish_namespace(),
+			cluster::Peer::default(),
+			None,
+		));
+
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(
+				futures::poll!(run.as_mut()).is_pending(),
+				"the announce must stay up at exactly the advertised limit"
+			);
+			settle().await;
+		}
+		assert!(
+			session.log.closes().is_empty(),
+			"no session close at the limit: {:?}",
+			session.log.closes()
+		);
+	}
+
+	/// Drafts below 19 carry no MAX_REQUEST_UPDATES option, so a peer there agreed to no ceiling:
+	/// the same flood that closes a draft-19 session must neither end the announce nor close the
+	/// session on draft-18, because a conforming peer must not be stranded for a limit it never saw.
+	#[tokio::test(start_paused = true)]
+	async fn older_drafts_do_not_strand_an_announce_flood() {
+		const VERSION: Version = Version::Draft18;
+
+		let mut script = Vec::new();
+		for rid in 0x40..=0x60u64 {
+			script.extend(publish_namespace_update_token_rid(VERSION, rid, None, None).await);
+		}
+		let (mut subscriber, mut requests, _cred, _consumer, session) = auth_announce_harness(VERSION, script);
+		let rt = subscriber.runtime.clone();
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.expect("a request");
+			let _held = first.accept(publish_grant_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+			stream,
+			token_publish_namespace(),
+			cluster::Peer::default(),
+			None,
+		));
+
+		for _ in 0..2000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			assert!(
+				futures::poll!(run.as_mut()).is_pending(),
+				"draft-18 negotiates no limit, so the flood must not strand the announce"
+			);
+			settle().await;
+		}
+		assert!(
+			session.log.closes().is_empty(),
+			"draft-18 flood must not close the session"
+		);
+	}
+
+	/// On drafts without the option the guard is a memory backstop, not a protocol limit: a flood
+	/// past it ends the one announce by finishing the stream, never the session.
+	#[tokio::test(start_paused = true)]
+	async fn an_older_draft_announce_flood_past_the_guard_ends_the_announce() {
+		const VERSION: Version = Version::Draft18;
+
+		let last = 0x40 + request_update::UNNEGOTIATED_GUARD as u64 + 1;
+		let mut script = Vec::new();
+		for rid in 0x40..=last {
+			script.extend(publish_namespace_update_token_rid(VERSION, rid, None, None).await);
+		}
+		let (mut subscriber, mut requests, _cred, _consumer, session) = auth_announce_harness(VERSION, script);
+		let rt = subscriber.runtime.clone();
+		let stream = Stream::open(&mut session.clone(), VERSION).await.unwrap();
+
+		let acceptor = async move {
+			let first = requests.next().await.expect("a request");
+			let _held = first.accept(publish_grant_expiring(&rt, None));
+			std::future::pending::<()>().await
+		};
+		let mut acceptor = std::pin::pin!(acceptor);
+		let mut run = std::pin::pin!(subscriber.run_publish_namespace_stream(
+			stream,
+			token_publish_namespace(),
+			cluster::Peer::default(),
+			None,
+		));
+
+		let mut result = None;
+		for _ in 0..4000 {
+			let _ = futures::poll!(acceptor.as_mut());
+			if let std::task::Poll::Ready(r) = futures::poll!(run.as_mut()) {
+				result = Some(r);
+				break;
+			}
+			settle().await;
+		}
 		assert!(
 			matches!(result, Some(Ok(()))),
-			"flooding past the cap must end the announce with Ok, not a session-closing error: {result:?}"
+			"a flood past the guard ends the announce with Ok: {result:?}"
 		);
 		assert!(
 			session.log.closes().is_empty(),
-			"the flood ends the announce, not the session"
+			"the guard ends the announce, not the session"
 		);
 	}
 
