@@ -628,6 +628,81 @@ pub struct Snapshot {
 	pub version: Version,
 }
 
+/// The request token a [`Connection`] presents on its own requests, shared across its
+/// sessions and shown by length only so it stays out of logs.
+///
+/// The single source of truth across reconnects: the reconnect loop seeds each new session
+/// from it, and [`Auth::set_request_token`] replaces it, so a renewal set on a live
+/// connection also survives into the next session.
+#[derive(Clone, Default)]
+struct RequestToken(std::sync::Arc<std::sync::Mutex<Option<bytes::Bytes>>>);
+
+impl RequestToken {
+	fn new(token: Option<bytes::Bytes>) -> Self {
+		Self(std::sync::Arc::new(std::sync::Mutex::new(token)))
+	}
+
+	/// The token to present right now, or `None` when none is set.
+	fn get(&self) -> Option<bytes::Bytes> {
+		self.0.lock().unwrap().clone()
+	}
+
+	/// Replace the token every later session is seeded with.
+	fn set(&self, token: bytes::Bytes) {
+		*self.0.lock().unwrap() = Some(token);
+	}
+}
+
+impl std::fmt::Debug for RequestToken {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match &*self.0.lock().unwrap() {
+			Some(token) => write!(f, "<{} bytes>", token.len()),
+			None => write!(f, "<none>"),
+		}
+	}
+}
+
+/// Renews the request token a [`Connection`] presents, independent of any one session.
+///
+/// Returned by [`Connection::auth`]. The connection owns the token, so one set here survives
+/// reconnects: the loop seeds every new session from it. Setting a new token on a live
+/// connection also re-presents it on the current session's live requests as a REQUEST_UPDATE,
+/// renewing a token-authorized request in place.
+///
+/// This is the request-token slice of the connection-owned auth handle. Session credentials
+/// and grant union (the relay-token work) are not built here.
+#[derive(Clone)]
+pub struct Auth {
+	token: RequestToken,
+	state: kio::Consumer<State>,
+}
+
+impl std::fmt::Debug for Auth {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Auth").field("request_token", &self.token).finish()
+	}
+}
+
+impl Auth {
+	/// Present `token` as the `AUTHORIZATION TOKEN` on this connection's own requests (MoQ
+	/// request-token).
+	///
+	/// Updates the connection's source of truth, so every later session is seeded with it, and
+	/// reaches the live session (if any) so a renewal re-presents on its live requests as a
+	/// REQUEST_UPDATE. Replaces whatever [`crate::connect::Config::with_request_token`] seeded.
+	pub fn set_request_token(&self, token: impl Into<bytes::Bytes>) {
+		let token = token.into();
+		// The source of truth first: a reconnect racing this call then seeds the new token onto
+		// its session rather than the old one.
+		self.token.set(token.clone());
+		// Then the live session, so a renewal reaches the current requests too.
+		let session = self.state.read().session.clone();
+		if let Some(session) = session {
+			session.auth().set_request_token(token);
+		}
+	}
+}
+
 /// Handle to a connection maintained by a background task.
 ///
 /// The task connects, waits for the session to end, then (unless reconnecting is
@@ -653,6 +728,9 @@ pub struct Connection {
 	/// The last status returned by [`status`](Self::status), for change detection.
 	/// Per-clone: a clone starts from its parent's cursor and diverges from there.
 	last_reported: Option<Status>,
+	/// The request token presented across reconnects, the single source of truth the loop
+	/// seeds each session from. Shared with every [`Auth`] handle from [`auth`](Self::auth).
+	request_token: RequestToken,
 }
 
 /// The connection loop, shared by every [`Connection`] clone and aborted when the
@@ -687,6 +765,11 @@ impl Connection {
 		let closed: CloseGuard = Default::default();
 		let task_closed = closed.clone();
 
+		// The connection owns the request token (seeded from the dial config), so a renewal
+		// outlives any one session and the loop seeds each new session from the same cell.
+		let request_token = RequestToken::new(client.request_token());
+		let loop_token = request_token.clone();
+
 		let task = tokio::spawn(async move {
 			let reconnect = client.reconnect;
 			let shared = Shared {
@@ -695,7 +778,7 @@ impl Connection {
 				recv_bw,
 				closed: task_closed,
 			};
-			if let Err(err) = Self::run(&shared, client, addrs).await {
+			if let Err(err) = Self::run(&shared, client, addrs, loop_token).await {
 				// In one-shot mode the session ending is the expected lifecycle, and
 				// its close reason arrives here; don't dress it up as a loop failure.
 				match reconnect {
@@ -715,6 +798,7 @@ impl Connection {
 			send_bandwidth,
 			recv_bandwidth,
 			last_reported: None,
+			request_token,
 		}
 	}
 
@@ -784,7 +868,7 @@ impl Connection {
 		Ok(session.and(predecessor)?)
 	}
 
-	async fn run(shared: &Shared, client: Client, addrs: Addrs) -> crate::Result<()> {
+	async fn run(shared: &Shared, client: Client, addrs: Addrs, request_token: RequestToken) -> crate::Result<()> {
 		let backoff = client.backoff.clone();
 		let goaway = client.goaway.resolve();
 		let pacing = Pacing::new(&backoff);
@@ -807,11 +891,21 @@ impl Connection {
 
 			let budget = retry_budget(client.reconnect, retry_start, timeout);
 
-			match Self::dial_any(shared, &client, &addrs, &mut draining, budget).await {
+			match Self::dial_any(shared, &client, &addrs, &mut draining, budget, request_token.get()).await {
 				Ok((addr, session)) => {
 					let url = addr.url().clone();
 					tracing::info!(peer = %Endpoint(&url), "connected");
+
 					shared.connected(&session);
+
+					// The token was seeded onto the session before its driver started (so its
+					// first request carries it and a renewal survives into each reconnect);
+					// re-read the cell now and set it again in case a renewal landed between the
+					// seed and connecting. A no-op when unchanged. [`Auth::set_request_token`]
+					// reaches the session live too.
+					if let Some(token) = request_token.get() {
+						session.auth().set_request_token(token);
+					}
 
 					let connected = tokio::time::Instant::now();
 					// Wait for the session to end, forwarding its bandwidth estimates into the
@@ -1005,6 +1099,7 @@ impl Connection {
 		addrs: &Addrs,
 		draining: &mut Option<Draining>,
 		budget: Option<tokio::time::Instant>,
+		token: Option<bytes::Bytes>,
 	) -> crate::Result<(crate::connect::Addr, moq_net::Session)> {
 		let candidates = addrs.as_slice();
 		let mut last = None;
@@ -1019,7 +1114,7 @@ impl Connection {
 
 			tracing::info!(peer = %Endpoint(url), "connecting");
 
-			let mut dial = std::pin::pin!(client.dial(addr.clone()));
+			let mut dial = std::pin::pin!(client.dial(addr.clone(), token.clone()));
 			let dialed = kio::wait(|waiter| {
 				if poll_draining(draining, waiter) {
 					shared.disconnected();
@@ -1204,6 +1299,20 @@ impl Connection {
 		Monitor {
 			state: self.state.clone(),
 			last_presence: moq_net::stats::Presence::default(),
+		}
+	}
+
+	/// Renew the request token this connection presents, across reconnects.
+	///
+	/// Returns an [`Auth`] handle the connection owns rather than the current session: a token
+	/// set through it is the single source of truth the reconnect loop seeds every new session
+	/// from, and setting one on a live connection also re-presents it on the current session as
+	/// a REQUEST_UPDATE. The connection starts from
+	/// [`crate::connect::Config::with_request_token`], and this replaces it.
+	pub fn auth(&self) -> Auth {
+		Auth {
+			token: self.request_token.clone(),
+			state: self.state.clone(),
 		}
 	}
 }
@@ -1414,6 +1523,217 @@ fn terminal(state: &State) -> Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The request token is shown by length only, never printed, in both the cell and the
+	/// [`Auth`] handle that wraps it.
+	#[test]
+	fn request_token_debug_is_redacted() {
+		let token = RequestToken::new(Some(bytes::Bytes::from_static(b"s3cr3t")));
+		assert_eq!(format!("{token:?}"), "<6 bytes>");
+		assert_eq!(format!("{:?}", RequestToken::default()), "<none>");
+
+		let producer = kio::Producer::<State>::default();
+		let auth = Auth {
+			token,
+			state: producer.consume(),
+		};
+		let debug = format!("{auth:?}");
+		assert!(!debug.contains("s3cr3t"), "the token leaked into Debug: {debug}");
+		assert!(debug.contains("<6 bytes>"), "{debug}");
+		drop(producer);
+	}
+
+	/// Renewing through the handle updates the connection's source of truth even with no live
+	/// session, so the reconnect loop seeds the next session with the latest token. The live
+	/// session path is covered end to end by
+	/// [`the_first_request_on_a_connected_session_carries_the_token`].
+	#[test]
+	fn renewal_updates_the_reconnect_seed() {
+		let token = RequestToken::new(None);
+		let producer = kio::Producer::<State>::default();
+		let auth = Auth {
+			token: token.clone(),
+			state: producer.consume(),
+		};
+		assert_eq!(token.get(), None);
+
+		// No live session: the cell still updates and does not panic. This is the value a
+		// reconnect reads to seed its session.
+		auth.set_request_token(bytes::Bytes::from_static(b"first"));
+		assert_eq!(token.get().as_deref(), Some(&b"first"[..]));
+
+		auth.set_request_token(bytes::Bytes::from_static(b"second"));
+		assert_eq!(
+			token.get().as_deref(),
+			Some(&b"second"[..]),
+			"the latest renewal is what the next session is seeded with"
+		);
+		drop(producer);
+	}
+
+	/// The connection owns the request token across the reconnect loop: the dial config seeds
+	/// the cell the loop presents on each (re)connected session, and renewing through
+	/// [`Connection::auth`] updates that same cell, so a renewal survives into the next session.
+	///
+	/// The live-session presentation and the REQUEST_UPDATE renewal on the wire are covered by
+	/// moq-net's auth suite, which drives the same `session.auth().set_request_token` seam this
+	/// connection calls on every connect.
+	#[cfg(feature = "tcp")]
+	#[tokio::test]
+	async fn the_connection_owns_the_request_token_across_the_loop() {
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+		let t1 = bytes::Bytes::from_static(b"token-one");
+		let mut config = crate::connect::Config::default();
+		config.tls.insecure = Some(true);
+		let config = config.with_request_token(t1.clone());
+		let client = config.init(Default::default()).expect("client");
+
+		// A dead address: the background loop never connects, but the handle and its token
+		// cell exist immediately, which is all this asserts.
+		let conn = client.connect(url("tcp://127.0.0.1:1/"));
+		assert_eq!(
+			conn.request_token.get().as_deref(),
+			Some(&t1[..]),
+			"the dial config seeds the cell the loop presents on each session"
+		);
+
+		let t2 = bytes::Bytes::from_static(b"token-two");
+		conn.auth().set_request_token(t2.clone());
+		assert_eq!(
+			conn.request_token.get().as_deref(),
+			Some(&t2[..]),
+			"renewing through auth() updates the source of truth the next session is seeded with"
+		);
+	}
+
+	/// Integration check that the request token reaches the FIRST request on a connected session:
+	/// the AUTH extension is declined so the connection grant covers nothing and the request token
+	/// is the only authorizing artifact, the namespace is announced before connecting so the first
+	/// PUBLISH_NAMESPACE is pending when the session starts, and the server records that the first
+	/// request-borne token is non-empty. This exercises the seed path end to end
+	/// (`connect_session` sets the token before the driver spawns; `run()` re-sets it after
+	/// `shared.connected`), which the cell-only `the_connection_owns_the_request_token_across_the_loop`
+	/// cannot observe.
+	///
+	/// Note: it does not isolate the pre-spawn seed from the post-connect re-set. In-process, the
+	/// re-set lands before the first request is served either way, so removing the `connect_session`
+	/// seed alone does not make this fail; the pre-spawn seed guards the multi-thread race where the
+	/// driver reads the token before the re-set, which an in-process test cannot force. The live
+	/// renewal and refusal paths are covered by the moq-net auth suite, including
+	/// `moq-net/tests/auth.rs::a_request_token_renews_a_subscription_through_the_driver`.
+	#[cfg(feature = "tcp")]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_first_request_on_a_connected_session_carries_the_token() {
+		use moq_net::auth::Grant;
+		use moq_net::{Pattern, Patterns, Timestamp};
+		use std::sync::Arc;
+		use std::sync::atomic::{AtomicBool, Ordering};
+
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+		// USE_VALUE (0x03), kind 0x00, then the value.
+		let request_token = bytes::Bytes::from_static(&[0x03, 0x00, b'v']);
+		let carried = Arc::new(AtomicBool::new(false));
+
+		// Server: decline Solicit (launch shape), admit the path-less connection credential with
+		// an empty grant, and on the first request-borne token record whether it was non-empty,
+		// then grant it everything so the announce is accepted.
+		let mut cfg = crate::listen::Config::default();
+		cfg.tcp.bind = Some("127.0.0.1:0".parse().unwrap());
+		cfg.version = vec!["moq-transport-16".parse().unwrap()];
+		cfg.extensions.solicit = false;
+		let mut listener = cfg
+			.init(Default::default())
+			.expect("server")
+			.listen()
+			.await
+			.expect("listen");
+		let addr = listener.tcp_local_addr().expect("tcp listener bound");
+		let sub_origin = crate::origin::spawn();
+		{
+			let carried = carried.clone();
+			tokio::spawn(async move {
+				while let Some(request) = listener.accept().await {
+					let sub_origin = sub_origin.clone();
+					let carried = carried.clone();
+					tokio::spawn(async move {
+						let request = request.with_subscriber(sub_origin);
+						let acceptor = request.auth().requests().ok();
+						let Ok(session) = request.ok().await else {
+							return;
+						};
+						if let Some(mut requests) = acceptor {
+							let mut held = Vec::new();
+							while let Some(req) = requests.next().await {
+								match req.path().is_some() {
+									true => {
+										if !req.token().is_empty() {
+											carried.store(true, Ordering::SeqCst);
+										}
+										held.push(req.accept(Grant {
+											publish: Patterns::from(Pattern::all()),
+											subscribe: Patterns::from(Pattern::all()),
+											expires: None,
+										}));
+									}
+									false => held.push(req.accept(Grant {
+										publish: Patterns::new(),
+										subscribe: Patterns::new(),
+										expires: None,
+									})),
+								}
+							}
+							let _ = &session;
+						} else {
+							let _ = session.closed().await;
+						}
+					});
+				}
+			});
+		}
+
+		// Client: decline the AUTH extension (empty connection grant, so the request token is the
+		// only authorizing artifact) and announce the namespace BEFORE connecting, so the first
+		// PUBLISH_NAMESPACE is already pending when the session's driver starts. The token must
+		// be on the session when the driver starts: it is seeded in `connect_session` before the
+		// driver spawns and re-set in `run()` after connect, and in-process the two cannot be told
+		// apart. draft-16 rides the token inline on the PUBLISH_NAMESPACE.
+		let origin = crate::origin::spawn();
+		let broadcast = origin.create_broadcast("cg/ch/input1").expect("broadcast");
+		broadcast.announce(Default::default()).expect("announce");
+		let track = broadcast.create_track("video", None).expect("track");
+		let mut group = track.append_group().expect("group");
+		group.write_frame(Timestamp::ZERO, b"m0".as_ref()).expect("frame");
+		group.finish().expect("finish");
+
+		let mut cfg = crate::connect::Config::default();
+		cfg.tls.insecure = Some(true);
+		cfg.version = vec!["moq-transport-16".parse().unwrap()];
+		cfg.extensions.auth = false;
+		let cfg = cfg.with_request_token(request_token);
+		let client = cfg
+			.init(Default::default())
+			.expect("client")
+			.with_publisher(origin.consume())
+			.with_reconnect(false);
+		let conn = client.connect(url(&format!("tcp://{addr}/")));
+
+		let mut seen = false;
+		for _ in 0..400 {
+			if carried.load(Ordering::SeqCst) {
+				seen = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+		assert!(
+			seen,
+			"the first request on the connected session must carry the request token"
+		);
+		// Keep the producers and connection alive until the assertion resolves.
+		drop((broadcast, track, origin, conn));
+	}
 
 	/// Updating with an empty CLI preserves a standing TOML value over typed defaults.
 	#[test]
@@ -1929,7 +2249,7 @@ mod tests {
 
 		let (connected, _session) = tokio::time::timeout(
 			WALK_TIMEOUT,
-			Connection::dial_any(&shared, &client, &addrs, &mut draining, None),
+			Connection::dial_any(&shared, &client, &addrs, &mut draining, None, None),
 		)
 		.await
 		.expect("the walk must not hang")
@@ -1951,7 +2271,7 @@ mod tests {
 
 		let result = tokio::time::timeout(
 			WALK_TIMEOUT,
-			Connection::dial_any(&shared, &client, &addrs, &mut draining, None),
+			Connection::dial_any(&shared, &client, &addrs, &mut draining, None, None),
 		)
 		.await
 		.expect("the walk must not hang");
@@ -1979,7 +2299,7 @@ mod tests {
 		let shared = shared();
 		let mut draining = None;
 		// `Session` isn't `Debug`, so unwrap the failure by hand.
-		let Err(err) = Connection::dial_any(&shared, &client, &addrs, &mut draining, None).await else {
+		let Err(err) = Connection::dial_any(&shared, &client, &addrs, &mut draining, None, None).await else {
 			panic!("a refused address must fail");
 		};
 

@@ -42,8 +42,9 @@ impl Config {
 #[derive(Clone)]
 pub struct Client {
 	moq: moq_net::Client,
-	/// The request token each session presents, from [`crate::connect::Config::with_request_token`].
-	/// Only the dial paths read it, so it is absent without a transport, like [`Self::timeout`].
+	/// The request token seeded from [`crate::connect::Config::with_request_token`], read once
+	/// by [`crate::Connection`] to seed its own request-token handle (the single source of truth
+	/// across reconnects). Absent without a transport, like [`Self::timeout`].
 	#[cfg(feature = "_transport")]
 	request_token: Option<bytes::Bytes>,
 	/// The single resolved set of protocol versions, used to advertise moq ALPNs across
@@ -259,6 +260,22 @@ impl Client {
 		Connection::new(self.clone(), addrs.into())
 	}
 
+	/// The request token seeded from [`crate::connect::Config::with_request_token`], if any.
+	///
+	/// Read by [`Connection`] to initialize its own request-token handle, which is the single
+	/// home for the token thereafter. `None` without a transport backend, where no session is
+	/// ever dialed.
+	pub(crate) fn request_token(&self) -> Option<bytes::Bytes> {
+		#[cfg(feature = "_transport")]
+		{
+			self.request_token.clone()
+		}
+		#[cfg(not(feature = "_transport"))]
+		{
+			None
+		}
+	}
+
 	/// Close every QUIC connection this client dialed, once each peer has been sent the
 	/// close.
 	///
@@ -312,7 +329,11 @@ impl Client {
 		feature = "tcp",
 		feature = "uds"
 	)))]
-	pub(crate) async fn dial(&self, _addr: crate::connect::Addr) -> crate::Result<moq_net::Session> {
+	pub(crate) async fn dial(
+		&self,
+		_addr: crate::connect::Addr,
+		_token: Option<bytes::Bytes>,
+	) -> crate::Result<moq_net::Session> {
 		Err(Error::NoBackend(
 			"no backend compiled; enable noq, iroh, websocket, tcp, or uds feature",
 		))
@@ -331,10 +352,14 @@ impl Client {
 		feature = "tcp",
 		feature = "uds"
 	))]
-	pub(crate) async fn dial(&self, addr: crate::connect::Addr) -> crate::Result<moq_net::Session> {
+	pub(crate) async fn dial(
+		&self,
+		addr: crate::connect::Addr,
+		token: Option<bytes::Bytes>,
+	) -> crate::Result<moq_net::Session> {
 		// Each compiled backend adds state to this dispatch future. Keep it off the
 		// caller's stack so all-feature builds remain safe on standard 2 MiB threads.
-		let attempt = Box::pin(self.connect_inner(addr));
+		let attempt = Box::pin(self.connect_inner(addr, token));
 
 		// The deadline covers the dial AND the handshake, for every transport: it is the
 		// only bound some of them have. Dropping `attempt` on expiry cancels whichever
@@ -373,7 +398,11 @@ impl Client {
 		feature = "tcp",
 		feature = "uds"
 	))]
-	async fn connect_inner(&self, addr: crate::connect::Addr) -> crate::Result<moq_net::Session> {
+	async fn connect_inner(
+		&self,
+		addr: crate::connect::Addr,
+		token: Option<bytes::Bytes>,
+	) -> crate::Result<moq_net::Session> {
 		let url = addr.url().clone();
 		// Transports with no request URI of their own advertise the request target in the
 		// SETUP instead; `setup_path` returns `None` for the ones that carry a URI, where
@@ -392,12 +421,7 @@ impl Client {
 		if url.scheme() == "tcp" {
 			let session =
 				crate::tcp::connect(url, &self.versions.alpns(), self.failover_delay, self.resolution_delay).await?;
-			return Ok(connect_session(
-				&moq,
-				self.request_token.as_ref(),
-				crate::transport::Session::new(session),
-			)
-			.await?);
+			return Ok(connect_session(&moq, crate::transport::Session::new(session), token.clone()).await?);
 		}
 
 		// Unix domain socket (qmux, no TLS). Same-host only; the server can
@@ -405,19 +429,14 @@ impl Client {
 		#[cfg(all(feature = "uds", unix))]
 		if url.scheme() == "unix" {
 			let session = crate::unix::connect(url, &self.versions.alpns()).await?;
-			return Ok(connect_session(
-				&moq,
-				self.request_token.as_ref(),
-				crate::transport::Session::new(session),
-			)
-			.await?);
+			return Ok(connect_session(&moq, crate::transport::Session::new(session), token.clone()).await?);
 		}
 
 		// A WebSocket URL names its transport. No QUIC backend can dial it, so there is
 		// nothing to race and the fallback's answer is the connect's verdict.
 		#[cfg(feature = "websocket")]
 		if matches!(url.scheme(), "ws" | "wss") {
-			return self.connect_websocket(addr).await;
+			return self.connect_websocket(addr, token.clone()).await;
 		}
 
 		// iroh offers the moq ALPNs ahead of H3, so two moq endpoints normally land on raw
@@ -436,12 +455,7 @@ impl Client {
 				crate::iroh::Binding::H3 => self.moq.clone(),
 			};
 
-			return Ok(connect_session(
-				&moq,
-				self.request_token.as_ref(),
-				crate::transport::Session::new(session),
-			)
-			.await?);
+			return Ok(connect_session(&moq, crate::transport::Session::new(session), token.clone()).await?);
 		}
 
 		#[cfg(feature = "noq")]
@@ -457,18 +471,18 @@ impl Client {
 
 			#[cfg(feature = "websocket")]
 			{
-				return self.race_moq_connect(&moq, addr, quic_handle).await;
+				return self.race_moq_connect(&moq, addr, quic_handle, token.clone()).await;
 			}
 
 			#[cfg(not(feature = "websocket"))]
 			{
 				let session = quic_handle.await?;
-				return Ok(connect_session(&moq, self.request_token.as_ref(), session).await?);
+				return Ok(connect_session(&moq, session, token.clone()).await?);
 			}
 		}
 
 		#[cfg(feature = "websocket")]
-		return self.connect_websocket(addr).await;
+		return self.connect_websocket(addr, token.clone()).await;
 
 		#[cfg(not(feature = "websocket"))]
 		return Err(Error::NoBackend("no QUIC backend matched; this should not happen"));
@@ -477,16 +491,15 @@ impl Client {
 	/// Connect over WebSocket alone. qmux over WebSocket carries the path in its request
 	/// URI, so the plain builder is used: repeating it in the SETUP is a protocol violation.
 	#[cfg(feature = "websocket")]
-	async fn connect_websocket(&self, addr: crate::connect::Addr) -> crate::Result<moq_net::Session> {
+	async fn connect_websocket(
+		&self,
+		addr: crate::connect::Addr,
+		token: Option<bytes::Bytes>,
+	) -> crate::Result<moq_net::Session> {
 		let alpns = self.versions.alpns();
 		let session =
 			crate::websocket::connect(&self.websocket, &self.tls, self.tls_host_name.as_deref(), addr, &alpns).await?;
-		Ok(connect_session(
-			&self.moq,
-			self.request_token.as_ref(),
-			crate::transport::Session::new(session),
-		)
-		.await?)
+		Ok(connect_session(&self.moq, crate::transport::Session::new(session), token).await?)
 	}
 
 	/// Race the QUIC dial against the WebSocket fallback, handshaking whichever wins.
@@ -503,6 +516,7 @@ impl Client {
 		moq: &moq_net::Client,
 		addr: crate::connect::Addr,
 		quic: Q,
+		token: Option<bytes::Bytes>,
 	) -> crate::Result<moq_net::Session>
 	where
 		Q: Future<Output = crate::Result<S>>,
@@ -519,13 +533,10 @@ impl Client {
 		};
 
 		match race_transport_connect(quic, websocket).await? {
-			TransportRace::Quic(quic) => Ok(connect_session(moq, self.request_token.as_ref(), quic).await?),
-			TransportRace::WebSocket(websocket) => Ok(connect_session(
-				&self.moq,
-				self.request_token.as_ref(),
-				crate::transport::Session::new(websocket),
-			)
-			.await?),
+			TransportRace::Quic(quic) => Ok(connect_session(moq, quic, token).await?),
+			TransportRace::WebSocket(websocket) => {
+				Ok(connect_session(&self.moq, crate::transport::Session::new(websocket), token).await?)
+			}
 		}
 	}
 }
@@ -690,15 +701,18 @@ where
 ))]
 async fn connect_session<S: moq_net::transport::poll::Boxable>(
 	client: &moq_net::Client,
-	request_token: Option<&bytes::Bytes>,
 	transport: S,
+	token: Option<bytes::Bytes>,
 ) -> Result<moq_net::Session, moq_net::Error> {
 	let (session, driver) = client
 		.connect(tokio::time::Instant::now().into_std(), transport)
 		.await?;
-	// Before the driver runs, so the session's first request already carries it.
-	if let Some(token) = request_token {
-		session.auth().set_request_token(token.clone());
+	// Seed the connection's current request token onto the session BEFORE the driver is
+	// spawned, so `enforce_grant` sees it at session start and the first request carries it
+	// (on draft-14/15/16 the first PUBLISH_NAMESPACE would otherwise go out token-less). The
+	// owning [`crate::Connection`] re-reads its cell after connecting and on every live renewal.
+	if let Some(token) = token {
+		session.auth().set_request_token(token);
 	}
 	use tracing::Instrument;
 	tokio::spawn(moq_net::time::run(driver).instrument(tracing::Span::current()));
@@ -1357,7 +1371,7 @@ mod tests {
 
 		let session = tokio::time::timeout(
 			std::time::Duration::from_secs(10),
-			client.race_moq_connect(&client.moq, ws_addr, quic),
+			client.race_moq_connect(&client.moq, ws_addr, quic, None),
 		)
 		.await
 		.expect("client connect timed out")
@@ -1467,7 +1481,7 @@ mod tests {
 
 		// `dial` rather than `connect`: this is about one attempt's deadline, and
 		// `connect` now hands back a reconnect loop that would redial past it.
-		let mut attempt = Box::pin(client.dial(url.into()));
+		let mut attempt = Box::pin(client.dial(url.into(), None));
 		let _silent = tokio::select! {
 			res = &mut attempt => match res {
 				Err(err) => panic!("connect failed before the silent peer accepted it: {err}"),

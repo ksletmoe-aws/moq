@@ -755,8 +755,9 @@ impl Default for Config {
 
 impl Config {
 	/// Present `token` as the `AUTHORIZATION TOKEN` on every session's own requests (MoQ
-	/// request-token), set on each session before it sends anything, so it survives
-	/// reconnects. Renewing it on a live session is [`moq_net::auth::Handle::set_request_token`].
+	/// request-token). It seeds the owning [`crate::Connection`]'s request-token handle, the
+	/// single source of truth across reconnects, so renewing it on a live connection is
+	/// [`crate::Connection::auth`] with [`Auth::set_request_token`](crate::Auth::set_request_token).
 	pub fn with_request_token(mut self, token: impl Into<bytes::Bytes>) -> Self {
 		self.request_token = Some(RequestToken(token.into()));
 		self

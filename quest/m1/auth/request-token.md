@@ -75,10 +75,11 @@ Decided in review:
 
 - Client credential: the request token rides the auth handle beside
   session tokens, distinguished by kind (`auth::Handle::set_request_token`),
-  with no `Client` methods. `Connection::auth()` is not in the tree yet, so
-  moq-tokio seeds it from `connect::Config` on every (re)connected session;
-  live renewal there arrives with `Connection::auth()`, and is available on
-  moq-net's `Session::auth()` until then.
+  with no `Client` methods. moq-tokio's `Connection` owns the token across
+  reconnects and seeds each (re)connected session from it; `Connection::auth()`
+  renews it on a live connection, and `connect::Config::with_request_token`
+  seeds that same handle, which is the single home for the token. moq-net's
+  `Session::auth()` is the per-session seam underneath.
 - Extensions: a positive `#[non_exhaustive] setup::Extensions { auth,
   solicit }`, all on by default, on moq-net's client and server, moq-tokio's
   dial and listen `Config`, and JS. Later extensions join it.
