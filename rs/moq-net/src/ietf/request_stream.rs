@@ -32,10 +32,27 @@ pub(super) fn poll_cancel<S: crate::transport::poll::Session>(
 }
 
 /// A framed subscription update, preserving omitted preferences.
-#[derive(Debug)]
 pub(super) struct Update {
+	pub(super) request_id: super::RequestId,
 	pub(super) priority: Option<u8>,
+	// The AUTHORIZATION TOKEN carried on this update, captured rather than folded into
+	// `unsupported`, so a request-token renewal can be verified (MoQ request-token).
+	pub(super) authorization_token: Option<bytes::Bytes>,
 	pub(super) unsupported: bool,
+}
+
+impl std::fmt::Debug for Update {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Update")
+			.field("request_id", &self.request_id)
+			.field("priority", &self.priority)
+			.field(
+				"authorization_token",
+				&super::token::Redacted(&self.authorization_token),
+			)
+			.field("unsupported", &self.unsupported)
+			.finish()
+	}
 }
 
 impl crate::coding::Decode<Version> for Update {
@@ -51,13 +68,13 @@ impl crate::coding::Decode<Version> for Update {
 		}
 		let mut data = r.copy_to_bytes(size);
 		let result = (|| {
-			let _id = RequestId::decode(&mut data, version)?;
+			let request_id = RequestId::decode(&mut data, version)?;
 			if version == Version::Draft17 {
 				u64::decode(&mut data, version)?;
 			}
 			decode_params!(&mut data, version,
 				0x02 => object_timeout: Option<u64>,
-				0x03 => token: Vec<Opaque>,
+				0x03 => authorization_token: Option<bytes::Bytes>,
 				0x06 => subgroup_timeout: Option<u64>,
 				0x10 => forward: Option<bool>,
 				0x20 => priority: Option<u8>,
@@ -74,13 +91,14 @@ impl crate::coding::Decode<Version> for Update {
 				return Err(DecodeError::InvalidValue);
 			}
 			Ok(Self {
+				request_id,
 				priority,
+				authorization_token,
 				unsupported: forward == Some(false)
 					|| filter.is_some()
 					|| fill.is_some()
 					|| object_timeout.is_some()
 					|| subgroup_timeout.is_some()
-					|| !token.is_empty()
 					|| !subgroup_filter.is_empty()
 					|| !object_filter.is_empty()
 					|| !priority_filter.is_empty()

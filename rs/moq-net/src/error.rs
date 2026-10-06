@@ -28,6 +28,11 @@ pub enum SessionError {
 	#[error("protocol violation")]
 	ProtocolViolation,
 
+	/// The peer left more unacknowledged REQUEST_UPDATEs outstanding on one request stream
+	/// than the MAX_REQUEST_UPDATES it was advertised (draft-19 section 10.3.1.7).
+	#[error("too many request updates")]
+	TooManyRequestUpdates,
+
 	/// A key-value pair was malformed or repeated more than allowed.
 	#[error("key-value formatting error")]
 	KeyValueFormatting,
@@ -35,6 +40,16 @@ pub enum SessionError {
 	/// The peer did not close within the GOAWAY drain deadline.
 	#[error("goaway timeout")]
 	GoawayTimeout,
+
+	/// A token registration would exceed the advertised MAX_AUTH_TOKEN_CACHE_SIZE
+	/// (draft-ietf-moq-transport-21 section 8.9). We advertise none, so the limit is 0.
+	#[error("auth token cache overflow")]
+	AuthTokenCacheOverflow,
+
+	/// A token named an alias that was never registered (draft-ietf-moq-transport-21
+	/// section 12.2). With a cache size of 0 no alias ever is.
+	#[error("unknown auth token alias")]
+	UnknownAuthTokenAlias,
 
 	/// A control message took too long.
 	#[error("control message timeout")]
@@ -64,7 +79,10 @@ impl SessionError {
 			Self::KeyValueFormatting => 0x6,
 			Self::GoawayTimeout => 0x10,
 			Self::Timeout => 0x11,
+			Self::AuthTokenCacheOverflow => 0x13,
 			Self::Version => 0x15,
+			Self::UnknownAuthTokenAlias => 0x17,
+			Self::TooManyRequestUpdates => 0x1B,
 			Self::App(app) => *app as u32 + 64,
 			Self::Unknown(code) => *code,
 		}
@@ -84,7 +102,10 @@ impl SessionError {
 			0x6 => Self::KeyValueFormatting,
 			0x10 => Self::GoawayTimeout,
 			0x11 => Self::Timeout,
+			0x13 => Self::AuthTokenCacheOverflow,
 			0x15 => Self::Version,
+			0x17 => Self::UnknownAuthTokenAlias,
+			0x1B => Self::TooManyRequestUpdates,
 			code @ 64.. => match u16::try_from(code - 64) {
 				Ok(app) => Self::App(app),
 				Err(_) => Self::Unknown(code),
@@ -630,10 +651,13 @@ mod tests {
 			SessionError::Internal,
 			SessionError::Unauthorized,
 			SessionError::ProtocolViolation,
+			SessionError::TooManyRequestUpdates,
 			SessionError::KeyValueFormatting,
 			SessionError::GoawayTimeout,
 			SessionError::Timeout,
+			SessionError::AuthTokenCacheOverflow,
 			SessionError::Version,
+			SessionError::UnknownAuthTokenAlias,
 			SessionError::App(0),
 			SessionError::App(404),
 		];
@@ -649,6 +673,9 @@ mod tests {
 		assert_eq!(SessionError::Unauthorized.to_code(), 0x2);
 		assert_eq!(SessionError::GoawayTimeout.to_code(), 0x10);
 		assert_eq!(SessionError::Version.to_code(), 0x15);
+		assert_eq!(SessionError::AuthTokenCacheOverflow.to_code(), 0x13);
+		assert_eq!(SessionError::UnknownAuthTokenAlias.to_code(), 0x17);
+		assert_eq!(SessionError::TooManyRequestUpdates.to_code(), 0x1B);
 
 		// The reserved 32-47 range, and anything else unregistered, keeps its value instead
 		// of being given a meaning. A peer on the old placeholders (0x20-0x22) lands here.

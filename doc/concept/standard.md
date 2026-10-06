@@ -82,10 +82,19 @@ TOKEN` option. The server reads a value (`USE_VALUE`, or `REGISTER`, which it
 treats as a value since it advertises no token cache) and hands its Token Type
 and bytes to the application unverified; a relay forwards them to its
 [auth server](/bin/relay/auth#the-contract). An alias reference (`DELETE`,
-`USE_ALIAS`) closes the session with `PROTOCOL_VIOLATION`, a structure that
-does not decode with `KEY_VALUE_FORMATTING_ERROR`, and a second token is
-refused. An `AUTHORIZATION TOKEN` parameter on a request is read and ignored:
-the session's credential is what authorizes it.
+`USE_ALIAS`) closes the session with `UNKNOWN_AUTH_TOKEN_ALIAS` (`0x17`): a
+cache size of zero prohibits token aliases, so none is ever registered. The
+draft would reject the message, but `0x17` exists only as a session
+termination code, not a request error code, so we close the session with it
+instead; this close is the deviation (#4804). A structure that does not decode
+closes with `KEY_VALUE_FORMATTING_ERROR`, and a second token is
+refused. An `AUTHORIZATION TOKEN` on a request is authorized by the session's
+grant first, and by the token on the request only when the application opts in
+to request-token verification (`auth::Handle::requests()`) and the request is a
+`SUBSCRIBE`, `PUBLISH_NAMESPACE`, or `REQUEST_UPDATE` renewing one; otherwise it
+is read and ignored, the session's credential authorizing. A request token's
+grant covers only that one request, never widens the session, and a refused
+renewal ends only it.
 
 A legal request that is not served is refused on its own with `NOT_SUPPORTED`,
 leaving the session open: a `SUBSCRIBE` with `FORWARD=0`, a `SUBSCRIBE` or

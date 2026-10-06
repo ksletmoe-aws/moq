@@ -97,6 +97,7 @@ mod tests {
 			properties_wanted: false,
 			forward: true,
 			range_filters: false,
+			authorization_token: None,
 		};
 
 		let subscribe_ok = SubscribeOk {

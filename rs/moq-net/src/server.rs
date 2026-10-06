@@ -20,6 +20,7 @@ pub struct Server {
 	subscribe: Option<origin::Producer>,
 	stats: stats::Session,
 	versions: Versions,
+	extensions: crate::setup::Extensions,
 }
 
 impl Server {
@@ -62,6 +63,12 @@ impl Server {
 	/// Defaults to every version this crate supports.
 	pub fn with_versions(mut self, versions: Versions) -> Self {
 		self.versions = versions;
+		self
+	}
+
+	/// Choose which moq-transport extensions this server offers in its SETUP. Defaults to all.
+	pub fn with_extensions(mut self, extensions: crate::setup::Extensions) -> Self {
+		self.extensions = extensions;
 		self
 	}
 
@@ -427,8 +434,9 @@ impl Server {
 			origin: peer_setup.declared.cluster.hop.filter(|h| *h != crate::Hop::UNKNOWN),
 			token: peer_setup.token.clone(),
 			assigned_hop: crate::Hop::random(),
-			// The client's SETUP already settled whether MoQ Auth is negotiated.
-			auth: crate::auth::Handle::new(peer_setup.declared.auth),
+			// The client's SETUP already settled whether MoQ Auth is negotiated, unless this
+			// server does not offer it.
+			auth: crate::auth::Handle::new(peer_setup.declared.auth && self.extensions.auth),
 			inner: Some(RequestInner {
 				server: self.clone(),
 				runtime,
@@ -567,6 +575,7 @@ where
 				peer_declared: Some(peer_setup.declared),
 				auth: auth.clone(),
 				early_unis: peer_setup.early,
+				extensions: server.extensions,
 			})?;
 			tracing::debug!(?version, "connected");
 			Ok(Session::new(
@@ -629,7 +638,9 @@ where
 					let mut parameters = ietf::Parameters::default();
 					parameters.set_varint(ietf::ParameterVarInt::MaxRequestId, u32::MAX as u64);
 					parameters.set_bytes(ietf::ParameterBytes::Implementation, b"moq-lite-rs".to_vec());
-					ietf::solicit::into_setup(&mut parameters, v);
+					if server.extensions.solicit {
+						ietf::solicit::into_setup(&mut parameters, v);
+					}
 					ietf::hidden::into_setup(&mut parameters, v);
 					ietf::active_count::into_setup(&mut parameters, v);
 					parameters.encode_bytes(v)?
@@ -687,6 +698,9 @@ where
 						peer_declared: Some(peer_declared),
 						auth: auth.clone(),
 						early_unis: Vec::new(),
+						// The legacy server already declared its extensions in its SETUP above;
+						// this arm sends no further SETUP.
+						extensions: server.extensions,
 					})?;
 					(None, crate::driver::Protocol::Ietf(protocol), goaway, auth)
 				}
@@ -1107,6 +1121,57 @@ mod tests {
 		params
 	}
 
+	/// An acceptor taken with `Request::auth().requests()` BEFORE `ok()` must govern the
+	/// session the driver then runs, through the REAL accept path (`accept_request` -> `ok`).
+	/// The session's own `auth()` (the handle the driver polls) routes a request token to that
+	/// pre-ok consumer instead of falling to the `Unsupported` default, and granting admits.
+	/// Both a no-AUTH-extension legacy session (draft-14, `Handle::new(false)`) and the modern
+	/// uni-SETUP path (draft-18); a QUIC server has no other point to install the acceptor.
+	#[tokio::test(start_paused = true)]
+	async fn a_pre_ok_requests_consumer_governs_the_session_acceptor() {
+		let cases = [
+			(
+				FakeSession::new(ALPN_14, [])
+					.with_bi(legacy_setup(ietf::Version::Draft14, ietf::Parameters::default())),
+				ietf::Version::Draft14,
+			),
+			(
+				FakeSession::new(ALPN_18, [ietf_setup(ietf::Version::Draft18, Some("room/alice"))]),
+				ietf::Version::Draft18,
+			),
+		];
+
+		for (session, version) in cases {
+			let request = Server::new()
+				.accept_request(tokio::time::Instant::now().into_std(), session)
+				.await
+				.unwrap_or_else(|e| panic!("accept at {version:?}: {e}"));
+
+			// Install the acceptor before ok(), as a QUIC server must.
+			let mut requests = request.auth().requests().expect("requests() pre-ok");
+			let (net_session, _driver) = request.ok().await.unwrap_or_else(|e| panic!("ok at {version:?}: {e}"));
+
+			// The session's own handle is the one the driver polls. Verifying a request token on
+			// it must reach the pre-ok consumer; if the handle were not shared it would fall to
+			// the Unsupported default and the consumer would never see this request.
+			let verdict = net_session.auth().verify_request(
+				Bytes::from_static(b"jwt"),
+				1,
+				crate::PathOwned::from("room/alice".to_string()),
+				crate::auth::RequestKind::PublishNamespace,
+			);
+			let received = requests.next().await.expect("the pre-ok consumer receives the request");
+			assert_eq!(received.path(), Some("room/alice"), "{version:?}");
+			assert_eq!(
+				received.kind(),
+				Some(crate::auth::RequestKind::PublishNamespace),
+				"{version:?}"
+			);
+			let _issued = received.accept(crate::auth::Grant::all());
+			assert!(verdict.grant().await.is_ok(), "granting admits at {version:?}");
+		}
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn accept_request_exposes_the_setup_token() {
 		let modern = FakeSession::new(
@@ -1149,7 +1214,7 @@ mod tests {
 		let delete = [0x0, 0x7]; // DELETE alias 7
 		let truncated = [0x3]; // USE_VALUE with no Token Type
 		for (raw, code) in [
-			(&delete[..], SessionError::ProtocolViolation),
+			(&delete[..], SessionError::UnknownAuthTokenAlias),
 			(&truncated[..], SessionError::KeyValueFormatting),
 		] {
 			let mut params = ietf::Parameters::default();

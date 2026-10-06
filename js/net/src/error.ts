@@ -42,8 +42,14 @@ export const SessionCode = Object.freeze(
 		GoawayTimeout: 0x10 as SessionCode,
 		/** A control message took too long. */
 		Timeout: 0x11 as SessionCode,
+		/** A token registration would exceed the advertised cache size, which is 0 when unadvertised. */
+		AuthTokenCacheOverflow: 0x13 as SessionCode,
 		/** No version could be negotiated. */
 		Version: 0x15 as SessionCode,
+		/** A token named an alias that was never registered. */
+		UnknownAuthTokenAlias: 0x17 as SessionCode,
+		/** More REQUEST_UPDATEs were sent than the advertised MAX_REQUEST_UPDATES allows. */
+		TooManyRequestUpdates: 0x1b as SessionCode,
 	} as const),
 );
 

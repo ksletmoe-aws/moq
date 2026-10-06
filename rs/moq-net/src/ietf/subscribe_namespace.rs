@@ -425,6 +425,7 @@ mod tests {
 				hops: hop_path(&[7]),
 				cost: 0,
 			}),
+			authorization_token: None,
 		};
 
 		let mut buf = BytesMut::new();

@@ -216,7 +216,10 @@ const MSG_PARAM_ROUTE_COST = 0x40b58n;
 const MSG_PARAM_HIDDEN = 0x40b5en;
 
 // Bytes parameter IDs (odd)
-/// AUTHORIZATION TOKEN. Ignored: the session's grant is what authorizes a request.
+/// AUTHORIZATION TOKEN (0x03): a per-request credential (MoQ request-token). This client has
+/// no accept-side consumer to verify one, so it is decoded and dropped; an uncovered request
+/// is then refused by the session grant as before. Recognizing it keeps a draft-17+ peer that
+/// presents a token from failing the whole message on an unknown parameter.
 const MSG_PARAM_AUTHORIZATION_TOKEN = 0x03n;
 const MSG_PARAM_LARGEST_OBJECT = 0x09n;
 const MSG_PARAM_SUBSCRIPTION_FILTER = 0x21n;
