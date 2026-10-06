@@ -17,7 +17,7 @@ grant per token, the union of every accepted token as the session's scope,
 and a loud failure when a publish can never be honored. It ends with the
 credential able to travel in band, while the URL keeps working for every peer
 that predates the stream. Hop-bound peer grants for direct sessions belong to
-[P2P](/quest/m2/p2p/peer-grant.md), their only consumer.
+[P2P](/quest/m3/p2p/peer-grant.md), their only consumer.
 
 ## Plan
 
@@ -76,8 +76,9 @@ Decisions settled while planning, recorded so review does not relitigate them:
   dial-side config. `Connection::auth()` is a handle the connection owns: it
   keeps every added token, presents them on each session as it reconnects,
   and reports the live session's grant.
-- **Spec home.** The AUTH stream is lite-06 core in
-  `drafts/draft-lcurley-moq-lite.md`, the way routing is. moq-transport gets
+- **Spec home.** The AUTH stream is core in the wip lite version
+  (`moq-lite-07-wip` today) in `drafts/draft-lcurley-moq-lite.md`, the way
+  routing is. moq-transport gets
   `drafts/draft-lcurley-moq-auth.md`, a setup-option-negotiated extension with
   AUTH, AUTH_OK, and AUTH_ERROR control messages, mirroring how moq-cluster is
   the IETF binding of lite's routing.
@@ -85,15 +86,21 @@ Decisions settled while planning, recorded so review does not relitigate them:
   SUBSCRIBE_OK. Rust is `moq_net::auth` with `auth::Grant`, `auth::Handle`,
   `auth::Token`, and `auth::Request`; JS mirrors as `connection.auth`.
 
-Everything here is additive: `Session::auth()` is new, the relay derives the
-grant from the origin handles it already scopes, and AUTH is added to the
-existing lite-06 ALPN.
+Everything here is additive: `Session::auth()` is new, and the relay derives
+the grant from the origin handles it already scopes. Decided 2026-10-05: wire
+work targets the wip lite version until the maintainer cuts it, never a
+published version in place, so AUTH and its stream code land in
+`moq-lite-07-wip` (or whichever version is wip then), not lite-06.
 
 ## Required
 
 - [WebSocket refusal](/quest/m1/auth/ws-unauthorized.md) - the relay serves WebSocket through moq-tokio, so a refused token closes the session as Unauthorized, as QUIC does
+- [AUTH on the wip version](/quest/m1/auth/wip-version.md) - lite AUTH and UNAUTHORIZED move from lite-06 to `moq-lite-07-wip`, so no published version changes in place
 - [Lite NOT_SUPPORTED](/quest/m1/auth/not-supported.md) - a lite acceptor answers AUTH_ERROR NOT_SUPPORTED after a grant too, and lite messages cap at moq-transport's 65,535 bytes
 - [AUTH violations](/quest/m1/auth/violations.md) - every AUTH protocol violation closes the session in Rust and JS, lite and IETF
+- [Malformed grant](/quest/m1/auth/malformed-grant.md) - a malformed or
+  non-canonical grant pattern, or an out-of-range `Expires`, closes the
+  session with PROTOCOL_VIOLATION in Rust and JS
 - [JS fetch grant watch](/quest/m1/auth/js-fetch-watch.md) - a JS `fetchGroup` ends `Unauthorized` when its path leaves the grant
 - [Relay tokens](/quest/m1/auth/relay-refresh.md) - the relay verifies tokens
   sent in band, unions their grants, and cancels only work that loses access
@@ -106,11 +113,11 @@ existing lite-06 ALPN.
   binding through moq-ffi
 - [Token in band](/quest/m1/auth/token-in-band.md) - the credential can leave
   the URL: a session starts on what the URL carried and its AUTH streams add
-  the rest, with the URL kept for peers below lite-06
+  the rest, with the URL kept for peers without the AUTH stream
 
 ## Related
 
-- [Expiring media grants](/quest/m2/processor/grant-lease.md) - a worker's
+- [Expiring media grants](/quest/m3/processor/grant-lease.md) - a worker's
   lease renewal is a new in-band token
-- [Peer grants](/quest/m2/p2p/peer-grant.md) - P2P's hop-bound credential,
+- [Peer grants](/quest/m3/p2p/peer-grant.md) - P2P's hop-bound credential,
   built on this line's relay tokens
