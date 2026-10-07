@@ -8,9 +8,7 @@ after a grant was issued, the acceptor resets the stream with INTERNAL_ERROR.
 The grant is revoked, but the presenter sees a generic stream error, while the
 moq-transport binding answers `AUTH_ERROR { NOT_SUPPORTED }`. After this
 change, lite has a NOT_SUPPORTED session code, so `Error::Unsupported`
-round-trips on both wires. Lite's message ceiling also drops to
-moq-transport's 65,535 bytes and is stated in the lite draft, so the same
-grant is too large on both wires.
+round-trips on both wires.
 
 ## Plan
 
@@ -32,31 +30,25 @@ Decided while planning the follow-ups of
 - **`Error::Unsupported` maps to 0x30 everywhere on lite**, not just in
   AUTH_ERROR. Rust `SessionError` and JS `SessionCode` round-trip it, so a
   session closed for an unsupported feature stops reading as INTERNAL_ERROR.
-- **The lite message ceiling is 65,535 bytes**, copied from moq-transport's
-  16-bit control Message Length. It replaces the 64 MiB `MAX_MESSAGE_SIZE` in
-  `rs/moq-net/src/lite/message.rs` and `js/net/src/lite/message.ts`. The lite
-  draft's Message Length section makes it normative: a longer message is a
-  PROTOCOL_VIOLATION, and a receiver MAY reject it from the length prefix
-  alone. The separate 65,536-byte SETUP rule is folded into this one. Check
-  that frame payloads, which have their own size limit, are not counted
-  against it.
+- **The message ceiling is not this quest's** (decided in the 2026-10-06
+  audit): [Request caps](/quest/m0/request-caps.md) (#4820) caps lite
+  messages at 65,535 bytes, moq-transport's 16-bit control Message Length, so
+  a grant too large for AUTH_OK is too large on both wires. This quest only
+  answers that case with NOT_SUPPORTED.
 - **Compatibility.** An old peer that receives 0x30 treats it as an
   unspecified error, as the draft requires. That is no worse than today's
-  reset. Lowering the receive limit on published lite versions only refuses
-  messages between 64 KiB and 64 MiB. AUTH_OK is unreleased and is the only
-  message plausibly that large; confirm nothing else can reach it before
-  landing.
-- Drafts: add the session code and the Message Length cap to
-  `drafts/draft-lcurley-moq-lite.md`, and replace the reset rule in the Auth
-  Stream section. Update `drafts/draft-lcurley-moq-auth.md` only where it
+  reset.
+- Drafts: add the session code to `drafts/draft-lcurley-moq-lite.md`, and
+  replace the reset rule in the Auth Stream section. Update `drafts/draft-lcurley-moq-auth.md` only where it
   refers to lite. `just drafts check`.
 - Tests: a regression test per side (Rust and JS). An oversized update after
   an AUTH_OK reports `Unsupported` and revokes the grant. Also add an interop
   case, run with `just test interop --all`.
 
 Public API: none new (`Error::Unsupported` exists). Wire: a new lite session
-code, and a lower lite message ceiling.
+code.
 
 ## Related
 
+- [Request caps](/quest/m0/request-caps.md) - owns the 65,535-byte lite message ceiling that makes a grant too large for AUTH_OK
 - [AUTH violations](/quest/m1/auth/violations.md) - AUTH protocol violations close the session on the same path (AUTH endings landed in #4550)

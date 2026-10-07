@@ -96,7 +96,7 @@ published version in place, so AUTH and its stream code land in
 
 - [WebSocket refusal](/quest/m1/auth/ws-unauthorized.md) - the relay serves WebSocket through moq-tokio, so a refused token closes the session as Unauthorized, as QUIC does
 - [AUTH on the wip version](/quest/m1/auth/wip-version.md) - lite AUTH and UNAUTHORIZED move from lite-06 to `moq-lite-07-wip`, so no published version changes in place
-- [Lite NOT_SUPPORTED](/quest/m1/auth/not-supported.md) - a lite acceptor answers AUTH_ERROR NOT_SUPPORTED after a grant too, and lite messages cap at moq-transport's 65,535 bytes
+- [Lite NOT_SUPPORTED](/quest/m1/auth/not-supported.md) - a lite acceptor answers AUTH_ERROR NOT_SUPPORTED after a grant too, with a lite session code for `Error::Unsupported`
 - [AUTH violations](/quest/m1/auth/violations.md) - every AUTH protocol violation closes the session in Rust and JS, lite and IETF
 - [Malformed grant](/quest/m1/auth/malformed-grant.md) - a malformed or
   non-canonical grant pattern, or an out-of-range `Expires`, closes the
@@ -117,7 +117,5 @@ published version in place, so AUTH and its stream code land in
 
 ## Related
 
-- [Expiring media grants](/quest/m3/processor/grant-lease.md) - a worker's
-  lease renewal is a new in-band token
 - [Peer grants](/quest/m3/p2p/peer-grant.md) - P2P's hop-bound credential,
   built on this line's relay tokens

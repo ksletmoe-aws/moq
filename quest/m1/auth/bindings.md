@@ -43,5 +43,6 @@ surface comes from moq-ffi rather than new `moq_session_auth_*` calls.
 
 ## Required
 
+- [FFI shape](/quest/m1/ffi-shape/README.md) - reshapes the moq-ffi session and wrappers this edits, so the wrappers break once
 - [Relay tokens](/quest/m1/auth/relay-refresh.md) - supplies the connection
   accessor and a relay that answers a real token, which the wrapper tests need
