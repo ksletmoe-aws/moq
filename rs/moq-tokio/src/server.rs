@@ -2112,9 +2112,8 @@ mod tests {
 	}
 
 	/// `Request::auth` must exist and yield an owned `auth::Handle`, so a QUIC app can take
-	/// `requests()` on it before `ok()`. Constructing a `Request` needs a live transport
-	/// handshake (the pre-ok runtime behavior is exercised over real QUIC by the request-token
-	/// end-to-end verification), so this pins the accessor's shape without binding one.
+	/// `requests()` on it before `ok()`. The pre-ok runtime behavior is exercised over TCP by the
+	/// connection tests' `first_request_token` server; this pins the accessor's shape.
 	#[test]
 	fn request_exposes_an_auth_handle() {
 		let _signature: fn(&Request) -> moq_net::auth::Handle = Request::auth;

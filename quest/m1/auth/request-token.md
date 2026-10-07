@@ -114,7 +114,7 @@ Decided in review:
   `UNAUTHORIZED` and `NOT_SUPPORTED`.
 
 - Even with no token present, the renewal loop is no longer byte-identical
-  to upstream:
+  to the token-less behavior before this quest:
   - A draft-15/16 token-less SUBSCRIBE_UPDATE now draws a keyed REQUEST_OK.
   - A draft-19+ SETUP advertises `MAX_REQUEST_UPDATES=16`.
   - A malformed SUBSCRIBE_UPDATE body on draft-14/15/16 now ends the

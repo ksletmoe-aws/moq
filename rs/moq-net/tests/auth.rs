@@ -20,7 +20,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LITE_06: &str = "moq-lite-06";
 /// The first draft that negotiates MoQ Auth, and the newest.
 const MOQT_17: &str = "moq-transport-17";
-/// A draft at the deployed floor, used for the request-token launch shape.
+/// A draft-18 session, the shape a standard request-token peer uses.
 const MOQT_18: &str = "moq-transport-18";
 const MOQT_19: &str = "moq-transport-19";
 const MOQT_22: &str = "moq-transport-22";
@@ -746,7 +746,7 @@ async fn a_held_renewal_coalesces_a_burst_without_tripping_the_credit() {
 /// request-borne token on an announce reaches the acceptor exactly when the server does not
 /// solicit, which is the shape a standard moq-transport peer (an encoder or CDN) always sends.
 ///
-/// This runs at draft-18 (the deployed floor) in the launch shape: the client also declines
+/// This runs at draft-18, with the client also declining
 /// the AUTH extension, so the session's union is `None`, the covers-gate does not short-circuit
 /// on a connection grant, and the request token is the authorizing artifact. The
 /// control half shows the default: with Solicit declared the client answers inline, no token

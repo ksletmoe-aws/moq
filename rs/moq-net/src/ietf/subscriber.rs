@@ -1413,8 +1413,8 @@ where
 		// must not be dropped by a later one. The queue is bounded by MAX_REQUEST_UPDATES, counting
 		// the one being verified, so a peer cannot grow it without limit behind a slow verdict.
 		//
-		// With no token grant both stay empty and every turn is upstream's: watch the writer on
-		// draft-17+, read the next message, and handle it.
+		// With no token grant both stay empty, and each turn watches the writer on draft-17+,
+		// reads the next message, and handles it.
 		let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
 		let mut stashed: std::collections::VecDeque<(u64, bytes::Bytes)> = std::collections::VecDeque::new();
 		// Draft-19+ only: the peer finished its send direction, which does not withdraw the

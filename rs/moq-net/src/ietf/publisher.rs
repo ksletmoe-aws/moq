@@ -1013,12 +1013,11 @@ where
 		// draft-18 section 10.9.1 permits coalescing cumulative deltas but still requires one
 		// answer per update, so an earlier buffered renewal must not be dropped by a later one.
 		//
-		// The token-less, renewal-less path tracks upstream closely but is no longer byte-identical:
-		// a draft-15/16 token-less SUBSCRIBE_UPDATE now draws a keyed REQUEST_OK, a draft-19+ SETUP
-		// advertises MAX_REQUEST_UPDATES=16, and a malformed SUBSCRIBE_UPDATE body on
-		// draft-14/15/16 now ends the subscription. Otherwise it is a typed Update on draft-17+
-		// (unsupported or priority, then a RequestOk ack) and a close on draft-14/15/16, with
-		// `pending` and `stashed` empty unless a token-bearing update is seen.
+		// On the token-less, renewal-less path a draft-15/16 SUBSCRIBE_UPDATE draws a keyed
+		// REQUEST_OK, a draft-19+ SETUP advertises MAX_REQUEST_UPDATES=16, and a malformed
+		// SUBSCRIBE_UPDATE body on draft-14/15/16 ends the subscription. Otherwise it is a typed
+		// Update on draft-17+ (unsupported or priority, then a RequestOk ack) and a close on
+		// draft-14/15/16, with `pending` and `stashed` empty unless a token-bearing update is seen.
 		let mut pending: Option<(crate::auth::RequestVerdict, RequestId)> = None;
 		let mut stashed: std::collections::VecDeque<(RequestId, bytes::Bytes)> = std::collections::VecDeque::new();
 
@@ -1209,8 +1208,8 @@ where
 					}
 				}
 				Turn::Update(update) => {
-					// Draft-17+ byte-identical to upstream for the token-less path: reject
-					// unsupported parameters, apply a priority change, then acknowledge.
+					// Draft-17+ token-less path: reject unsupported parameters, apply a priority
+					// change, then acknowledge.
 					if update.unsupported {
 						let result = self
 							.write_subscribe_error(
